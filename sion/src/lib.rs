@@ -105,9 +105,12 @@ fn table(d: &[u8], pfx: &[u8]) -> Table {
         match d[i] {
             b'(' => {
                 let e = find(d, i, b")");
+                let mut j = e;
+                while d.get(j).is_some_and(|c| c.is_ascii_whitespace() || *c == b',') { j += 1 }
+                // Without a count after `)` it's not an interpolation: SiON reads the numbers inside as plain values.
+                if !d.get(j).is_some_and(u8::is_ascii_digit) { i += 1; continue }
                 let list = nums(&d[i + 1..e]);
-                i = e;
-                while d.get(i).is_some_and(|c| c.is_ascii_whitespace() || *c == b',') { i += 1 }
+                i = j;
                 let n = num(d, &mut i).unwrap_or(0);
                 for k in 0..n {
                     let t = if list.len() > 1 { k as f32 * (list.len() - 1) as f32 / n as f32 } else { 0.0 };
@@ -675,9 +678,11 @@ fn expand(mac: &[Vec<u8>], s: &[u8], deep: u8) -> Vec<u8> {
             let mut j = i + 1;
             if let (Some(n), Some(b')')) = (num(s, &mut j), s.get(j)) { t = n; i = j + 1 }
         }
-        cmd(&mut out, b"!@ns", &[t]);
+        // Only a transposed macro is wrapped in note shifts: the closing one would otherwise swallow a length
+        // written right after the macro (`Z16..` would read as `!@ns016` and lose its `16..`).
+        if t != 0 { cmd(&mut out, b"!@ns", &[t]) }
         if deep > 0 && deep < 9 { out.extend(expand(mac, m, deep + 1)) } else { out.extend(m) }
-        cmd(&mut out, b"!@ns", &[-t]);
+        if t != 0 { cmd(&mut out, b"!@ns", &[-t]) }
     }
     out
 }
