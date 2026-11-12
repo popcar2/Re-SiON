@@ -70,6 +70,11 @@ pub struct Shared {
     pub att: Vec<f32>,
 }
 
+impl Shared {
+    pub fn sample(&self, i: usize) -> Option<&Sample> { self.samples.get(i)?.as_ref() }
+    pub fn voice(&self, i: usize) -> Option<&Voice> { self.voices.get(i)?.as_ref() }
+}
+
 /// White, pulse, short, high-pass, pink and Game Boy noise tables.
 pub fn noise() -> [Vec<f32>; 6] {
     let (mut w, mut p, mut j) = (vec![], vec![], 1i32);
@@ -108,6 +113,13 @@ fn pow2(e: i32) -> f32 { f32::from_bits(((e.clamp(-126, 127) + 127) as u32) << 2
 
 /// Wrap a phase into 0..1 (fast path when it already is).
 fn wrap(x: f32) -> f32 { if (0.0..1.0).contains(&x) { x } else { x.rem_euclid(1.0) } }
+
+/// Move a sample cursor on by `d` frames: whole frames into `pos`, the rest kept in `frac`.
+fn advance(pos: &mut usize, frac: &mut f32, d: f32) {
+    *frac += d;
+    let k = *frac as usize;
+    (*pos, *frac) = (*pos + k, *frac - k as f32);
+}
 
 fn tri(p: f32) -> f32 { if p < 0.25 { 4.0 * p } else if p < 0.75 { 2.0 - 4.0 * p } else { 4.0 * p - 4.0 } }
 fn saw(p: f32) -> f32 { if p < 0.5 { 2.0 * p } else { 2.0 * p - 2.0 } }
@@ -300,7 +312,7 @@ impl Op {
     #[cfg_attr(feature = "small", optimize(speed))]
     fn level(&self, sh: &Shared, lv: f32, am: f32) -> f32 {
         let ksl = if self.ksl == 0 { 0 } else { self.kc >> (5 - self.ksl) };
-        let am = if self.ams == 0 { 0.0 } else { am / (1 << (3 - self.ams)) as f32 };
+        let am = if self.ams == 0 { 0.0 } else { am * pow2(self.ams - 3) };
         gain(sh, lv + (((self.tl + ksl) * 8) as f32 + self.tlo).min(OFF) + am)
     }
 
@@ -341,8 +353,10 @@ pub struct Chan {
     /// gone back to its loop point, so the next sample joins the level wherever the end of the track left it.
     pub rejoin: bool,
     dm: bool, dplay: bool, dnew: bool, dprev: Option<(usize, usize, f32, f32, f32)>, dlv: f32, doff: f32, dg: f32, dhp: (f32, f32),
+    /// Per operator (from `ALG`): the pipe it writes, the pipe modulating it (0: none), whether it adds to that pipe.
+    wire: [(u8, u8, bool); 4],
     pub f_on: bool, pub f_type: usize, f_cut: [i32; 6], f_time: [i32; 6], f_res: f32, f_v: [f32; 3], cutoff: i32, pub cut_off: i32, f_st: usize, f_step: i32, f_next: i32, f_inc: i32, f_cnt: i32,
-    pub ks: bool, kbuf: Vec<f32>, kidx: f32, kout: f32, kdec: (f32, f32), pub k_lpf: f32, pub kx: f32,
+    pub ks: bool, kbuf: Vec<f32>, kidx: f32, kout: f32, pub k_lpf: f32, pub kx: f32,
 }
 
 /// Operator wiring per algorithm, one letter per operator ('a' + flags):
@@ -353,6 +367,13 @@ const ALG: [&[&str]; 4] = [
     &["ack", "aak", "ibm", "aki", "bmm", "iii", "aKi"],
     &["acck", "aack", "abek", "acak", "akbm", "bmmm", "akii", "iiii", "ibfm", "ibmi", "aaak", "ibbm", "aKbm"],
 ];
+
+/// Decode an `ALG` letter into (flags, pipe written, pipe modulating it, adds to that pipe).
+fn wiring(c: u8) -> (u8, (u8, u8, bool)) {
+    let f = if c == b'K' { 10 } else { c - b'a' };
+    let (out, md) = (f & 1, (f >> 1) & 3);
+    (f, (out, md, c == b'K' || md != out + 1))
+}
 
 impl Chan {
     pub fn new() -> Chan {
@@ -384,9 +405,9 @@ impl Chan {
             ops: vec![], n: 1, alg: 0, act: 0, fb: 0, fbc: 0, fratio: 1.0, inp: (0, 0), ring: (0, 0), outp: (0, 0), stale: true,
             lfo: 2, lfo_tab: vec![], lfo_step: 0.0, lfo_ph: 0, lfo_t: 1.0, amd: 0, pmd: 0, am: 0.0, pm: 0,
             vol: [0.0; 8], pan: 64, vm: (0, 0), xv: (128, 256), pitch: 0, on: false, fine: 0.0, pcm: -1, smp: 0, sidx: 0, spos: 0, sfrac: 0.0, sstep: 0.0, sfrac0: 0.0, slate: 0.0, slen: 0.0, sleft: 0.0,
-            rejoin: false, dm: false, dplay: false, dnew: false, dprev: None, dlv: 0.0, doff: 0.0, dg: 0.0, dhp: (0.0, 0.0),
+            rejoin: false, dm: false, dplay: false, dnew: false, dprev: None, dlv: 0.0, doff: 0.0, dg: 0.0, dhp: (0.0, 0.0), wire: [wiring(b'i').1; 4],
             f_on: false, f_type: 0, f_cut: [128, 128, 128, 128, 0, 128], f_time: [0, 0, 0, i32::MAX, 0, i32::MAX], f_res: 1.0, f_v: [0.0; 3], cutoff: 128, cut_off: 0, f_st: 5, f_step: i32::MAX, f_next: 0, f_inc: 0, f_cnt: i32::MAX,
-            ks: false, kbuf: vec![], kidx: 0.0, kout: 0.0, kdec: (0.5, 0.75), k_lpf: 0.875, kx: 1.0,
+            ks: false, kbuf: vec![], kidx: 0.0, kout: 0.0, k_lpf: 0.875, kx: 1.0,
         }
     }
 
@@ -417,7 +438,7 @@ impl Chan {
         self.ops.resize(ops, Op::new(true));
         (self.n, self.alg, self.act, self.fb) = (if cnt == 5 { 5 } else { ops }, alg, ops - 1, 0);
         let code = ALG[ops - 1].get(alg).filter(|_| cnt != 5).map_or(&b"iiii"[..], |c| c.as_bytes());
-        for (o, c) in self.ops.iter_mut().zip(code) { o.fin = *c == b'K' || (c - b'a') & 8 != 0 }
+        for ((o, w), &c) in self.ops.iter_mut().zip(&mut self.wire).zip(code) { let (f, wc) = wiring(c); (o.fin, *w) = (f & 8 != 0, wc) }
         self.volume(self.xv.0, self.xv.1);
     }
 
@@ -526,10 +547,8 @@ impl Chan {
                 self.stale = true;
             }
         }
-        if let (true, Some(s)) = (self.pcm >= 0 && live && !self.dm, sh.samples.get(self.sidx).and_then(Option::as_ref)) {
-            self.sfrac += self.sstep * nf;
-            let k = self.sfrac as usize;
-            (self.spos, self.sfrac) = (self.spos + k, self.sfrac - k as f32);
+        if let (true, Some(s)) = (self.pcm >= 0 && live && !self.dm, sh.sample(self.sidx)) {
+            advance(&mut self.spos, &mut self.sfrac, self.sstep * nf);
             let o = &mut self.ops[0];
             if self.spos >= s.data.len() { match s.wrap(self.spos) { Some(u) => self.spos = u, None => o.st = 0 } }
             if self.slen > 0.0 { self.sleft -= self.sstep * nf; if self.sleft <= 0.0 { o.st = 0 } }
@@ -554,10 +573,8 @@ impl Chan {
     fn dpcm_leap(&mut self, sh: &Shared, nf: f32) {
         (self.dprev, self.dnew, self.doff) = (None, false, 0.0);
         if self.dplay {
-            self.sfrac += self.sstep * nf;
-            let k = self.sfrac.max(0.0) as usize;
-            (self.spos, self.sfrac) = (self.spos + k, self.sfrac - k as f32);
-            if let Some(s) = sh.samples.get(self.sidx).and_then(Option::as_ref) {
+            advance(&mut self.spos, &mut self.sfrac, self.sstep * nf);
+            if let Some(s) = sh.sample(self.sidx) {
                 match s.wrap(self.spos) { Some(u) => self.spos = u, None => { self.dplay = false; self.spos = s.data.len().saturating_sub(1) } }
                 if self.sfrac >= 0.0 { self.dlv = s.data.get(self.spos).copied().unwrap_or(0.0) }
             }
@@ -583,7 +600,6 @@ impl Chan {
     fn dpcm(&mut self, sh: &Shared, am: f32) -> f32 {
         const HP: f32 = 1.0 / (1.0 + TAU * 60.0 / RATE);
         const FADE: f32 = 1.0 - 1.0 / (0.02 * RATE);
-        let get = |i: usize| sh.samples.get(i).and_then(Option::as_ref);
         // (A one-shot holds its last frame: past it there is no silence to slide towards.)
         let at = |s: &Sample, u: usize| if s.lp.is_some() { s.at(u) } else { s.data.get(u).or(s.data.last()).copied().unwrap_or(0.0) };
         let o = &mut self.ops[0];
@@ -591,29 +607,26 @@ impl Chan {
         if self.sfrac < 0.0 || !self.dplay {
             // Waiting to start (or done): the sample before plays on, or the level holds.
             if let Some((i, mut pos, mut frac, step, mut left)) = self.dprev {
-                match get(i) {
+                match sh.sample(i) {
                     Some(s) if left > 0.0 && (s.lp.is_some() || pos + 1 < s.data.len()) => {
                         self.dlv = at(s, pos) + (at(s, pos + 1) - at(s, pos)) * frac;
-                        frac += step;
-                        let k = frac as usize;
-                        (pos, frac, left) = (pos + k, frac - k as f32, left - step);
+                        advance(&mut pos, &mut frac, step);
+                        left -= step;
                         if let Some(u) = s.wrap(pos) { pos = u }
                         self.dprev = Some((i, pos, frac, step, left));
                     }
                     s => { if let Some(s) = s { if left > 0.0 { self.dlv = at(s, pos) } } self.dprev = None }
                 }
             }
-        } else if let Some(s) = get(self.sidx) {
+        } else if let Some(s) = sh.sample(self.sidx) {
             self.dprev = None;
             if core::mem::take(&mut self.dnew) && core::mem::take(&mut self.rejoin) { self.doff += self.dlv - at(s, 0) }
             self.dlv = at(s, self.spos) + (at(s, self.spos + 1) - at(s, self.spos)) * self.sfrac;
         }
         self.doff *= FADE;
         if self.dplay {
-            self.sfrac += self.sstep;
-            let k = self.sfrac.max(0.0) as usize;
-            (self.spos, self.sfrac) = (self.spos + k, self.sfrac - k as f32);
-            if let Some(s) = get(self.sidx) {
+            advance(&mut self.spos, &mut self.sfrac, self.sstep);
+            if let Some(s) = sh.sample(self.sidx) {
                 match s.wrap(self.spos) { Some(u) => self.spos = u, None if self.spos + 1 >= s.data.len() => { self.dplay = false; self.dlv = at(s, self.spos) } None => {} }
             }
             if self.slen > 0.0 { self.sleft -= self.sstep; if self.sleft <= 0.0 { self.dplay = false } }
@@ -634,7 +647,7 @@ impl Chan {
             self.sidx = if self.pcm == 10 { (pitch >> 6).max(0) as usize } else { self.smp };
             self.dm = sh.dpcm.get(self.sidx).copied().unwrap_or(false);
             let semi = |s: &Sample| if self.pcm == 7 { (((pitch + self.ops[0].det + pm - s.key * 64) as f32 + fine) / 768.0).exp2() } else { 1.0 };
-            let step = sh.samples.get(self.sidx).and_then(Option::as_ref).map_or(0.0, |s| s.rate / RATE * semi(s));
+            let step = sh.sample(self.sidx).map_or(0.0, |s| s.rate / RATE * semi(s));
             // The new speed applies from the event's exact time, partway into the frame just played.
             self.sfrac += (step - self.sstep) * late;
             while self.sfrac < 0.0 && self.spos > 0 { (self.spos, self.sfrac) = (self.spos - 1, self.sfrac + 1.0) }
@@ -668,14 +681,12 @@ impl Chan {
         } else { 0.0 };
         let mut x = if self.pcm >= 0 && self.dm { self.dpcm(sh, am) } else if self.pcm >= 0 {
             let o = &mut self.ops[0];
-            match (sh.samples.get(self.sidx).and_then(Option::as_ref), o.eg(fr)) {
+            match (sh.sample(self.sidx), o.eg(fr)) {
                 (Some(s), Some(lv)) => {
                     // (Before the first frame, the note fades in from silence over one frame.)
                     let (a, b, f) = if self.sfrac < 0.0 { (0.0, s.at(0), (1.0 + self.sfrac).max(0.0)) } else { (s.at(self.spos), s.at(self.spos + 1), self.sfrac) };
                     o.out = (a + (b - a) * f) * o.level(sh, lv, am);
-                    self.sfrac += self.sstep;
-                    let k = self.sfrac as usize;
-                    (self.spos, self.sfrac) = (self.spos + k, self.sfrac - k as f32);
+                    advance(&mut self.spos, &mut self.sfrac, self.sstep);
                     if self.spos >= s.data.len() { match s.wrap(self.spos) { Some(u) => self.spos = u, None => o.st = 0 } }
                     if self.slen > 0.0 { self.sleft -= self.sstep; if self.sleft <= 0.0 { o.st = 0 } }
                     o.out
@@ -687,9 +698,9 @@ impl Chan {
             let b = &mut rest[0];
             let lv = a.eg(fr);
             let wrap_a = a.ph + a.step + fbin >= 1.0;
-            a.ph = (a.ph + a.step + if self.alg == 2 { fbin } else { 0.0 }).rem_euclid(1.0);
+            a.ph = wrap(a.ph + a.step + if self.alg == 2 { fbin } else { 0.0 });
             b.ph = if self.alg == 2 && wrap_a { 0.0 } else { wrap(b.ph + b.step) };
-            let (wa, wb) = (wave(sh, a.pg, (a.ph + if self.alg == 2 { 0.0 } else { fbin }).rem_euclid(1.0)), wave(sh, b.pg, b.ph));
+            let (wa, wb) = (wave(sh, a.pg, wrap(a.ph + if self.alg == 2 { 0.0 } else { fbin })), wave(sh, b.pg, b.ph));
             a.out = match (lv, self.alg) {
                 (None, _) => 0.0,
                 (Some(lv), 1) => wa * wb * b.level(sh, lv, am),
@@ -698,13 +709,10 @@ impl Chan {
             };
             a.out
         } else {
-            let code = ALG[self.ops.len() - 1].get(self.alg).map_or(&b"iiii"[..], |c| c.as_bytes());
             let mut p = [0f32; 2];
-            for (i, o) in self.ops.iter_mut().enumerate() {
-                let c = if code[i] == b'K' { 10 } else { code[i] - b'a' };
-                let (out, md) = ((c & 1) as usize, (c >> 1) & 3);
+            for (i, (o, &(out, md, add))) in self.ops.iter_mut().zip(&self.wire).enumerate() {
                 let x = o.run(sh, if i == 0 { fbin } else if md > 0 { p[md as usize - 1] * 4.0 } else { 0.0 }, am, fr);
-                p[out] = x + if code[i] == b'K' || md as usize != out + 1 { p[out] } else { 0.0 };
+                p[out as usize] = x + if add { p[out as usize] } else { 0.0 };
             }
             p[0]
         };
@@ -713,7 +721,7 @@ impl Chan {
             let wl = RATE / (8.175799 * ((pitch + self.ops[0].det + pm).clamp(0, 8191) as f32 / 768.0).exp2());
             self.kidx += 1.0;
             if self.kidx >= wl { self.kidx %= wl }
-            let (t, (dec, lpf)) = (self.kidx as usize, if self.on { (0.98, self.k_lpf) } else { (self.kdec.1, self.kdec.0) });
+            let (t, (dec, lpf)) = (self.kidx as usize, if self.on { (0.98, self.k_lpf) } else { (0.75, 0.5) });
             self.kout = self.kout * dec + (self.kbuf[t] - self.kout * dec) * lpf + x;
             self.kbuf[t] = self.kout;
             x = self.kout * self.kx;

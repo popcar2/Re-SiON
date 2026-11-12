@@ -11,7 +11,6 @@ mod m;
 mod synth;
 
 use alloc::{string::{String, ToString}, sync::Arc, vec, vec::Vec};
-use core::f32::consts::PI;
 use fx::Fx;
 use m::M;
 pub use synth::{Sample, RATE};
@@ -149,7 +148,7 @@ fn table(d: &[u8], pfx: &[u8]) -> Table {
             b']' => {
                 i += 1;
                 let n = if d.get(i).is_some_and(u8::is_ascii_digit) { num(d, &mut i).unwrap_or(2) } else { 2 };
-                if let Some(h) = stack.pop() { let seg = out[h..].to_vec(); for _ in 0..n.max(1) { out.extend(&seg) } }
+                if let Some(h) = stack.pop() { let e = out.len(); for _ in 0..n.max(1) { out.extend_from_within(h..e) } }
             }
             _ => i += 1,
         }
@@ -255,6 +254,9 @@ const CMD: [&str; 44] = [
     "@@", "na", "np", "nt", "nf", "mp", "ma", "po", "kt", "%v", "%x", "%f", "%t", "%e", "@q", "@v", "@i", "@o", "@p", "@f", "@r", "&&",
 ];
 
+/// Envelope commands (`_`: for key-off), longest first.
+const ENV: [&[u8]; 11] = [b"_@@", b"_na", b"_nt", b"_np", b"_nf", b"!na", b"@@", b"na", b"nt", b"np", b"nf"];
+
 struct Track {
     s: Arc<[u8]>, i: usize, loops: Vec<(usize, i32)>, rep: Option<usize>, moved: bool, end: bool,
     /// Has reached the end of its sequence at least once (ended, or jumped back to its `$` loop point).
@@ -309,12 +311,12 @@ impl Track {
     }
 
     /// Select tone / voice number `v` for the current module; returns the voice's init sequence, if any.
-    fn select(&mut self, sh: &Shared, v: i32) -> Option<Vec<u8>> {
+    fn select<'a>(&mut self, sh: &'a Shared, v: i32) -> Option<&'a [u8]> {
         match self.md {
-            6 => if let Some(voice) = sh.voices.get(v.max(0) as usize).and_then(|v| v.as_ref()) {
+            6 => if let Some(voice) = sh.voice(v.max(0) as usize) {
                 self.ch.set_voice(voice);
                 self.ch.volume(self.x, self.vel);
-                return Some(voice.init.clone());
+                return Some(&voice.init);
             }
             7 | 10 => { self.ch.smp = v.max(0) as usize; self.ch.stale = true }
             11 => {}
@@ -397,6 +399,9 @@ impl Track {
             self.menv = Some(i + 1);
         }
     }
+
+    /// No commands or key on/off left to run.
+    fn done(&self) -> bool { self.end && self.koff == INF && self.kon == INF }
 
     /// Advance to tick `now`: run due commands, key on/off and envelope frames.
     #[cfg_attr(feature = "small", optimize(speed))]
@@ -542,7 +547,7 @@ impl Track {
                     b"p" | b"@p" => 2,
                     b"q" | b"@q" => 4,
                     b"@" | b"@al" | b"@fb" | b"@dt" | b"@er" | b"@fx" | b"@ml" | b"@ph" | b"@rr" | b"@se" | b"@tl" | b"i" | b"s" => 8,
-                    b"@@" | b"na" | b"nt" | b"np" | b"nf" | b"!na" | b"_@@" | b"_na" | b"_nt" | b"_np" | b"_nf" => 16,
+                    _ if ENV.contains(&name) => 16,
                     b"mp" | b"ma" => 32,
                     _ => 0,
                 };
@@ -626,7 +631,7 @@ impl Track {
                             None
                         };
                     }
-                    b"@@" | b"na" | b"nt" | b"np" | b"nf" | b"!na" | b"_@@" | b"_na" | b"_nt" | b"_np" | b"_nf" => {
+                    _ if ENV.contains(&name) => {
                         let (on, kind) = ((name[0] != b'_') as usize, match name[name.len() - 1] { b'@' => 1, b't' => 2, b'p' => 3, b'f' => 4, _ => 0 });
                         self.set[on][kind] = Some((a[0].max(0) as usize, p(1, 1))).filter(|(_, s)| (0..512).contains(&a[0]) && *s != 0);
                         if kind == 0 { self.xoff[on] = name[0] == b'!' }
@@ -636,7 +641,7 @@ impl Track {
                         let init = if a[0] != MIN { self.tone = a[0]; self.select(sh, a[0]) } else { None };
                         if self.ch.ks {
                             // Plucked string seed: `@1,n` excites with FM voice n, otherwise `@0,ar,dr,tl,fix,ws` sets a noise burst.
-                            let voice = sh.voices.get(a[1].max(0) as usize).and_then(|v| v.as_ref()).filter(|_| a[0] == 1);
+                            let voice = sh.voice(a[1].max(0) as usize).filter(|_| a[0] == 1);
                             if let Some(v) = voice { self.ch.set_voice(v) } else {
                                 self.ch.params(&[a[1], a[2], 0, 63, 15, a[3], 0, 0, 1, 0, 0, 0, 0, a[4]]);
                                 (self.ch.ops[0].pg, self.ch.ops[0].pt) = (p(5, 20), Op::pt_of(p(5, 20)));
@@ -645,7 +650,7 @@ impl Track {
                             self.ch.params(&a[1..15]);
                         }
                         let mut j = 0;
-                        while let Some(seq) = init.as_ref().filter(|q| j < q.len()) { self.exec(seq, &mut j, sh, bpm, false) }
+                        while let Some(seq) = init.filter(|q| j < q.len()) { self.exec(seq, &mut j, sh, bpm, false) }
                     }
                     _ => {}
                 }
@@ -655,8 +660,11 @@ impl Track {
 }
 
 /// An effect slot: 0 is the master chain, 1..8 are sends (`@v` extra arguments).
-#[derive(Default)]
 struct Slot { fx: Vec<Fx>, vol: f32, pan: i32, mono: bool, buf: Vec<[f32; 2]> }
+
+impl Default for Slot {
+    fn default() -> Slot { Slot { fx: vec![], vol: 1.0, pan: 64, mono: false, buf: vec![] } }
+}
 
 pub struct Song {
     tracks: Vec<Track>, sh: Shared, slots: Vec<Slot>, bpm: f64, now: f64, tail: usize,
@@ -667,7 +675,6 @@ pub struct Song {
     base: (f64, f64, u64),
 }
 
-/// Replace macro references (`A`, `A(3)` = transposed) with their bodies.
 /// Note number of letter `c` with accidental `nx`, octave, note shift and key signature.
 fn key(c: u8, nx: Option<&u8>, oct: i32, ns: i32, sign: &[i32; 7]) -> i32 {
     let k = (c - b'a') as usize;
@@ -727,6 +734,7 @@ fn statics(s: &[u8], sh: &Shared) -> Vec<u8> {
     out
 }
 
+/// Replace macro references (`A`, `A(3)` = transposed) with their bodies.
 fn expand(mac: &[Vec<u8>], s: &[u8], deep: u8) -> Vec<u8> {
     let (mut out, mut i) = (vec![], 0);
     while i < s.len() {
@@ -799,10 +807,10 @@ fn fm(form: &[u8], seqs: &[Vec<u8>]) -> Option<(usize, Vec<Vec<u8>>)> {
 fn inline(s: &[u8], tables: &mut [Option<Table>], next: &mut usize) -> Vec<u8> {
     let (mut out, mut i) = (vec![], 0);
     while i < s.len() {
-        let name = ["_@@", "_na", "_nt", "_np", "_nf", "!na", "@@", "na", "nt", "np", "nf"].iter().find(|c| s[i..].starts_with(c.as_bytes()));
+        let name = ENV.iter().find(|c| s[i..].starts_with(c));
         let Some(name) = name else { out.push(s[i]); i += 1; continue };
         let mut j = i + name.len();
-        out.extend(name.as_bytes());
+        out.extend(*name);
         ws(s, &mut j);
         if s.get(j) == Some(&b'{') && *next > 255 {
             let e = find(s, j, b"}");
@@ -923,10 +931,10 @@ impl Song {
         }
 
         // Effect chains: `name arg,arg,...` units in series, then `p`/`@p`/`@v` for the slot's return.
-        let mut slots: Vec<Slot> = (0..8).map(|_| Slot { vol: 1.0, pan: 64, ..Slot::default() }).collect();
+        let mut slots: Vec<Slot> = (0..8).map(|_| Slot::default()).collect();
         for (k, dat, pfx) in effects {
             let Some(slot) = slots.get_mut(k) else { continue };
-            *slot = Slot { vol: 1.0, pan: 64, ..Slot::default() };
+            *slot = Slot::default();
             for (post, src) in [(false, &dat), (true, &pfx)] {
                 let mut i = 0;
                 while i < src.len() {
@@ -1048,7 +1056,7 @@ impl Song {
             }
         }
         if !synth { return }
-        let ended = self.tracks.iter().all(|t| t.end && t.koff == INF && t.kon == INF) && { self.catch_up(); self.tracks.iter().all(|t| t.ch.silent()) };
+        let ended = self.tracks.iter().all(Track::done) && { self.catch_up(); self.tracks.iter().all(|t| t.ch.silent()) };
         self.tail = if ended { self.tail + (self.pos - pos) as usize } else { 0 };
     }
 
@@ -1101,14 +1109,14 @@ impl Song {
         for s in sends.iter_mut().filter(|s| !s.fx.is_empty()) {
             for f in &mut s.fx { f.run(&mut s.buf) }
             let direct = s.vol == 1.0 && s.pan == 64;
-            let (l, r) = if direct { (1.0, 1.0) } else { (((128 - s.pan) as f32 * PI / 256.0).sin() * s.vol, (s.pan as f32 * PI / 256.0).sin() * s.vol) };
+            let (l, r) = if direct { (1.0, 1.0) } else { (self.sh.pan[(128 - s.pan) as usize] * s.vol, self.sh.pan[s.pan as usize] * s.vol) };
             for (m, f) in master.buf.iter_mut().zip(&s.buf) { m[0] += f[0] * l; m[1] += f[1] * r }
         }
         for f in &mut master.fx { f.run(&mut master.buf) }
         for (o, f) in out.chunks_exact_mut(2).zip(&master.buf) { o[0] = f[0].clamp(-1.0, 1.0); o[1] = f[1].clamp(-1.0, 1.0) }
         // Finished once every track has ended and the output has been quiet for a while.
         let quiet = master.buf.iter().all(|f| f[0].abs() + f[1].abs() < 1e-4);
-        self.tail = if self.tracks.iter().all(|t| t.end && t.koff == INF && t.kon == INF) && quiet { self.tail + n } else { 0 };
+        self.tail = if self.tracks.iter().all(Track::done) && quiet { self.tail + n } else { 0 };
         self.tail < RATE as usize / 2
     }
 }

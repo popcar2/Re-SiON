@@ -1,6 +1,6 @@
 //! SiON's `#EFFECT` units, processing interleaved stereo frames in place.
 
-use crate::synth::Table;
+use crate::synth::{Table, RATE};
 use crate::m::M;
 use alloc::{vec, vec::Vec};
 use core::f32::consts::{PI, TAU};
@@ -11,7 +11,7 @@ pub struct Fx { k: usize, p: [f32; 8], s: Vec<f32>, i: usize, c: i32, t: [Option
 
 /// Biquad coefficients [b0, b1, b2, a1, a2] for filter kind 11..=18 (lf hf bf nf pf af lb hb).
 fn biquad(k: usize, freq: f32, band: f32, gain: f32) -> [f32; 5] {
-    let (omg, a) = (freq * TAU / 44100.0, 10f32.powf(gain * 0.025));
+    let (omg, a) = (freq * TAU / RATE, 10f32.powf(gain * 0.025));
     let (cos, sin) = (omg.cos(), omg.sin());
     let alp = sin * (0.34657359 * band * omg / sin).sinh();
     let ia0 = 1.0 / (1.0 + alp);
@@ -39,16 +39,16 @@ impl Fx {
         let g = |i: usize, d: f32| if a[i].is_nan() { d } else { a[i] };
         let (mut p, mut s, mut t) = ([0.0; 8], vec![], [None, None]);
         match k {
-            0 => { p = [(g(0, 250.0) * 44.1).min(65535.0), (g(1, 25.0) / 100.0).clamp(-0.999, 0.999), (a[2] == 1.0) as i32 as f32, g(3, 100.0) / 100.0, 0., 0., 0., 0.]; s = vec![0.0; 131072] }
+            0 => { p = [(g(0, 250.0) * (RATE / 1000.0)).min(65535.0), (g(1, 25.0) / 100.0).clamp(-0.999, 0.999), (a[2] == 1.0) as i32 as f32, g(3, 100.0) / 100.0, 0., 0., 0., 0.]; s = vec![0.0; 131072] }
             1 => { p = [g(0, 70.0) / 100.0, g(1, 40.0) / 100.0, (g(2, 80.0) / 100.0).clamp(-0.99, 0.99), g(3, 100.0) / 100.0, 0., 0., 0., 0.]; s = vec![0.0; 16384] }
             2 => {
-                let off = (g(0, 20.0) * 44.1).clamp(5.0, 4095.0).floor();
+                let off = (g(0, 20.0) * (RATE / 1000.0)).clamp(5.0, 4095.0).floor();
                 let (freq, depth) = (g(2, 4.0).max(0.01), g(3, 20.0).min(off - 4.0));
-                let size = ((depth * TAU).floor()).min((11025.0 / freq).floor()).max(1.0);
-                p = [off, (g(1, 20.0) / 100.0).clamp(-0.999, 0.999), size, depth, g(4, 50.0) / 100.0, if g(5, 1.0) != 0.0 { -1.0 } else { 1.0 }, (44100.0 / (size * freq)).floor().max(4.0), 0.];
+                let size = ((depth * TAU).floor()).min((RATE / 4.0 / freq).floor()).max(1.0);
+                p = [off, (g(1, 20.0) / 100.0).clamp(-0.999, 0.999), size, depth, g(4, 50.0) / 100.0, if g(5, 1.0) != 0.0 { -1.0 } else { 1.0 }, (RATE / (size * freq)).floor().max(4.0), 0.];
                 s = vec![0.0; 8192];
             }
-            3 => p = [(172.265625 / (g(0, 1.0) * 0.5).max(1e-3)).floor().max(4.0), g(1, 100.0) / 100.0, 0., 0., 0., 0., 0., 0.],
+            3 => p = [(RATE / 256.0 / (g(0, 1.0) * 0.5).max(1e-3)).floor().max(4.0), g(1, 100.0) / 100.0, 0., 0., 0., 0., 0., 0.],
             4 => { let d = (g(0, 50.0) / 100.0).min(0.99998); p[0] = 2.0 * d / (1.0 - d); p[1] = g(1, 100.0) / 100.0 }
             5 => {
                 let post = (-g(1, 18.0) / 6.0).exp2();
@@ -59,8 +59,8 @@ impl Fx {
                 s = vec![0.0; 4];
             }
             6 => {
-                let w = (g(1, 50.0) * 44.1).max(1.0).floor();
-                p = [(g(0, 70.0) / 100.0).powi(2), w, if g(2, 20.0) == 0.0 { 0.5 } else { (-1.0 / (g(2, 20.0) * 44.1)).exp2() }, if g(3, 20.0) == 0.0 { 2.0 } else { (1.0 / (g(3, 20.0) * 44.1)).exp2() }, (g(4, 6.0) / 6.0).exp2(), g(5, 50.0) / 100.0, 2.0, 0.0];
+                let w = (g(1, 50.0) * (RATE / 1000.0)).max(1.0).floor();
+                p = [(g(0, 70.0) / 100.0).powi(2), w, if g(2, 20.0) == 0.0 { 0.5 } else { (-1.0 / (g(2, 20.0) * (RATE / 1000.0))).exp2() }, if g(3, 20.0) == 0.0 { 2.0 } else { (1.0 / (g(3, 20.0) * (RATE / 1000.0))).exp2() }, (g(4, 6.0) / 6.0).exp2(), g(5, 50.0) / 100.0, 2.0, 0.0];
                 s = vec![0.0; w as usize];
             }
             7 => { p = [(1 << (g(0, 0.0) as u32).min(12)) as f32, (g(1, 16.0).clamp(1.0, 30.0)).exp2(), g(2, 2.0), 0., 0., 0., 0., 0.]; s = vec![0.0; 4] }
@@ -73,7 +73,7 @@ impl Fx {
                 p[..4].copy_from_slice(&m);
                 p[4] = (w == 0.0 && g(2, 0.0) == 0.0 && inv > 0.0) as i32 as f32;
             }
-            10 => { p = [g(0, 100.0) / 100.0, g(1, 100.0) / 100.0, g(2, 100.0) / 100.0, 2.0 * (g(3, 880.0) * PI / 44100.0).sin(), 2.0 * (g(4, 5000.0) * PI / 44100.0).sin(), 0., 0., 0.]; s = vec![0.0; 22] }
+            10 => { p = [g(0, 100.0) / 100.0, g(1, 100.0) / 100.0, g(2, 100.0) / 100.0, 2.0 * (g(3, 880.0) * PI / RATE).sin(), 2.0 * (g(4, 5000.0) * PI / RATE).sin(), 0., 0., 0.]; s = vec![0.0; 22] }
             11..=18 => { p[..5].copy_from_slice(&biquad(k, g(0, [800., 5500., 3000., 3000., 3000., 3000., 3000., 5500.][k - 11]), g(1, 1.0), g(2, 6.0))); s = vec![0.0; 8] }
             21 => {
                 // Six peaking formants (frequency snapped to 1/32 octave from 50 Hz), then output level.
@@ -88,7 +88,7 @@ impl Fx {
             _ => {
                 let tb = |i: usize| tables.get(g(i, 255.0) as usize).cloned().flatten().filter(|_| g(i, 255.0) < 255.0);
                 t = [tb(0), tb(1)];
-                p[0] = (44100.0 / g(2, 20.0).max(1.0)).floor().max(44.0);
+                p[0] = (RATE / g(2, 20.0).max(1.0)).floor().max(44.0);
                 p[1] = t[0].as_ref().map_or(128.0, |t| t.0[0] as f32);
                 p[2] = t[1].as_ref().map_or(0.0, |t| t.0[0] as f32 / 129.0);
                 s = vec![0.0; 4];
@@ -212,10 +212,7 @@ impl Fx {
                     if self.c >= p[0] as i32 {
                         (self.c, self.i) = (0, self.i + 1);
                         for (j, sc) in [(0, 1.0), (1, 129.0)] {
-                            if let Some((v, lp)) = &self.t[j] {
-                                let i = if self.i < v.len() { self.i } else { lp.map_or(v.len() - 1, |l| l + (self.i - l) % (v.len() - l).max(1)) };
-                                self.p[j + 1] = v[i] as f32 / sc;
-                            }
+                            if let Some(t) = &self.t[j] { self.p[j + 1] = crate::tval(t, self.i) as f32 / sc }
                         }
                     }
                 }
