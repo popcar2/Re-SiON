@@ -1,0 +1,23 @@
+cargo-features = ["panic-immediate-abort"]
+
+[package]
+name = "sion-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "C ABI shared library (libsion.so / sion.dll) for the SiON MML player"
+
+[lib]
+name = "sion"
+crate-type = ["cdylib"]
+
+[dependencies]
+sion_core = { package = "sion", path = "../sion" }
+
+[profile.release]
+# Full speed: the size saving comes from rebuilding std without panic/backtrace machinery (.cargo/config.toml).
+# opt-level "z" would only save ~7% more and costs ~15% render speed.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "immediate-abort"
+strip = true
