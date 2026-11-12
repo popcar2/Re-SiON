@@ -335,6 +335,8 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
         for b in &mut n.bends { b.0 = (b.0 + shift) * sub }
         for v in &mut n.vols { v.0 = (v.0 + shift) * sub }
         for l in &mut n.lfos { l.0 = (l.0 + shift) * sub }
+        for w in &mut n.waves { w.0 = (w.0 + shift) * sub }
+        for p in &mut n.pans { p.0 = (p.0 + shift) * sub }
         if let Some(c) = &mut n.cut { *c = (*c + shift) * sub }
         // Release pitch per driver frame → per SiON frame (1/60 s, when key-off tables step).
         if !n.rel.is_empty() && period != 735.0 {
@@ -342,7 +344,23 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
             n.rel = (0..len).map(|j| n.rel[((j as f64 * 735.0 / period) as usize).min(n.rel.len() - 1)]).collect();
         }
     }
-    notes.extend(hits.iter().filter_map(|(k, h)| hit_note(h, ch0 + 16 * *k as u32 + h.voice as u32, phase, period / sub as f64, shift * sub)));
+    let note = |(k, h): &(usize, Hit)| hit_note(h, ch0 + 16 * *k as u32 + h.voice as u32, phase, period / sub as f64, shift * sub);
+    notes.extend(hits.iter().filter(|(_, h)| !h.dmc).filter_map(note));
+    // NES DPCM hits: the channel holds the level between them and plays a sample on until the next one starts,
+    // so they share one track: each note ends by the time the next starts (where its sample may play on).
+    let mut dmc: Vec<Note> = hits.iter().filter(|(_, h)| h.dmc).filter_map(note).collect();
+    dmc.sort_by_key(|n| (n.ch, n.start));
+    for i in 1..dmc.len() {
+        let (ch, start) = (dmc[i].ch, dmc[i].start);
+        let n = &mut dmc[i - 1];
+        if n.ch == ch && n.end > start {
+            n.end = start.max(n.start + 1);
+            let end = n.end;
+            n.bends.retain(|b| b.0 < end);
+            n.vols.retain(|v| v.0 < end);
+        }
+    }
+    notes.extend(dmc);
     if defs.pcm.len() >= 256 { warnings.push("more than 256 different samples: the rest are left out".into()) }
     let ppq = 4 * (rowlen * sub) as u32;
     let bpm = 60.0 * 44100.0 / period / (4 * rowlen) as f64;

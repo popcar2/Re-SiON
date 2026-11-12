@@ -68,18 +68,39 @@ fn len(s: &[u8], i: &mut usize, l: i32) -> i32 {
     }
 }
 
-/// `#PCMB n{data}rate,key,loop,flags`: base64url (`A-Z a-z 0-9 - _`) of signed little-endian frames, 8-bit or
-/// (flags 1) 16-bit; played at `rate` (44100) at note `key` (60); looping from frame `loop` (none if omitted or
-/// negative), back and forth with flags 2.
-fn pcm(dat: &[u8], a: &[f32]) -> Sample {
+/// Base64url (`A-Z a-z 0-9 - _`) to bytes.
+fn unb64(dat: &[u8]) -> Vec<u8> {
     let (mut bytes, mut acc, mut nb) = (vec![], 0u32, 0);
     for &c in dat {
         let d = match c { b'A'..=b'Z' => c - b'A', b'a'..=b'z' => c - b'a' + 26, b'0'..=b'9' => c - b'0' + 52, b'-' => 62, b'_' => 63, _ => continue };
         (acc, nb) = ((acc << 6 | d as u32) & 0xffff, nb + 6);
         if nb >= 8 { nb -= 8; bytes.push((acc >> nb) as u8) }
     }
+    bytes
+}
+
+/// `#PCMB n{data}rate,key,loop,flags,level`: base64url of signed little-endian frames, 8-bit or (flags 1) 16-bit;
+/// played at `rate` (44100) at note `key` (60); looping from frame `loop` (none if omitted or negative), back and
+/// forth with flags 2. With flags 4 the data is NES DPCM, decoded as the console's delta modulation channel plays
+/// it: each bit, least significant first, moves a 7-bit level up (1) or down (0) by 2, staying within 0..127,
+/// from `level` (0); the frames are the level / 128, frame 0 the starting level, so there is one more frame than
+/// bits. A channel plays it the way the console's channel does (the level holds between samples; see
+/// `Chan::dpcm`). `{=m}` instead of data: the bytes of DPCM sample `m` (an earlier `#PCMB`), so the same DPCM
+/// sample started from another level is stored once.
+fn pcm(bytes: &[u8], a: &[f32]) -> Sample {
     let flags = a.get(3).map_or(0, |f| *f as i32);
-    let data = if flags & 1 != 0 { bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect() }
+    let data = if flags & 4 != 0 {
+        let mut l = a.get(4).map_or(0, |l| *l as i32).clamp(0, 127);
+        let mut d = Vec::with_capacity(bytes.len() * 8 + 1);
+        d.push(l as f32 / 128.0);
+        for &b in bytes {
+            for k in 0..8 {
+                l = if b >> k & 1 != 0 { if l <= 125 { l + 2 } else { l } } else if l >= 2 { l - 2 } else { l };
+                d.push(l as f32 / 128.0);
+            }
+        }
+        d
+    } else if flags & 1 != 0 { bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect() }
         else { bytes.iter().map(|&b| b as i8 as f32 / 128.0).collect() };
     let lp = a.get(2).filter(|l| **l >= 0.0).map(|l| *l as usize);
     Sample { data, rate: a.first().copied().unwrap_or(RATE).max(0.0), key: a.get(1).map_or(60, |k| *k as i32), lp, bidi: flags & 2 != 0 }
@@ -393,7 +414,7 @@ impl Track {
                 self.exec(&s, &mut i, sh, bpm, true);
                 self.i = i;
             } else if let (Some(r), true) = (self.rep, self.moved) {
-                (self.i, self.moved, self.once) = (r, false, true);
+                (self.i, self.moved, self.once, self.ch.rejoin) = (r, false, true, true);
             } else {
                 (self.end, self.once) = (true, true);
             }
@@ -799,7 +820,9 @@ fn inline(s: &[u8], tables: &mut [Option<Table>], next: &mut usize) -> Vec<u8> {
 
 impl Song {
     /// Set PCM sample `n` (0..255), replacing any `#PCMB` of that number.
-    pub fn set_sample(&mut self, n: usize, s: Sample) { if let Some(slot) = self.sh.samples.get_mut(n) { *slot = Some(s) } }
+    pub fn set_sample(&mut self, n: usize, s: Sample) {
+        if let Some(slot) = self.sh.samples.get_mut(n) { *slot = Some(s); self.sh.dpcm[n] = false }
+    }
 
     pub fn new(mml: &str) -> Song {
         // Strip comments.
@@ -813,12 +836,14 @@ impl Song {
 
         let (sine, pan, att) = tables();
         let mut sh = Shared {
-            samples: vec![None; 256], waves: vec![vec![]; 256], noise: noise(), tables: vec![None; 512], voices: vec![None; 256],
+            samples: vec![None; 256], dpcm: vec![false; 256], waves: vec![vec![]; 256], noise: noise(), tables: vec![None; 512], voices: vec![None; 256],
             fps: 60.0, quant: 8, tmode: (0, 1.0), vmode: (0, 0, 4), rev: (1, 1), fb2: false, sign: [0; 7], sine, pan, att,
         };
 
         // Split into `;`-terminated statements: macro definitions, system commands, sequences.
         let (mut mac, mut dynamic, mut seqs, mut effects, mut conn) = (vec![vec![]; 26], false, vec![], vec![], vec![]);
+        // Each DPCM `#PCMB`'s bytes, for `{=m}` references.
+        let mut raw: Vec<(usize, Vec<u8>)> = vec![];
         let (mut st, mut brace) = (0, false);
         for e in 0..text.len() {
             match text[e] { b'{' => brace = true, b'}' => brace = false, _ => {} }
@@ -881,7 +906,16 @@ impl Song {
                     let hex: Vec<u32> = dat.iter().filter_map(|c| (*c as char).to_digit(16)).collect();
                     sh.waves[k & 255] = hex.chunks_exact(2).map(|p| (p[0] * 16 + p[1]) as u8 as i8 as f32 / 128.0).collect();
                 }
-                b"PCMB" => sh.samples[k & 255] = Some(pcm(dat, &nums(pfx))),
+                b"PCMB" => {
+                    let bytes = match dat.strip_prefix(b"=") {
+                        Some(m) => { let mut j = 0; let m = num(m, &mut j).unwrap_or(-1); raw.iter().rev().find(|r| r.0 as i32 == m).map_or(vec![], |r| r.1.clone()) }
+                        None => unb64(dat),
+                    };
+                    let a = nums(pfx);
+                    sh.samples[k & 255] = Some(pcm(&bytes, &a));
+                    sh.dpcm[k & 255] = a.get(3).is_some_and(|f| *f as i32 & 4 != 0);
+                    if sh.dpcm[k & 255] { raw.push((k & 255, bytes)) }
+                }
                 b"EFFECT" => effects.push((k, dat.to_vec(), pfx.to_vec())),
                 b"FM" => conn.push((seqs.len(), dat.to_vec())),
                 _ => {}

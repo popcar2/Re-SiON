@@ -277,26 +277,67 @@ fn ym2612_dac_stream() {
     assert!(xdb > 50.0, "--exact-pcm: the streamed DAC output as written: {xdb:.1} dB");
 }
 
+/// Set `level` (the DMC's output, which holds between samples) to `frames` played from VGM time `at` at `rate`
+/// frames per second, linearly interpolated, holding the level up to there.
+fn play_level(level: &mut Vec<f64>, at: f64, rate: f64, frames: &[f64]) {
+    let n = (frames.len() as f64 * 44100.0 / rate).ceil() as usize + 2;
+    let last = level.last().copied().unwrap_or(0.0);
+    level.resize(at as usize + n + 1, last);
+    for i in (at.ceil() as usize)..=(at as usize + n) {
+        let p = (i as f64 - at) * rate / 44100.0;
+        let (k, f) = (p as usize, p.fract());
+        let v = |k: usize| frames.get(k).or(frames.last()).copied().unwrap_or(0.0);
+        level[i] = v(k) + (v(k + 1) - v(k)) * f;
+    }
+}
+
+/// The DC blocker a DPCM channel's level goes through (first order, 60 Hz).
+fn dc_block(x: &[f64]) -> Vec<f64> {
+    let a = 1.0 / (1.0 + std::f64::consts::TAU * 60.0 / 44100.0);
+    let (mut y, mut prev) = (0.0, 0.0);
+    x.iter().map(|&v| { y = a * (y + v - prev); prev = v; y }).collect()
+}
+
+#[test]
+fn nes_noise_mode_change_mid_note() {
+    // Long-mode noise hits every 6 frames from the fifth row; the last switches to short mode two frames in, without a new key-on:
+    // one slurred note that swaps to `@10` there. A DPCM sample in the song makes the score count in SiON ticks
+    // (`sub` per frame), where the swap must land too, not at the note's start.
+    let mut b = block(0xc2, &[0x00, 0xc0, 0x55, 0xaa]);
+    b.extend([0xb4, 0x10, 0x0f, 0xb4, 0x12, 0x00, 0xb4, 0x13, 0x00, 0xb4, 0x0c, 0x3f, 0xb4, 0x0e, 0x05]);
+    for i in 0..8 {
+        // (Pulse notes every row, so the score finds the rows.)
+        b.extend([0xb4, 0x15, if i == 0 { 0x11 } else if i < 4 { 0x01 } else { 0x09 }, 0xb4, 0x00, 0xbf, 0xb4, 0x02, 0x80 + i * 8, 0xb4, 0x03, 0x01]);
+        if i >= 4 { b.extend([0xb4, 0x0f, 0x08]) }
+        if i == 7 { wait(&mut b, 735 * 2); b.extend([0xb4, 0x0e, 0x85]); wait(&mut b, 735 * 4) } else { wait(&mut b, 735 * 6) }
+    }
+    b.extend([0xb4, 0x15, 0x00]);
+    wait(&mut b, 735 * 6);
+    let out = check(&vgm(&[(0x84, 1789773)], &b));
+    assert!(out.plain.contains("%7"), "the DPCM sample: {}", out.plain);
+    let noise = out.plain.lines().find(|l| l.contains("%1@9")).unwrap_or_else(|| panic!("long noise: {}", out.plain));
+    let (long, short) = (noise.rfind("%1@9").unwrap(), noise.find("@10").unwrap_or_else(|| panic!("short noise: {noise}")));
+    assert!(short > long && noise[long..short].contains('&'), "short mode only after the slur: {noise}");
+}
+
 #[test]
 fn nes_dpcm_and_raw_pcm() {
     // A 17-byte DPCM sample at $C000 played twice at the top rate, then levels written to $4011 every 3 frames.
-    // (Each byte has as many ups as downs, so the level ends where it started: the NES would hold any other
-    // level, a DC offset the conversion leaves out.)
+    // The DMC's level (64, from $4011) holds between the samples; the channel playing them takes its DC out.
     let bits: Vec<u8> = (0..17u8).map(|i| [0x0f, 0xf0, 0x33, 0xcc, 0xaa, 0x55, 0x3c][i as usize % 7]).collect();
     let mut body = vec![0x00, 0xc0];
     body.extend(&bits);
     let mut b = block(0xc2, &body);
     b.extend([0xb4, 0x15, 0x00, 0xb4, 0x11, 64, 0xb4, 0x10, 0x0f, 0xb4, 0x12, 0x00, 0xb4, 0x13, 0x01]);
     let rate = 1789773.0 / 54.0;
-    let (mut held, mut played, mut t) = (vec![], vec![], 0u64);
+    let (mut held, mut played, mut dmc, mut t) = (vec![], vec![], vec![], 0u64);
     for _ in 0..2 {
         wait(&mut b, 3000);
         t += 3000;
         b.extend([0xb4, 0x15, 0x10]);
-        let (mut l, mut frames) = (64i32, vec![0.0]);
-        for byte in &bits { for k in 0..8 { if byte >> k & 1 != 0 { if l <= 125 { l += 2 } } else if l >= 2 { l -= 2 } frames.push((l - 64) as f64) } }
-        mix(&mut held, t as f64, rate, &frames);
-        mix(&mut played, t as f64, rate, &frames);
+        let (mut l, mut frames) = (64i32, vec![64.0]);
+        for byte in &bits { for k in 0..8 { if byte >> k & 1 != 0 { if l <= 125 { l += 2 } } else if l >= 2 { l -= 2 } frames.push(l as f64) } }
+        play_level(&mut dmc, t as f64, rate, &frames);
         assert_eq!(l, 64);
         wait(&mut b, 2000);
         t += 2000;
@@ -310,6 +351,10 @@ fn nes_dpcm_and_raw_pcm() {
     mix(&mut held, t as f64, 44100.0, &levels.iter().flat_map(|&v| [v; 3]).collect::<Vec<_>>());
     mix(&mut played, t as f64, 14700.0, &levels);
     wait(&mut b, 4000);
+    dmc.resize(held.len().max(played.len()) + 4000, 64.0);
+    for (i, v) in dc_block(&dmc).into_iter().enumerate() {
+        for out in [&mut held, &mut played] { if out.len() <= i { out.resize(i + 1, 0.0) } out[i] += v }
+    }
     let (out, exact) = both(&vgm(&[(0x84, 1789773)], &b));
     assert!(out.plain.matches("#PCMB").count() >= 2, "the DPCM sample and the written levels");
     let (db, xdb) = (match_db(&out.mml, &played), match_db(&exact.mml, &held));

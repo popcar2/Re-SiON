@@ -35,16 +35,19 @@ pub struct Hit {
     pub pan: i32,
     pub vols: Vec<(f64, f32)>,
     pub keys: Vec<(f64, f64)>,
+    /// NES DPCM: the frames are the DMC's level, which the channel playing them holds between hits (each starts
+    /// from the level the one before left), so all of them play on one track.
+    pub dmc: bool,
 }
 
 impl Hit {
     pub fn new(voice: usize, at: f64, end: f64, smp: usize, rate: f64, key: f64, amp: f32, pan: i32) -> Hit {
-        Hit { voice, at, end, cut: false, smp, ofs: 0.0, rate, key, amp, pan, vols: vec![], keys: vec![] }
+        Hit { voice, at, end, cut: false, smp, ofs: 0.0, rate, key, amp, pan, vols: vec![], keys: vec![], dmc: false }
     }
 }
 
 /// URL-safe base64, as `#PCMB` reads it (no `/`, so a sample can't contain a `//` comment).
-fn b64(bytes: &[u8]) -> String {
+pub fn b64(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut s = String::with_capacity(bytes.len() * 4 / 3 + 4);
     for c in bytes.chunks(3) {

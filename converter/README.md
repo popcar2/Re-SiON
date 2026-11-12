@@ -163,8 +163,12 @@ partway into its sample plays just its frames (`@ph start,length`). Each sound i
   at the rate it reads. Drivers write with a few frames of jitter (Sonic's every 2 to 7 frames); that is left out.
 - Values written directly (YM2612 DAC register writes, NES `$4011`) are sampled at the run's usual write rate:
   each write lasts as many frames as its gap spans at that rate, so a pause in the writing still holds the value.
-- NES: DPCM samples are decoded from the program memory in the VGM (`0xC2` blocks) and played at the DMC rate.
-  The DMC level a sample leaves behind (a DC offset) is not kept.
+- NES: DPCM samples are taken from the program memory in the VGM (`0xC2` blocks) and stored as they are, 1 bit a
+  step (`#PCMB` flags 4, below), with the level the DMC was at when each started: a sample decodes differently
+  from another level, where it reaches the 7-bit level's floor or ceiling. They play at the DMC rate (a `$4010`
+  change bends a playing one), all on one track: the channel keeps the DMC's level between samples, so a sample
+  stopped partway (`$4015`) leaves it where it got to and the next goes on from there, as on the console, with
+  no click where one ends.
 - YM2610 ADPCM-A (six channels, at clock / 432) and ADPCM-B (pitched, repeating), YM2608 ADPCM-B: decoded from the
   ROM blocks (`0x81`-`0x83`) as the chips decode them, kept in 8 bits scaled to each sample's peak, with their
   levels, pan and pitch changes.
@@ -207,7 +211,8 @@ lengths, so the converter works out where each one ends:
 - Otherwise the NSFE's track time (plus fade) when it gives one, or the first 10 minutes (with a note).
 
 DPCM samples are read from the program's memory as it is banked when each one starts. The DMC level starts at
-0, as on the console, and a driver setting it now and then (`$4011`, a few writes: a DC step) isn't a sample.
+0, as on the console, and a driver setting it now and then (`$4011`, a few writes: a DC step) isn't a sample: the
+next DPCM sample starts from that level.
 
 Expansion sound:
 
@@ -224,6 +229,7 @@ VRC7, Famicom Disk System and Namco 163 sound, MMC5 PCM, and the VRC6 pulses' di
 runs with them (FDS RAM, N163 sound RAM, the MMC5 multiplier and ExRAM are there), so the APU part converts.
 
 Sizes: Shovel Knight's NSFE tracks (APU and VRC6) become 25-90 KB of MML; each takes a few seconds to convert.
+A FamiTracker NSF with DPCM drums (a 15 KB E1M1 cover) becomes 26 KB.
 
 ### `#PCMB`: samples in MML
 
@@ -236,6 +242,16 @@ from, and may have a fraction (`@ph221.25`), be negative (that many frames of si
 frames to play before the sample stops (`@ph-16.5,100`); `k` may have a fraction too, on every module. A PCM note
 starts, and changes pitch, at its exact time between output frames, so the sample's position never drifts from the
 score. These are extensions: SiON itself loads PCM data from ActionScript, not from MML.
+
+NES DPCM (flags 4, `#PCMBn{data}rate,key,loop,4,level;`): `data` is the DMC's bytes as they are, each bit (least
+significant first) moving its 7-bit level up (1) or down (0) by 2 within 0..127, from `level`; the frames are the
+level / 128, one per bit plus the starting level. `{=m}` instead of data takes the bytes of DPCM sample `m` (an
+earlier `#PCMB`), so a sample started from several levels is stored once. A channel plays them as the console's
+DMC does: its output is the level, which holds where a sample ends, is stopped by `@ph`'s length, or is keyed off
+(those don't stop the channel); a note waiting for its start (a negative `@ph`) lets the sample before it play on
+until then; and a first-order 60 Hz high-pass takes out the DC, as the console's output stage does (60 Hz matches
+an NSF player's low end). Where a song loops back, the first sample after the loop point joins the level the end
+left (the difference fading out over 20 ms), since it was decoded from the level of the first time through.
 
 `#FBMODE{chip};` (another extension of the `sion` crate) feeds FM feedback from the sum of an operator's last
 two outputs, each at half the depth, as the Yamaha chips do: the same depth for a slowly changing tone, but the

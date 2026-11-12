@@ -194,12 +194,23 @@ struct Dmc {
     level: u8,
     /// The playing sample: until when, its hit, and the level it ends on.
     play: Option<(f64, Hit, u8)>,
+    /// Where the playing sample has got to: frames played by `pos.1`, at `pos.2` frames per second; its decoded
+    /// sample (in `cache`) and the level it started from.
+    pos: (f64, f64, f64, usize, u8),
     raw: Capture,
     hits: Vec<Hit>,
     /// Decoded samples by (address, length, starting level, loop): frames and the level they end on.
     cache: Vec<((usize, usize, u8, bool), Vec<f32>, u8)>,
-    /// Per hit: the decoded sample, the rate it started at, whether it loops (numbered in `hits`).
-    played: Vec<(usize, f64, bool)>,
+    /// Per hit: the decoded sample, whether it loops (numbered in `hits`).
+    played: Vec<(usize, bool)>,
+    /// Per decoded sample: the rate it is defined at (the first it played at: other rates play it at another
+    /// pitch, so a sample played at several rates is stored once), the first decoded sample with the same frames
+    /// (whose definition it uses), and its DPCM bytes.
+    defn: Vec<(f64, usize, Vec<u8>)>,
+    /// DPCM bytes already defined, and the sample number that holds them (later definitions refer to it).
+    stored: Vec<(Vec<u8>, usize)>,
+    /// Decoded samples already defined, and their sample numbers.
+    defined: Vec<(usize, usize)>,
 }
 
 /// DMC output step in the level scale the other channels use (pulse 15 = 1.0 for a ±1 wave): the APU's linear
@@ -210,7 +221,7 @@ const NES_LEN: [u8; 32] = [10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12,
 
 impl NesApu {
     pub fn new(clock: u32) -> Self {
-        let dmc = Dmc { mem: vec![0; 0x10000], t: 0.0, level: 0, play: None, raw: Capture::new(1, 64.0, 1.0 / 128.0, 128.0 * DMC_UNIT), hits: vec![], cache: vec![], played: vec![] };
+        let dmc = Dmc { mem: vec![0; 0x10000], t: 0.0, level: 0, play: None, raw: Capture::new(1, 64.0, 1.0 / 128.0, 128.0 * DMC_UNIT), hits: vec![], cache: vec![], played: vec![], defn: vec![], stored: vec![], defined: vec![], pos: (0.0, 0.0, 1.0, 0, 0) };
         // Channels start enabled: rips of NSF music start after the player's init, which enables them.
         let mut r = [0; 0x18];
         r[0x15] = 0x0f;
@@ -238,23 +249,54 @@ impl NesApu {
         if self.dmc.play.is_some() { return }
         let (addr, len, lp) = (0xc000 + self.r[0x12] as usize * 64, self.r[0x13] as usize * 16 + 1, self.r[0x10] & 0x40 != 0);
         let key = (addr, len, self.dmc.level, lp);
-        let (frames, end_level) = match self.dmc.cache.iter().find(|c| c.0 == key) {
-            Some(c) => (c.1.clone(), c.2),
-            None => { let (f, l) = dpcm(&self.dmc.mem, addr, len, self.dmc.level); self.dmc.cache.push((key, f.clone(), l)); (f, l) }
-        };
         let rate = self.dmc_rate(self.r[0x10]);
+        let i = match self.dmc.cache.iter().position(|c| c.0 == key) {
+            Some(i) => i,
+            None => {
+                let (f, l) = dpcm(&self.dmc.mem, addr, len, self.dmc.level);
+                let bytes = (0..len).map(|k| self.dmc.mem[if addr + k > 0xffff { addr + k - 0x8000 } else { addr + k }]).collect();
+                // (The same frames, from another address or starting level, share one definition.)
+                let same = self.dmc.cache.iter().position(|c| c.1 == f && c.0.3 == lp).map(|j| self.dmc.defn[j].1);
+                self.dmc.defn.push(match same { Some(j) => (self.dmc.defn[j].0, j, bytes), None => (rate, self.dmc.cache.len(), bytes) });
+                self.dmc.cache.push((key, f, l));
+                self.dmc.cache.len() - 1
+            }
+        };
+        let (n, end_level, def_rate) = (self.dmc.cache[i].1.len(), self.dmc.cache[i].2, self.dmc.defn[i].0);
         let t = self.dmc.t;
-        let until = if lp { f64::INFINITY } else { t + frames.len() as f64 * 44100.0 / rate };
+        let until = if lp { f64::INFINITY } else { t + n as f64 * 44100.0 / rate };
         // (`smp` indexes `played` until the samples are numbered in `hits`.)
-        let i = self.dmc.cache.iter().position(|c| c.0 == key).unwrap();
-        self.dmc.played.push((i, rate, lp));
-        let h = Hit::new(0, t, until, self.dmc.played.len() - 1, rate, 60.0, 128.0 * DMC_UNIT, 0);
+        self.dmc.played.push((i, lp));
+        let h = Hit::new(0, t, until, self.dmc.played.len() - 1, def_rate, 60.0 + 12.0 * (rate / def_rate).log2(), 128.0 * DMC_UNIT, 0);
+        self.dmc.pos = (0.0, t, rate, i, self.dmc.level);
         self.dmc.play = Some((until, h, if lp { self.dmc.level } else { end_level }));
     }
-    /// Stop the playing sample now (DMC disabled).
+    /// The `#PCMB` of decoded sample `i`: its DPCM bytes as they are (`flags` 4) and the level it starts from, for
+    /// SiON to decode; bytes already stored for another level are referred to (`{=m}`) instead of repeated.
+    fn dpcm_def(&mut self, defs: &mut Defs, i: usize, lp: bool) -> Option<usize> {
+        if let Some(&(_, n)) = self.dmc.defined.iter().find(|d| d.0 == i) { return Some(n) }
+        let (rate, _, bytes) = &self.dmc.defn[i];
+        let tail = format!("{},60,{},4,{}", *rate as f32, if lp { 1 } else { -1 }, self.dmc.cache[i].0.2);
+        let data = match self.dmc.stored.iter().find(|s| s.0 == *bytes) { Some(s) => format!("={}", s.1), None => crate::pcm::b64(bytes) };
+        let n = defs.pcm(format!("{{{data}}}{tail}"))?;
+        if !self.dmc.stored.iter().any(|s| s.0 == *bytes) { self.dmc.stored.push((bytes.clone(), n)) }
+        self.dmc.defined.push((i, n));
+        Some(n)
+    }
+    /// Stop the playing sample now (DMC disabled): the output stays at the level the sample had got to, which is
+    /// where the next sample starts from.
     fn dmc_stop(&mut self) {
         self.dmc_settle();
-        if let Some((_, mut h, _)) = self.dmc.play.take() { (h.end, h.cut) = (self.dmc.t, true); self.dmc.hits.push(h) }
+        if let Some((_, mut h, _)) = self.dmc.play.take() {
+            let (done, since, rate, i, start) = self.dmc.pos;
+            let frames = &self.dmc.cache[i].1;
+            let k = ((done + (self.dmc.t - since) * rate / 44100.0) as usize).min(frames.len() - 1);
+            // (A looping sample's frames repeat from frame 1, which is relative to the same start.)
+            let k = if self.dmc.cache[i].0.3 && frames.len() > 1 && k > 0 { 1 + (k - 1) % (frames.len() - 1) } else { k };
+            self.dmc.level = (start as f32 + frames[k] * 128.0).round() as u8;
+            (h.end, h.cut) = (self.dmc.t, true);
+            self.dmc.hits.push(h)
+        }
     }
     fn sweep_target(&self, c: usize) -> i32 {
         let (t, s) = (self.timer[c] as i32, self.r[c * 4 + 1]);
@@ -311,10 +353,18 @@ impl Chip for NesApu {
                 self.env[2].0 = true;
             }
             0x10 => {
-                // A rate change bends a playing sample.
+                // A rate change bends a playing sample, and moves its end.
                 self.dmc_settle();
-                let rate = self.dmc_rate(d);
-                if let Some((_, h, _)) = &mut self.dmc.play { h.keys.push((self.dmc.t, 60.0 + 12.0 * (rate / h.rate).log2())) }
+                let (rate, t) = (self.dmc_rate(d), self.dmc.t);
+                if let Some((until, h, _)) = &mut self.dmc.play {
+                    let (done, since, old, i, start) = self.dmc.pos;
+                    if rate != old {
+                        h.keys.push((t, 60.0 + 12.0 * (rate / h.rate).log2()));
+                        let done = done + (t - since) * old / 44100.0;
+                        if until.is_finite() { *until = t + (self.dmc.cache[i].1.len() as f64 - done).max(0.0) * 44100.0 / rate }
+                        self.dmc.pos = (done, t, rate, i, start);
+                    }
+                }
             }
             0x11 => { self.dmc.level = d & 0x7f; self.dmc.raw.set(self.dmc.t, (d & 0x7f) as f32, 0) }
             0x13 => {}
@@ -378,10 +428,11 @@ impl Chip for NesApu {
         if let Some((_, mut h, _)) = self.dmc.play.take() { h.end = h.end.min(end); self.dmc.hits.push(h) }
         // Number the samples played (a looping one loops all but its first frame, the level it starts from).
         let mut out: Vec<Hit> = vec![];
-        for mut h in self.dmc.hits.drain(..) {
-            let (i, rate, lp) = self.dmc.played[h.smp];
-            let Some(n) = crate::pcm::def(defs, &self.dmc.cache[i].1, rate as f32, lp.then_some(1), false) else { continue };
-            h.smp = n;
+        let hits: Vec<Hit> = self.dmc.hits.drain(..).collect();
+        for mut h in hits {
+            let (i, lp) = self.dmc.played[h.smp];
+            let Some(n) = self.dpcm_def(defs, self.dmc.defn[i].1, lp) else { continue };
+            (h.smp, h.dmc) = (n, true);
             out.push(h);
         }
         out.extend(self.dmc.raw.hits(defs, end));

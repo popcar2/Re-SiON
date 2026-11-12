@@ -47,6 +47,9 @@ impl Sample {
 
 pub struct Shared {
     pub samples: Vec<Option<Sample>>,
+    /// Which samples are NES DPCM (`#PCMB` flags 4): their frames are the level of the console's delta modulation
+    /// channel, which a channel playing them keeps the way the console does (see `Chan::dpcm`).
+    pub dpcm: Vec<bool>,
     pub waves: Vec<Vec<f32>>,
     pub noise: [Vec<f32>; 6],
     pub tables: Vec<Option<Table>>,
@@ -331,6 +334,13 @@ pub struct Chan {
     pub sfrac0: f32, pub slate: f32,
     /// Frames a PCM note plays from its start frame before stopping (0: all), and how many are left.
     pub slen: f32, sleft: f32,
+    /// Playing DPCM samples: whether this channel does (its sample is one), whether the sample is still moving
+    /// and whether it has yet to start, the one before (sample, frame, fraction, step, frames left) playing on
+    /// until it does, the level reached (a frame value), the offset that joins a sample to the level the one
+    /// before left (fading out), the gain, and the DC blocker's last input and output. `rejoin`: the track has
+    /// gone back to its loop point, so the next sample joins the level wherever the end of the track left it.
+    pub rejoin: bool,
+    dm: bool, dplay: bool, dnew: bool, dprev: Option<(usize, usize, f32, f32, f32)>, dlv: f32, doff: f32, dg: f32, dhp: (f32, f32),
     pub f_on: bool, pub f_type: usize, f_cut: [i32; 6], f_time: [i32; 6], f_res: f32, f_v: [f32; 3], cutoff: i32, pub cut_off: i32, f_st: usize, f_step: i32, f_next: i32, f_inc: i32, f_cnt: i32,
     pub ks: bool, kbuf: Vec<f32>, kidx: f32, kout: f32, kdec: (f32, f32), pub k_lpf: f32, pub kx: f32,
 }
@@ -356,8 +366,11 @@ impl Chan {
     pub fn init(&mut self, module: i32) {
         // Pipe wiring survives module changes so `#FM` connections set before `%` stay in place.
         let keep = (self.vol, self.pan, self.vm, self.xv, self.inp, self.outp);
+        // (The DMC level stays where it is when the module is set again.)
+        let dmc = (self.rejoin, self.dm, self.dplay, self.dnew, self.dprev, self.dlv, self.doff, self.dg, self.dhp, self.sidx, self.spos, self.sfrac, self.sstep, self.slen, self.sleft);
         *self = Chan { ops: vec![Op::new(true)], ks: module == 11, pcm: if module == 7 || module == 10 { module } else { -1 }, kbuf: vec![0.0; if module == 11 { 5400 } else { 0 }], ..Chan::new_raw() };
         (self.vol, self.pan, self.vm, self.xv, self.inp, self.outp) = keep;
+        if self.pcm >= 0 && dmc.1 { (self.rejoin, self.dm, self.dplay, self.dnew, self.dprev, self.dlv, self.doff, self.dg, self.dhp, self.sidx, self.spos, self.sfrac, self.sstep, self.slen, self.sleft) = dmc }
         self.lfo_time(333.0);
         if self.ks {
             let o = &mut self.ops[0];
@@ -371,6 +384,7 @@ impl Chan {
             ops: vec![], n: 1, alg: 0, act: 0, fb: 0, fbc: 0, fratio: 1.0, inp: (0, 0), ring: (0, 0), outp: (0, 0), stale: true,
             lfo: 2, lfo_tab: vec![], lfo_step: 0.0, lfo_ph: 0, lfo_t: 1.0, amd: 0, pmd: 0, am: 0.0, pm: 0,
             vol: [0.0; 8], pan: 64, vm: (0, 0), xv: (128, 256), pitch: 0, on: false, fine: 0.0, pcm: -1, smp: 0, sidx: 0, spos: 0, sfrac: 0.0, sstep: 0.0, sfrac0: 0.0, slate: 0.0, slen: 0.0, sleft: 0.0,
+            rejoin: false, dm: false, dplay: false, dnew: false, dprev: None, dlv: 0.0, doff: 0.0, dg: 0.0, dhp: (0.0, 0.0),
             f_on: false, f_type: 0, f_cut: [128, 128, 128, 128, 0, 128], f_time: [0, 0, 0, i32::MAX, 0, i32::MAX], f_res: 1.0, f_v: [0.0; 3], cutoff: 128, cut_off: 0, f_st: 5, f_step: i32::MAX, f_next: 0, f_inc: 0, f_cnt: i32::MAX,
             ks: false, kbuf: vec![], kidx: 0.0, kout: 0.0, kdec: (0.5, 0.75), k_lpf: 0.875, kx: 1.0,
         }
@@ -474,7 +488,9 @@ impl Chan {
         // A PCM note starts at frame `@ph` (moving at no speed until its pitch is set); a negative one is that
         // many frames of silence before the sample.
         let ph = self.ops[0].phase as f32 + self.sfrac0;
-        (self.spos, self.sfrac, self.sstep, self.sleft) = (ph.max(0.0) as usize, if ph < 0.0 { ph } else { self.sfrac0 }, 0.0, self.slen);
+        // (A DPCM sample still playing plays on until the new one starts.)
+        self.dprev = (self.dm && self.dplay).then_some((self.sidx, self.spos, self.sfrac.max(0.0), self.sstep, if self.slen > 0.0 { self.sleft } else { f32::INFINITY }));
+        (self.spos, self.sfrac, self.sstep, self.sleft, self.dplay, self.dnew) = (ph.max(0.0) as usize, if ph < 0.0 { ph } else { self.sfrac0 }, 0.0, self.slen, true, true);
         if self.f_on { self.cutoff = self.f_cut[0]; self.f_shift(0) }
         if self.ks { self.kout = 0.0; for v in &mut self.kbuf { *v *= 0.3 } }
         self.on = true;
@@ -490,6 +506,7 @@ impl Chan {
     /// filter sweep and oscillator phases move on as `n` calls of `sample` would (to rounding); what only
     /// lasts a moment (feedback, filter and plucked-string memory) is left to settle in the samples after.
     pub fn leap(&mut self, sh: &Shared, n: u64) {
+        if self.pcm >= 0 && self.dm { self.dpcm_leap(sh, n as f32) }
         if !self.ks && !self.f_on && self.silent() { return }
         let (live, fr, nf) = (self.ops[0].st != 0, self.fratio, n as f32);
         let eg = if self.pcm >= 0 || self.n == 5 { 1 } else { self.ops.len() };
@@ -509,7 +526,7 @@ impl Chan {
                 self.stale = true;
             }
         }
-        if let (true, Some(s)) = (self.pcm >= 0 && live, sh.samples.get(self.sidx).and_then(Option::as_ref)) {
+        if let (true, Some(s)) = (self.pcm >= 0 && live && !self.dm, sh.samples.get(self.sidx).and_then(Option::as_ref)) {
             self.sfrac += self.sstep * nf;
             let k = self.sfrac as usize;
             (self.spos, self.sfrac) = (self.spos + k, self.sfrac - k as f32);
@@ -532,6 +549,81 @@ impl Chan {
     /// No operator is sounding (a filter or plucked string may still be ringing out).
     pub fn silent(&self) -> bool { self.ops.iter().all(|o| o.st == 0) }
 
+    /// `leap` for a DPCM sample: it moves on (the one before it is taken to have finished), the level goes where
+    /// it got to, and the DC blocker starts settled there.
+    fn dpcm_leap(&mut self, sh: &Shared, nf: f32) {
+        (self.dprev, self.dnew, self.doff) = (None, false, 0.0);
+        if self.dplay {
+            self.sfrac += self.sstep * nf;
+            let k = self.sfrac.max(0.0) as usize;
+            (self.spos, self.sfrac) = (self.spos + k, self.sfrac - k as f32);
+            if let Some(s) = sh.samples.get(self.sidx).and_then(Option::as_ref) {
+                match s.wrap(self.spos) { Some(u) => self.spos = u, None => { self.dplay = false; self.spos = s.data.len().saturating_sub(1) } }
+                if self.sfrac >= 0.0 { self.dlv = s.data.get(self.spos).copied().unwrap_or(0.0) }
+            }
+            if self.slen > 0.0 { self.sleft -= self.sstep * nf; if self.sleft <= 0.0 { self.dplay = false } }
+        }
+        self.dhp = (self.dlv * self.dg, 0.0);
+    }
+
+    /// Whether a DPCM channel still has something to do: a sample moving, or its level's DC still settling.
+    fn dmc_busy(&self) -> bool { self.dm && (self.dplay || self.dprev.is_some() || self.dhp.1.abs() > 1e-7 || (self.dlv + self.doff) * self.dg != self.dhp.0) }
+
+    /// One frame of a DPCM sample, played as the NES's delta modulation channel plays it: its output is a level,
+    /// which stays where the sample left it (at its end, where `@ph` stops it, or at key-off: the channel doesn't
+    /// stop for it) until the next sample moves it on from there; a sample waiting for its start (a negative
+    /// `@ph`) lets the one before it play on until then, so samples that the converter decoded each from the level
+    /// the one before leaves join without a step however the notes fall on output frames. (Where a song loops
+    /// back, the level the end of the song left isn't the one the samples after the loop point were decoded from:
+    /// the first sample after it joins that level instead, and the difference fades out over a few tens of ms.)
+    /// The DC comes out the way the console's output stage takes it out: a first-order high-pass, at 60 Hz, where
+    /// the channel's low end matches an NSF player's (libgme's) within half a dB. (The console's own filters, 90 and
+    /// 440 Hz, act on the whole mix, which SiON's other channels don't get either.) The note's envelope only sets
+    /// the gain.
+    fn dpcm(&mut self, sh: &Shared, am: f32) -> f32 {
+        const HP: f32 = 1.0 / (1.0 + TAU * 60.0 / RATE);
+        const FADE: f32 = 1.0 - 1.0 / (0.02 * RATE);
+        let get = |i: usize| sh.samples.get(i).and_then(Option::as_ref);
+        // (A one-shot holds its last frame: past it there is no silence to slide towards.)
+        let at = |s: &Sample, u: usize| if s.lp.is_some() { s.at(u) } else { s.data.get(u).or(s.data.last()).copied().unwrap_or(0.0) };
+        let o = &mut self.ops[0];
+        if let Some(lv) = o.eg(self.fratio) { if self.on { self.dg = o.level(sh, lv, am) } }
+        if self.sfrac < 0.0 || !self.dplay {
+            // Waiting to start (or done): the sample before plays on, or the level holds.
+            if let Some((i, mut pos, mut frac, step, mut left)) = self.dprev {
+                match get(i) {
+                    Some(s) if left > 0.0 && (s.lp.is_some() || pos + 1 < s.data.len()) => {
+                        self.dlv = at(s, pos) + (at(s, pos + 1) - at(s, pos)) * frac;
+                        frac += step;
+                        let k = frac as usize;
+                        (pos, frac, left) = (pos + k, frac - k as f32, left - step);
+                        if let Some(u) = s.wrap(pos) { pos = u }
+                        self.dprev = Some((i, pos, frac, step, left));
+                    }
+                    s => { if let Some(s) = s { if left > 0.0 { self.dlv = at(s, pos) } } self.dprev = None }
+                }
+            }
+        } else if let Some(s) = get(self.sidx) {
+            self.dprev = None;
+            if core::mem::take(&mut self.dnew) && core::mem::take(&mut self.rejoin) { self.doff += self.dlv - at(s, 0) }
+            self.dlv = at(s, self.spos) + (at(s, self.spos + 1) - at(s, self.spos)) * self.sfrac;
+        }
+        self.doff *= FADE;
+        if self.dplay {
+            self.sfrac += self.sstep;
+            let k = self.sfrac.max(0.0) as usize;
+            (self.spos, self.sfrac) = (self.spos + k, self.sfrac - k as f32);
+            if let Some(s) = get(self.sidx) {
+                match s.wrap(self.spos) { Some(u) => self.spos = u, None if self.spos + 1 >= s.data.len() => { self.dplay = false; self.dlv = at(s, self.spos) } None => {} }
+            }
+            if self.slen > 0.0 { self.sleft -= self.sstep; if self.sleft <= 0.0 { self.dplay = false } }
+        }
+        let u = (self.dlv + self.doff) * self.dg;
+        self.dhp.1 = HP * (self.dhp.1 + u - self.dhp.0);
+        self.dhp.0 = u;
+        self.dhp.1
+    }
+
     /// Recompute the operator pitches and PCM speed after a pitch, LFO or operator change; `late` is how far
     /// into the frame just played (0..1) the change came.
     pub fn refresh(&mut self, sh: &Shared, late: f32) {
@@ -540,6 +632,7 @@ impl Chan {
         if self.pcm >= 0 {
             // `%10` picks the sample by note number and plays it at its own rate.
             self.sidx = if self.pcm == 10 { (pitch >> 6).max(0) as usize } else { self.smp };
+            self.dm = sh.dpcm.get(self.sidx).copied().unwrap_or(false);
             let semi = |s: &Sample| if self.pcm == 7 { (((pitch + self.ops[0].det + pm - s.key * 64) as f32 + fine) / 768.0).exp2() } else { 1.0 };
             let step = sh.samples.get(self.sidx).and_then(Option::as_ref).map_or(0.0, |s| s.rate / RATE * semi(s));
             // The new speed applies from the event's exact time, partway into the frame just played.
@@ -554,7 +647,7 @@ impl Chan {
     #[cfg_attr(feature = "small", optimize(speed))]
     pub fn sample(&mut self, sh: &Shared, pipes: &mut [f32; 4]) -> f32 {
         let late = core::mem::take(&mut self.slate);
-        if !self.ks && !self.f_on && self.silent() { return 0.0 }
+        if !self.ks && !self.f_on && self.silent() && !self.dmc_busy() { return 0.0 }
         if self.pmd != 0 || self.amd > 0 {
             self.lfo_t -= self.lfo_step;
             if self.lfo_t < 0.0 {
@@ -573,7 +666,7 @@ impl Chan {
             // (The chips' sum also cancels at the sample rate, so deep feedback doesn't break into oscillation.)
             if sh.fb2 { (o.out + o.pout) * pow2(self.fb - 8) } else { o.out * pow2(self.fb - 7) }
         } else { 0.0 };
-        let mut x = if self.pcm >= 0 {
+        let mut x = if self.pcm >= 0 && self.dm { self.dpcm(sh, am) } else if self.pcm >= 0 {
             let o = &mut self.ops[0];
             match (sh.samples.get(self.sidx).and_then(Option::as_ref), o.eg(fr)) {
                 (Some(s), Some(lv)) => {
