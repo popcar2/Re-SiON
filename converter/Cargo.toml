@@ -1,0 +1,19 @@
+[package]
+name = "sion-converter"
+version = "0.1.0"
+edition = "2021"
+description = "Convert MIDI, tracker modules (MOD/S3M/XM/IT) and VGM/VGZ chip music to minified SiON MML"
+
+[[bin]]
+name = "sion-convert"
+path = "src/main.rs"
+
+[dependencies]
+# Inflate for gzipped VGM files (.vgz).
+miniz_oxide = "0.8"
+# Renders the output: to keep it from clipping, and for `--verify` (minifying must not change the audio) and `--wav`.
+sion = { path = "../sion" }
+
+[profile.release]
+lto = true
+codegen-units = 1

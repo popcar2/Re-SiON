@@ -1,0 +1,43 @@
+# Rust build output (every crate's target/ folder, at any depth)
+target/
+**/target/
+
+# Rust misc
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+perf.data*
+flamegraph.svg
+
+# Rendered audio / test output
+*.wav
+*.flac
+*.ogg
+*.mp3
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+\#*\#
+.\#*
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+.directory
+
+# Environment / local secrets
+.env
+.env.*
+
+# Logs and temp files
+*.log
+*.tmp
+*.orig
+*.rej

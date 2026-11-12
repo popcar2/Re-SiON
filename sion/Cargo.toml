@@ -1,0 +1,9 @@
+[package]
+name = "sion"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal player for SiON MML music"
+
+[features]
+# Nightly only: for size-optimised builds (opt-level "z"), keep the per-sample playback code optimised for speed.
+small = []
