@@ -221,6 +221,10 @@ fn loops(pool: &mut Pool, seq: &[u32], lens: &Lengths) -> Vec<u32> {
         let mut hl = vec![0u32; n + 1];
         for i in 0..n { pc[i + 1] = pc[i] + pool.cost[s[i] as usize]; hl[i + 1] = hl[i] + pool.has_l[s[i] as usize] as u32 }
         let mut best = (0i64, 0, 0, 0, 0); // saving, start, period, count, prefix length before `|`
+        // The loop point (`$`) can't be inside a repeat: the jump back to it would land partway through one. (A
+        // run can only take it in as the `b` of a once-through `[a|b]2`, since `$` occurs once.)
+        let dollar = pool.ids.get(&Atom::Cmd("$".into())).and_then(|id| s.iter().position(|x| x == id));
+        let clear = |a: usize, len: usize| dollar.is_none_or(|d| d < a || d >= a + len);
         for p in 1..n.min(PMAX + 1) {
             let mut j = 0;
             while j + p < n {
@@ -231,11 +235,11 @@ fn loops(pool: &mut Pool, seq: &[u32], lens: &Lengths) -> Vec<u32> {
                 let (k, m, cu) = (r / p + 1, r % p, pc[a + p] - pc[a]);
                 if k >= 2 {
                     let sav = (k as i64 - 1) * cu - 2 - dig(k);
-                    if sav > best.0 { best = (sav, a, p, k, 0) }
+                    if sav > best.0 && clear(a, k * p) { best = (sav, a, p, k, 0) }
                 }
                 // `[a|b]n` ends at runtime after `a` but in the text after `b`; SiON resolves `l` in text order,
                 // so `b` must not change it.
-                if m > 0 && hl[a + p] == hl[a + m] {
+                if m > 0 && hl[a + p] == hl[a + m] && clear(a, k * p + m) {
                     let sav = (k as i64 - 1) * cu + (pc[a + m] - pc[a]) - 3 - dig(k + 1);
                     if sav > best.0 { best = (sav, a, p, k + 1, m) }
                 }

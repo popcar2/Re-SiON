@@ -2,7 +2,7 @@
 name = "sion-converter"
 version = "0.1.0"
 edition = "2021"
-description = "Convert MIDI, tracker modules (MOD/S3M/XM/IT) and VGM/VGZ chip music to minified SiON MML"
+description = "Convert MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ chip music and NSF/NSFE to minified SiON MML"
 
 [[bin]]
 name = "sion-convert"

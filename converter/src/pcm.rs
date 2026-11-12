@@ -96,6 +96,9 @@ impl Capture {
         Capture { voice, center, scale, amp, exact: false, cur: center, last: 0.0, run: None, done: vec![] }
     }
 
+    /// The output starts at `v` instead of the center (the value before any writes).
+    pub fn start_at(&mut self, v: f32) { self.cur = v }
+
     /// The program writes `v` at frame `t`.
     pub fn set(&mut self, t: f64, v: f32, pan: i32) {
         if self.run.is_some() && t - self.last >= GAP { self.stop(t) }
@@ -115,7 +118,9 @@ impl Capture {
         if let Some(mut r) = self.run.take() {
             let last = self.last;
             r.w.retain(|w| w.0 <= last);
-            if !r.w.is_empty() { self.done.push(r) }
+            // (A few changes only move the output's DC level, as a driver setting the DMC level does: a click
+            // at most. Sounds written value by value take many.)
+            if r.w.windows(2).filter(|p| p[0].1 != p[1].1).count() >= 4 { self.done.push(r) }
         }
     }
 

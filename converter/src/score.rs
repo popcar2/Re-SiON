@@ -61,6 +61,8 @@ pub struct Note {
     /// it sounds. The LFO's rate is part of the tone (`@lfo` in `env`).
     pub lfo0: (i32, i32),
     pub lfos: Vec<(u64, (i32, i32))>,
+    /// (tick, instr) waveform changes while it sounds, within `instr`'s module (`%4@1` → `%4@2`: written `@2`).
+    pub waves: Vec<(u64, String)>,
     /// FM release: the pitch after the key-off, per 1/60 s frame, relative to the pitch at the key-off (1/64
     /// semitones; a key-off pitch table, `_np`), and the tick at which the release is silenced (`v0`), if before
     /// the next note.
@@ -86,7 +88,7 @@ impl Score {
 
 impl Note {
     pub fn new(ch: u32, start: u64, end: u64, key: u8, amp: f32, instr: String) -> Note {
-        Note { ch, start, end, key, amp, instr, env: String::new(), pan: 0, ptab: None, k0: 0, bends: vec![], vols: vec![], pans: vec![], lfo0: (0, 0), lfos: vec![], rel: vec![], cut: None, ofs: 0.0, plen: 0.0, drum: None }
+        Note { ch, start, end, key, amp, instr, env: String::new(), pan: 0, ptab: None, k0: 0, bends: vec![], vols: vec![], pans: vec![], lfo0: (0, 0), lfos: vec![], waves: vec![], rel: vec![], cut: None, ofs: 0.0, plen: 0.0, drum: None }
     }
 }
 
@@ -136,6 +138,15 @@ impl Stream {
         self.tones.iter().position(|x| *x == t).unwrap_or_else(|| { self.tones.push(t); self.tones.len() - 1 })
     }
 
+    /// Tone `a` can change to `b` during a note, without a new key-on: the same envelope, and another waveform
+    /// of the same wavetable module (`%1@n`, `%4@n`), which SiON's `@n` swaps without resetting the phase. (A
+    /// chip changing the waveform, the VRC6 saw's rate or a pulse's duty, doesn't restart it either.)
+    fn switch(&self, a: usize, b: usize) -> bool {
+        let (a, b) = (&self.tones[a], &self.tones[b]);
+        let module = |s: &str| s.strip_prefix('%').and_then(|r| r.split_once('@')).filter(|(m, n)| matches!(*m, "1" | "4") && n.parse::<u32>().is_ok()).map(|(m, _)| m.to_string());
+        a.env == b.env && a.legato == b.legato && module(&a.instr).is_some() && module(&a.instr) == module(&b.instr)
+    }
+
     /// Notes on channels `ch0..`: one note per key-on (or per pitch step for tones without an envelope), with
     /// pitch and volume changes while it sounds. Detune changes smaller than `kstep` (1/64 semitones) are dropped,
     /// and with `kstep` > 1 so are detunes of 1/64 semitone. With `exact` the detunes are in 1/64000 semitones.
@@ -181,10 +192,11 @@ impl Stream {
                     close(&mut cur, t, &mut out);
                     continue;
                 };
+                // A new pitch without a key-on carries on the same note (written as a slur): the chips' tone
+                // generators don't restart their waveform when the frequency changes, and a new note in SiON
+                // would, every frame of an arpeggio or slide (a buzz at the frame rate).
                 let tone = &self.tones[f.tone];
-                let keep = cur.as_ref().is_some_and(|(n, tn, ..)| {
-                    !f.trig && *tn == f.tone && (tone.legato || (f.pitch - n.key as f32).abs() < 0.6)
-                });
+                let keep = cur.as_ref().is_some_and(|(_, tn, ..)| !f.trig && (*tn == f.tone || self.switch(*tn, f.tone)));
                 if !keep {
                     close(&mut cur, t, &mut out);
                     // (A PCM key-on starts its note even when silent: the sample is playing from its start.)
@@ -200,7 +212,8 @@ impl Stream {
                     cur = Some((n, f.tone, f.amp, f.pan));
                     continue;
                 }
-                let (n, _, last, pan) = cur.as_mut().unwrap();
+                let (n, tn, last, pan) = cur.as_mut().unwrap();
+                if *tn != f.tone { n.waves.push((t, tone.instr.clone())); *tn = f.tone }
                 if self.exact && f.pan != *pan { n.pans.push((t, f.pan)); *pan = f.pan }
                 let k = tiny(((f.pitch - n.key as f32) as f64 * ku).round() as i32);
                 let lk = n.bends.last().map_or(n.k0, |b| b.1);

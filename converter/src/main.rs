@@ -1,13 +1,14 @@
-//! sion-convert: MIDI, tracker modules (MOD/S3M/XM/IT) and VGM/VGZ → minified SiON MML.
+//! sion-convert: MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ and NSF/NSFE → minified SiON MML.
 //!
-//! Usage: sion-convert <input> [-o output.mml] [--grid N] [--gain G] [--wavetables] [--exact-pcm] [--plain] [--verify] [--wav FILE]
+//! Usage: sion-convert <input> [-o output.mml] [--grid N] [--gain G] [--wavetables] [--exact-pcm] [--track N] [--plain] [--verify] [--wav FILE]
 
 use std::process::exit;
 
 const HELP: &str = "usage: sion-convert <input> [options]
        sion-convert <song.mml> --wav FILE   (render an MML file)
 
-  input: Standard MIDI (.mid), tracker module (.mod .s3m .xm .it) or chip log (.vgm .vgz);
+  input: Standard MIDI (.mid), tracker module (.mod .s3m .xm .it), chip log (.vgm .vgz) or NES music
+         (.nsf .nsfe);
          the format is recognized from the file's contents
 
   -o, --output FILE  where to write the MML (default: input name with .mml)
@@ -15,7 +16,8 @@ const HELP: &str = "usage: sion-convert <input> [options]
   --gain G           volume scale (default: automatic, avoids clipping chords)
   --wavetables       tracker modules: approximate samples with wavetables and noise instead of embedding them
                      (much smaller output, but only chiptune samples come out close)
-  --exact-pcm        VGM: capture samples exactly as the chips output them (timing jitter and all) instead of
+  --track N          NSF/NSFE: which song of the file to convert (from 1; default: the file's first song)
+  --exact-pcm        VGM/NSF: capture samples exactly as the chips output them (timing jitter and all) instead of
                      storing each sound once (many times larger)
   --plain            write the unminified MML instead
   --verify           render both versions with the sion crate and check the audio is identical; for a
@@ -36,6 +38,7 @@ fn main() {
             "--gain" => opt.gain = Some(val("--gain").parse().unwrap_or_else(|_| fail("--gain takes a number, e.g. 1.5"))),
             "--wavetables" => opt.wavetables = true,
             "--exact-pcm" => opt.exact_pcm = true,
+            "--track" => opt.track = Some(val("--track").parse().unwrap_or_else(|_| fail("--track takes a number, e.g. 2"))),
             "--plain" => plain = true,
             "--verify" => verify = true,
             "--wav" => wav = Some(val("--wav")),

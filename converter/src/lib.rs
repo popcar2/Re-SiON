@@ -1,11 +1,14 @@
-//! Converters to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT) and VGM/VGZ chip logs.
+//! Converters to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT), VGM/VGZ chip logs and
+//! NSF/NSFE NES music.
 //! Every reader produces a `score::Score`; `arrange` and `mml` turn that into minified MML.
 
 mod arrange;
 mod chips;
+mod cpu;
 mod fm;
 pub mod midi;
 mod mml;
+mod nsf;
 mod pcm;
 mod play;
 mod sample;
@@ -32,11 +35,12 @@ pub struct Converted {
 
 /// Input formats, recognized from the file's contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format { Midi, Vgm, Module }
+pub enum Format { Midi, Vgm, Nsf, Module }
 
 pub fn detect(data: &[u8]) -> Option<Format> {
     if data.starts_with(b"Vgm ") { return Some(Format::Vgm) }
     if data.starts_with(&[0x1f, 0x8b]) { return vgm::gunzip(data).ok().filter(|d| d.starts_with(b"Vgm ")).map(|_| Format::Vgm) }
+    if nsf::detect(data) { return Some(Format::Nsf) }
     if tracker::detect(data).is_some() { return Some(Format::Module) }
     if data.windows(4).any(|w| w == b"MThd") { return Some(Format::Midi) }
     None
@@ -47,8 +51,9 @@ pub fn convert(data: &[u8], opt: &Options) -> Result<Converted, String> {
     match detect(data) {
         Some(Format::Midi) => midi_to_mml(data, opt),
         Some(Format::Vgm) => { let (score, w) = vgm::to_score(data, opt.exact_pcm)?; Ok(write(&score, opt, w)) }
+        Some(Format::Nsf) => { let (score, w) = nsf::to_score(data, opt.exact_pcm, opt.track)?; Ok(write(&score, opt, w)) }
         Some(Format::Module) => Ok(module_to_mml(&tracker::load(data)?, opt)),
-        None => Err("unrecognized file (supported: MIDI, MOD, S3M, XM, IT, VGM/VGZ)".into()),
+        None => Err("unrecognized file (supported: MIDI, MOD, S3M, XM, IT, VGM/VGZ, NSF/NSFE)".into()),
     }
 }
 

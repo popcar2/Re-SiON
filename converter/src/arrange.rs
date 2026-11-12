@@ -15,6 +15,8 @@ pub struct Options {
     /// VGM: capture samples exactly as the chips output them, frame by frame, instead of storing each once at its
     /// own rate (much larger).
     pub exact_pcm: bool,
+    /// NSF / NSFE: which song of the file to convert (from 1). `None`: the one the file starts with.
+    pub track: Option<usize>,
 }
 
 pub struct Arranged {
@@ -69,6 +71,8 @@ struct Note {
     /// LFO depths (`mp`, `ma`) at the start and changes while the note sounds.
     lfo0: (i32, i32),
     lfos: Vec<(u64, (i32, i32))>,
+    /// Waveform changes (the module's `@n`, as the whole `instr`) while the note sounds.
+    waves: Vec<(u64, String)>,
     /// Key-off pitch table (`_np`), and the tick its release is silenced (`v0`).
     rtab: Option<usize>,
     cut: Option<u64>,
@@ -175,6 +179,15 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
                 if lfos.last().is_some_and(|x| x.0 == t) { lfos.pop(); }
                 if lfos.last().map_or(lfo0, |x| x.1) != l { lfos.push((t, l)) }
             }
+            let mut waves: Vec<(u64, String)> = vec![];
+            let mut instr = n.instr.clone();
+            for (t, w) in &n.waves {
+                let t = map(*t);
+                if t <= start { instr = w.clone(); continue }
+                if t >= end { break }
+                if waves.last().is_some_and(|x| x.0 == t) { waves.pop(); }
+                if waves.last().map_or(&instr, |x| &x.1) != w { waves.push((t, w.clone())) }
+            }
             // (SiON has 255 tables; sweeps past that are left out.)
             let rtab = (!n.rel.is_empty()).then(|| {
                 *tab_ids.entry(&n.rel[..]).or_insert_with(|| {
@@ -184,7 +197,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
                 })
             }).flatten();
             let cut = n.cut.map(map).filter(|&c| c >= end);
-            let note = Note { start, end, key: n.key, v, instr: n.instr.clone(), env: n.env.clone(), pan: n.pan, ptab: n.ptab, k0, bends, vols, pans, lfo0, lfos, rtab, cut, ofs: n.ofs, plen: n.plen };
+            let note = Note { start, end, key: n.key, v, instr, env: n.env.clone(), pan: n.pan, ptab: n.ptab, k0, bends, vols, pans, lfo0, lfos, waves, rtab, cut, ofs: n.ofs, plen: n.plen };
             // Drum hits ring until the next hit, so a voice is free as soon as its last hit started.
             let slot = match n.drum { Some(_) => voices.iter_mut().find(|v| v.0 < start), None => voices.iter_mut().find(|v| v.0 <= start) };
             let busy = if n.drum.is_some() { start } else { end };
@@ -313,21 +326,28 @@ pub fn tokens(tr: &Track, gate: bool, lens: &Lengths) -> Vec<Tok> {
         // Pieces joined by slurs where the pitch bend or volume changes or a tempo change falls mid-note.
         let first = out.len();
         let (mut bend, mut vols, mut pans) = (n.bends.iter().peekable(), n.vols.iter().peekable(), n.pans.iter().peekable());
-        let mut lfos = n.lfos.iter().peekable();
+        let (mut lfos, mut waves) = (n.lfos.iter().peekable(), n.waves.iter().peekable());
         let mut at = n.start;
+        // A bend of a semitone or more moves the slur to the nearer note (`c&d`) instead of a large `k`.
+        let unit = if tr.kmilli { 64000 } else { 64 };
+        let mut key = n.key as i32;
         loop {
             let nb = bend.peek().map(|b| b.0);
             let nv = vols.peek().map(|b| b.0);
             let np = pans.peek().map(|b| b.0);
             let nl = lfos.peek().map(|b| b.0);
+            let nw = waves.peek().map(|b| b.0);
             let nt = tempo.peek().map(|x| x.0).filter(|&x| x > n.start && x < n.end);
             // (A note that sounds through the loop point is split there, slurred: `c&$c`.)
             let nlp = tr.lp.filter(|&l| mark.is_none() && l > n.start && l < n.end);
-            let Some(split) = [nb, nv, np, nl, nt, nlp].into_iter().flatten().min() else { break };
-            if split > at { out.push(Tok::Note { key: n.key, len: (split - at) as u32, slur: true }); at = split }
+            let Some(split) = [nb, nv, np, nl, nw, nt, nlp].into_iter().flatten().min() else { break };
+            if split > at { out.push(Tok::Note { key: key as u8, len: (split - at) as u32, slur: true }); at = split }
             if nlp == Some(split) { loop_point!() }
             while let Some((_, s)) = tempo.next_if(|x| x.0 == split) { out.push(Tok::Cmd(s.clone())) }
             while let Some(&(_, nk)) = bend.next_if(|b| b.0 == split) {
+                let total = n.key as i32 * unit + nk;
+                if (total - key * unit).abs() >= unit { key = ((total as f64 / unit as f64).round() as i32).clamp(0, 127) }
+                let nk = total - key * unit;
                 if nk != k { out.push(Tok::Cmd(kcmd(nk))); k = nk }
             }
             while let Some(&(_, nv)) = vols.next_if(|b| b.0 == split) {
@@ -337,8 +357,12 @@ pub fn tokens(tr: &Track, gate: bool, lens: &Lengths) -> Vec<Tok> {
                 if np != pan { out.push(Tok::Cmd(format!("@p{np}"))); pan = np }
             }
             while let Some(&(_, nl)) = lfos.next_if(|b| b.0 == split) { lfo_cmds(&mut out, &mut lfo, nl) }
+            // (Same module: `@n` changes the waveform and leaves the note, envelope and LFO as they are.)
+            while let Some((_, w)) = waves.next_if(|b| b.0 == split) {
+                if *w != instr { out.push(Tok::Cmd(format!("@{}", w.split_once('@').unwrap().1))); instr = w }
+            }
         }
-        out.push(Tok::Note { key: n.key, len: (n.end - at) as u32, slur: false });
+        out.push(Tok::Note { key: key as u8, len: (n.end - at) as u32, slur: false });
         gates.push((first, out.len() - 1));
         t = n.end;
         cut = n.cut;

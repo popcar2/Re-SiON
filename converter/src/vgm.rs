@@ -29,7 +29,33 @@ const OTHER: [(usize, &str); 27] = [
 
 /// A register write at a sample time (44100 Hz), to chip number `chip` (`src`: of that byte of the sample bank);
 /// or (`block`) a data block for it.
-struct Write { at: u64, chip: usize, port: u8, reg: u8, val: u8, block: Option<usize>, src: Option<usize> }
+pub(crate) struct Write { pub at: u64, pub chip: usize, pub port: u8, pub reg: u8, pub val: u8, pub block: Option<usize>, pub src: Option<usize> }
+
+impl Write {
+    pub fn reg(at: u64, chip: usize, port: u8, reg: u8, val: u8) -> Self { Write { at, chip, port, reg, val, block: None, src: None } }
+}
+
+/// A chip log, from a VGM file or a played NSF: what `render` turns into a score.
+pub(crate) struct Log {
+    pub chips: Vec<Box<dyn Chip>>,
+    /// Mixing level of each chip.
+    pub level: Vec<f32>,
+    /// In time order.
+    pub writes: Vec<Write>,
+    /// Data blocks the writes refer to: (type, start in the chip's memory, bytes).
+    pub blocks: Vec<(u8, usize, Vec<u8>)>,
+    /// The song's end and loop point (44100 Hz frames).
+    pub end: u64,
+    pub loop_at: Option<u64>,
+    /// The driver's frame length (44100 Hz frames), if known; otherwise it is detected from the writes.
+    pub period: Option<f64>,
+    /// Where in the period the driver's frames start (44100 Hz frames), if known; otherwise detected.
+    pub phase: Option<f64>,
+    /// The chip whose writes to register 0x2a (port 0) are DAC samples, not the driver's frame.
+    pub dac: Option<usize>,
+    /// Mega Drive chips: match libvgm's output with a high shelf.
+    pub shelf: bool,
+}
 
 /// A DAC stream (commands 0x90-0x95): bytes from a data bank written to a chip register at a fixed rate.
 #[derive(Default, Clone)]
@@ -220,15 +246,24 @@ pub fn to_score(data: &[u8], exact: bool) -> Result<(Score, Vec<String>), String
     if compressed { warnings.push("compressed sample data blocks are not converted".into()) }
     if writes.is_empty() { return Err("the VGM writes to no supported chip".into()) }
 
+    let rate = hdr(0x24);
+    let log = Log { chips, level, writes, blocks, end, loop_at, period: (10..=300).contains(&rate).then(|| 44100.0 / rate as f64), phase: None,
+        dac: (slot[0x52] != usize::MAX).then_some(slot[0x52]), shelf: sn != 0 || ym2612 != 0 };
+    render(log, warnings)
+}
+
+/// Sample every channel of the log's chips once per driver frame and turn the frames (and the samples the chips
+/// played) into a score.
+pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<String>), String> {
+    let Log { mut chips, level, writes, blocks, end, loop_at, period, phase, dac, shelf } = log;
     // Driver frame rate: the most common gap between bursts of writes, unless the header gives a rate. (Sample
     // data written to the YM2612 DAC isn't the driver's frame.)
-    let timing: Vec<&Write> = writes.iter().filter(|w| !(w.reg == 0x2a && w.port == 0 && slot[0x52] == w.chip) && w.block.is_none()).collect();
+    let timing: Vec<&Write> = writes.iter().filter(|w| !(w.reg == 0x2a && w.port == 0 && dac == Some(w.chip)) && w.block.is_none()).collect();
     let bursts: Vec<u64> = timing.iter().enumerate().filter(|(k, w)| *k == 0 || w.at > timing[k - 1].at + 32).map(|(_, w)| w.at).collect();
     let mut gaps = std::collections::HashMap::new();
     for p in bursts.windows(2) { if (147..=2205).contains(&(p[1] - p[0])) { *gaps.entry(p[1] - p[0]).or_insert(0usize) += 1 } }
-    let rate = hdr(0x24);
     let period = match gaps.iter().max_by_key(|(g, n)| (**n, std::cmp::Reverse(**g))) {
-        _ if (10..=300).contains(&rate) => 44100.0 / rate as f64,
+        _ if period.is_some() => period.unwrap(),
         Some((&g, _)) => g as f64,
         None => 735.0,
     };
@@ -236,7 +271,7 @@ pub fn to_score(data: &[u8], exact: bool) -> Result<(Score, Vec<String>), String
     let mut hist = [0usize; 32];
     for &b in &bursts { hist[((b as f64 % period) / period * 32.0) as usize & 31] += 1 }
     // (Whole frames, so captured samples line up with SiON's output frames.)
-    let phase = ((0..32).max_by_key(|&k| hist[k]).unwrap_or(0) as f64 / 32.0 * period).round();
+    let phase = phase.unwrap_or_else(|| ((0..32).max_by_key(|&k| hist[k]).unwrap_or(0) as f64 / 32.0 * period).round());
     for c in &mut chips { c.set_fps(44100.0 / period) }
 
     let mut st = Stream { chans: vec![vec![]; chips.iter().map(|c| c.chans()).sum()], ..Stream::default() };
@@ -318,7 +353,7 @@ pub fn to_score(data: &[u8], exact: bool) -> Result<(Score, Vec<String>), String
     let mut header = defs.header();
     // Mega Drive chips: libvgm's output (resampled from the chips' own rates) is about 3 dB down above 9 kHz from
     // SiON's, which renders at 44.1 kHz; a high shelf on the master matches it (measured on two songs).
-    if sn != 0 || ym2612 != 0 { header.push("#EFFECT0{hb9000,1,-3}".into()) }
+    if shelf { header.push("#EFFECT0{hb9000,1,-3}".into()) }
     Ok((Score { ppq, tempos: vec![(0, bpm)], header, notes, mix: vec![], end, lp, fine, db: !fine, kmilli: false }, warnings))
 }
 

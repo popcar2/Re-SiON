@@ -199,7 +199,7 @@ fn block(ty: u8, body: &[u8]) -> Vec<u8> { let mut b = vec![0x67, 0x66, ty]; b.e
 
 fn wait(b: &mut Vec<u8>, n: u16) { b.extend([0x61, n as u8, (n >> 8) as u8]) }
 
-const EXACT: Options = Options { grid: None, gain: None, wavetables: false, exact_pcm: true };
+const EXACT: Options = Options { grid: None, gain: None, wavetables: false, exact_pcm: true, track: None };
 
 /// Convert both ways: (default, `--exact-pcm`).
 fn both(data: &[u8]) -> (sion_converter::Converted, sion_converter::Converted) { (check(data), check_with(data, &EXACT)) }
@@ -403,6 +403,8 @@ fn vgm_loop_point() {
     let mut b = vec![];
     tone(&mut b, 0, SCALE[0], 0);
     frames(&mut b, 6);
+    // (Channel 0 off before the loop: a pitch change without a key-on would carry its note on, slurred.)
+    b.extend([0x50, 0x9f]);
     tone(&mut b, 1, SCALE[1], 6);
     frames(&mut b, 6);
     let lp = 0x100 + b.len();
@@ -427,4 +429,192 @@ fn vgm_loop_point() {
     // Without the loop point it plays once.
     data[0x1c..0x24].fill(0);
     assert!(convert(&data, &Options::default()).unwrap().loop_secs.is_none());
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// NSF / NSFE: small sound drivers, hand-assembled, that the converter runs on its 6502.
+
+/// An NSF header for a program loaded at $8000 with INIT at $8000 and PLAY at $8010 (60 Hz NTSC).
+fn nsf(songs: u8, banks: [u8; 8], chips: u8, prog: &[u8]) -> Vec<u8> {
+    let mut h = vec![0u8; 0x80];
+    h[..5].copy_from_slice(b"NESM\x1a");
+    (h[5], h[6], h[7]) = (1, songs, 1);
+    for (o, v) in [(8, 0x8000u16), (0x0a, 0x8000), (0x0c, 0x8010), (0x6e, 16639)] { h[o..o + 2].copy_from_slice(&v.to_le_bytes()) }
+    h[0x0e..0x13].copy_from_slice(b"Scale");
+    h[0x70..0x78].copy_from_slice(&banks);
+    h[0x7b] = chips;
+    h.extend_from_slice(prog);
+    h
+}
+
+/// Place `code` at `addr` in a program image starting at $8000.
+fn put(prog: &mut Vec<u8>, addr: usize, code: &[u8]) {
+    let at = addr - 0x8000;
+    if prog.len() < at + code.len() { prog.resize(at + code.len(), 0) }
+    prog[at..at + code.len()].copy_from_slice(code);
+}
+
+/// Pulse 1 periods of the C major test scale (low bytes, high bytes with the longest length).
+fn scale_periods() -> ([u8; 5], [u8; 5]) {
+    let t: Vec<u32> = SCALE.iter().map(|f| (1789773.0 / (16.0 * f)).round() as u32 - 1).collect();
+    (std::array::from_fn(|k| t[k] as u8), std::array::from_fn(|k| (t[k] >> 8) as u8 | 0xf8))
+}
+
+/// A driver that plays the scale on pulse 1, a note every 12 frames, and starts over after the fifth: its
+/// state (frame counter $00, note $01) comes round after 60 frames, so the song loops.
+/// Bankswitched: the code is in bank 0 at $8000, the note tables in bank 2 at $9000 (bank 1 is filler), and a
+/// 17-byte DPCM sample, played by INIT, in bank 3 at $C000.
+fn looping_scale() -> Vec<u8> {
+    let mut p = vec![];
+    put(&mut p, 0x8000, &[
+        0xa9, 0x0f, 0x8d, 0x15, 0x40, // LDA #$0F; STA $4015
+        0xa9, 0x00, 0x85, 0x00, 0x85, 0x01, // LDA #0; STA $00; STA $01
+        0x4c, 0x00, 0x81, // JMP $8100 (DPCM)
+    ]);
+    put(&mut p, 0x8010, &[
+        0xa5, 0x00, 0xd0, 0x1c, // LDA $00; BNE skip
+        0xa6, 0x01, 0xa9, 0xbf, 0x8d, 0x00, 0x40, // LDX $01; LDA #$BF; STA $4000
+        0xbd, 0x40, 0x90, 0x8d, 0x02, 0x40, // LDA $9040,X; STA $4002
+        0xbd, 0x48, 0x90, 0x8d, 0x03, 0x40, // LDA $9048,X; STA $4003
+        0xe8, 0xe0, 0x05, 0xd0, 0x02, 0xa2, 0x00, // INX; CPX #5; BNE ok; LDX #0
+        0x86, 0x01, // ok: STX $01
+        0xe6, 0x00, 0xa5, 0x00, 0xc9, 0x0c, 0xd0, 0x04, 0xa9, 0x00, 0x85, 0x00, // skip: INC $00; LDA $00; CMP #12; BNE done; LDA #0; STA $00
+        0x60, // done: RTS
+    ]);
+    // DPCM: $C000, 17 bytes, the top rate, from level 64.
+    put(&mut p, 0x8100, &[0xa9, 64, 0x8d, 0x11, 0x40, 0xa9, 0x00, 0x8d, 0x12, 0x40, 0xa9, 0x01, 0x8d, 0x13, 0x40, 0xa9, 0x0f, 0x8d, 0x10, 0x40, 0xa9, 0x1f, 0x8d, 0x15, 0x40, 0x60]);
+    p.resize(0x1000, 0);
+    p.extend(std::iter::repeat_n(0xff, 0x1000));
+    let (lo, hi) = scale_periods();
+    let mut tables = vec![0u8; 0x1000];
+    tables[0x40..0x45].copy_from_slice(&lo);
+    tables[0x48..0x4d].copy_from_slice(&hi);
+    p.extend(tables);
+    let mut dpcm: Vec<u8> = (0..17u8).map(|i| [0x0f, 0xf0, 0x33, 0xcc, 0xaa, 0x55, 0x3c][i as usize % 7]).collect();
+    dpcm.resize(0x1000, 0);
+    p.extend(dpcm);
+    nsf(1, [0, 2, 0, 0, 3, 0, 0, 0], 0, &p)
+}
+
+#[test]
+fn nsf_loops_where_its_state_repeats() {
+    let out = check(&looping_scale());
+    assert_eq!(notes(&out.plain, 0), ["5c", "5e", "5g", "5a", "6c"]);
+    assert!(out.plain.contains("%1@4"), "50% pulse");
+    assert!(out.plain.contains("#PCMB") && out.plain.contains("%7"), "the DPCM sample, from its bank");
+    let lp = out.loop_secs.expect("a loop");
+    assert!((lp - 60.0 * 16639e-6).abs() < 0.01, "the loop is the 60 frames: {lp}");
+    let (plain, mml) = (render(&out.plain, 3), render(&out.mml, 3));
+    assert_eq!(plain, mml, "minified MML must sound like the plain conversion, across the loop too");
+}
+
+#[test]
+fn nsf_song_that_ends() {
+    // Three notes 12 frames apart, then the driver silences the APU every frame but keeps counting frames in
+    // $02-$03 (so its state never repeats): the song ends after its last note instead of looping silence.
+    let mut p = vec![];
+    put(&mut p, 0x8000, &[0xa9, 0x0f, 0x8d, 0x15, 0x40, 0x60]); // LDA #$0F; STA $4015; RTS
+    put(&mut p, 0x8010, &[
+        0xe6, 0x02, 0xd0, 0x02, 0xe6, 0x03, // INC $02; BNE +2; INC $03
+        0xa5, 0x04, 0xd0, 0x1e, // LDA $04 (timer); BNE dec
+        0xa5, 0x00, 0xc9, 0x03, 0xb0, 0x1b, // LDA $00 (notes played); CMP #3; BCS end
+        0xa9, 0xbf, 0x8d, 0x00, 0x40, // LDA #$BF; STA $4000
+        0xa6, 0x00, 0xbd, 0x50, 0x80, 0x8d, 0x02, 0x40, // LDX $00; LDA $8050,X; STA $4002
+        0xa9, 0xf8, 0x8d, 0x03, 0x40, // LDA #$F8; STA $4003
+        0xe6, 0x00, 0xa9, 0x0c, 0x85, 0x04, // INC $00; LDA #12; STA $04
+        0xc6, 0x04, 0x60, // dec: DEC $04; RTS
+        0xa9, 0x00, 0x8d, 0x15, 0x40, 0x60, // end: LDA #0; STA $4015; RTS
+    ]);
+    let t: Vec<u8> = [523.25, 659.25, 783.99].iter().map(|f| ((1789773.0 / (16.0 * f)) as f64).round() as u8 - 1).collect();
+    put(&mut p, 0x8050, &t);
+    let out = check(&nsf(1, [0; 8], 0, &p));
+    assert!(out.loop_secs.is_none(), "no loop of silence");
+    assert_eq!(notes(&out.plain, 0), ["6c", "6e", "6g"]);
+    assert!(out.secs < 1.0, "ends after its notes: {}", out.secs);
+}
+
+#[test]
+fn nsf_vrc6() {
+    // VRC6: pulse 1 at A (duty 4/16: SiON's 25% pulse), pulse 2 at C (3/16: a wavetable), the saw at A an
+    // octave down; for 60 frames, then all off.
+    let per = |hz: f64, div: f64| (1789773.0 / (div * hz)).round() as u32 - 1;
+    let (a, c, s) = (per(440.0, 16.0), per(523.25, 16.0), per(220.0, 14.0));
+    let mut p = vec![];
+    put(&mut p, 0x8000, &[
+        0xa9, 0x00, 0x8d, 0x03, 0x90, // $9003 = 0
+        0xa9, 0x3f, 0x8d, 0x00, 0x90, 0xa9, a as u8, 0x8d, 0x01, 0x90, 0xa9, 0x80 | (a >> 8) as u8, 0x8d, 0x02, 0x90,
+        0xa9, 0x2f, 0x8d, 0x00, 0xa0, 0xa9, c as u8, 0x8d, 0x01, 0xa0, 0xa9, 0x80 | (c >> 8) as u8, 0x8d, 0x02, 0xa0,
+        0xa9, 0x2a, 0x8d, 0x00, 0xb0, 0xa9, s as u8, 0x8d, 0x01, 0xb0, 0xa9, 0x80 | (s >> 8) as u8, 0x8d, 0x02, 0xb0,
+        0x60,
+    ]);
+    // PLAY (at $8080): count frames in $00; on the 60th switch all three off.
+    put(&mut p, 0x8080, &[
+        0xa5, 0x00, 0xc9, 0x3c, 0xf0, 0x13, // LDA $00; CMP #60; BEQ done
+        0xe6, 0x00, 0xa5, 0x00, 0xc9, 0x3c, 0xd0, 0x0b, // INC $00; LDA $00; CMP #60; BNE done
+        0xa9, 0x00, 0x8d, 0x02, 0x90, 0x8d, 0x02, 0xa0, 0x8d, 0x02, 0xb0, // LDA #0; STA $9002; STA $A002; STA $B002
+        0x60, // done: RTS
+    ]);
+    let mut f = nsf(1, [0; 8], 1, &p);
+    f[0x0c..0x0e].copy_from_slice(&0x8080u16.to_le_bytes());
+    let out = check(&f);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+    // Pulses other than 50% are wavetables balanced around zero (no DC offset to follow the volume steps).
+    let wave = |hi: i32, h: usize, lo: i32| format!("{{{}}}", (0..16).map(|j| if j < h { hi } else { lo }.to_string()).collect::<Vec<_>>().join(","));
+    assert!(out.plain.contains(&wave(126, 4, -42)), "4/16 duty");
+    assert!(out.plain.contains(&wave(117, 3, -27)), "3/16 duty");
+    assert!(!out.plain.contains("%1@"), "no SiON APU pulse (it swings from -full to +full)");
+    let all: Vec<String> = (0..out.tracks).flat_map(|t| notes(&out.plain, t)).collect();
+    for n in ["5a", "6c", "4a"] { assert!(all.contains(&n.to_string()), "{n} in {all:?}") }
+    assert!(out.loop_secs.is_none() && out.secs < 1.5, "ends when switched off: {} {:?}", out.secs, out.loop_secs);
+}
+
+#[test]
+fn nsf_vrc6_saw_rate_envelope() {
+    // The saw at A, its rate (the level, and so the waveform table) changed every frame, as a volume envelope
+    // does: one held note whose waveform changes (`@n` in a slur), not a new key-on (a phase reset) every frame.
+    let s = (1789773.0 / (14.0 * 220.0f64)).round() as u32 - 1;
+    let mut p = vec![];
+    put(&mut p, 0x8000, &[
+        0xa9, 0x00, 0x8d, 0x03, 0x90, // $9003 = 0
+        0xa9, 0x2a, 0x8d, 0x00, 0xb0, 0xa9, s as u8, 0x8d, 0x01, 0xb0, 0xa9, 0x80 | (s >> 8) as u8, 0x8d, 0x02, 0xb0,
+        0x60,
+    ]);
+    // PLAY: count frames in $00; rate = 16 + (frame & 15); on the 60th frame the saw goes off.
+    put(&mut p, 0x8080, &[
+        0xa5, 0x00, 0xc9, 0x3c, 0xf0, 0x16, // LDA $00; CMP #60; BEQ done
+        0xe6, 0x00, 0xa5, 0x00, 0x29, 0x0f, 0x69, 0x10, 0x8d, 0x00, 0xb0, // INC $00; LDA $00; AND #15; ADC #16; STA $B000
+        0xa5, 0x00, 0xc9, 0x3c, 0xd0, 0x05, // LDA $00; CMP #60; BNE done
+        0xa9, 0x00, 0x8d, 0x02, 0xb0, // LDA #0; STA $B002
+        0x60, // done: RTS
+    ]);
+    let mut f = nsf(1, [0; 8], 1, &p);
+    f[0x0c..0x0e].copy_from_slice(&0x8080u16.to_le_bytes());
+    let out = check(&f);
+    let t = out.plain.split(";\n").find(|t| !t.starts_with('#')).unwrap();
+    assert!(notes(&out.plain, 0).iter().all(|n| n == "4a"));
+    // (Every piece but the last slurred into the next, and the module set once.)
+    assert_eq!(t.matches("o4a").count(), t.matches('&').count() + 1, "one note: {t}");
+    assert_eq!(t.matches('%').count(), 1, "waveform changes as `@n` in the slur: {t}");
+}
+
+#[test]
+fn nsfe_chunks_and_tracks() {
+    // The looping scale as an NSFE with two tracks and their names.
+    let n = looping_scale();
+    let chunk = |id: &[u8], body: &[u8]| { let mut c = (body.len() as u32).to_le_bytes().to_vec(); c.extend(id); c.extend(body); c };
+    let mut info = vec![];
+    for v in [0x8000u16, 0x8000, 0x8010] { info.extend(v.to_le_bytes()) }
+    info.extend([0, 0, 2, 0]);
+    let mut f = b"NSFE".to_vec();
+    f.extend(chunk(b"INFO", &info));
+    f.extend(chunk(b"BANK", &n[0x70..0x78]));
+    f.extend(chunk(b"tlbl", b"First\0Second\0"));
+    f.extend(chunk(b"DATA", &n[0x80..]));
+    f.extend(chunk(b"NEND", &[]));
+    let out = check(&f);
+    assert_eq!(notes(&out.plain, 0), ["5c", "5e", "5g", "5a", "6c"]);
+    assert!(out.warnings.iter().any(|w| w.contains("track 1 of 2 (First)")), "{:?}", out.warnings);
+    let second = convert(&f, &Options { track: Some(2), ..Options::default() }).unwrap();
+    assert!(second.warnings.iter().any(|w| w.contains("track 2 of 2 (Second)")));
+    assert!(convert(&f, &Options { track: Some(3), ..Options::default() }).is_err());
 }

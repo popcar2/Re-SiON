@@ -1,17 +1,19 @@
 # sion-converter
 
-Converts other music formats to minified SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT)
-and VGM/VGZ chip music logs. The format is recognized from the file's contents.
+Converts other music formats to minified SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT),
+VGM/VGZ chip music logs and NSF/NSFE NES music. The format is recognized from the file's contents.
 
 ```
 cargo run --release -- song.mid              # writes song.mml
 cargo run --release -- song.xm -o out.mml --verify
 cargo run --release -- song.vgz --wav out.wav
+cargo run --release -- game.nsfe --track 3
 ```
 
 Options: `-o FILE`, `--grid N` (snap timing to 1/N notes: smaller output, but no longer exact),
 `--wavetables` (tracker modules: approximate samples instead of embedding them; see below),
-`--exact-pcm` (VGM: capture chip samples exactly, frame by frame; much larger, see below),
+`--track N` (NSF/NSFE: which song of the file, from 1; default: the file's first song),
+`--exact-pcm` (VGM and NSF: capture chip samples exactly, frame by frame; much larger, see below),
 `--gain G` (volume; default is automatic, so the busiest chord doesn't clip), `--plain` (write the unminified MML),
 `--verify` (render the plain and minified MML with the `sion` crate and check that every sample is identical;
 for a tracker module, also compare the result with the module mixed straight from its samples),
@@ -98,10 +100,23 @@ note sounding through the loop point is split there (`c&$c`), so the first pass 
 | --- | --- | --- |
 | SN76489 | Master System, Game Gear, Mega Drive | squares (`%1@4`), noise (`%2@1`), periodic noise (`%8@1`), Game Gear stereo |
 | AY-3-8910 / YM2149 | MSX, ZX Spectrum, Atari ST, CPC | squares, noise; the hardware envelope as a volume change, or as a saw/triangle "buzzer" tone |
-| NES APU | NES / Famicom | pulses with duty (`%1@1`..`@6`), triangle (`%1@8`), noise (`%1@9`/`@10`); envelopes, sweeps, length and linear counters; DPCM and `$4011` samples |
+| NES APU | NES / Famicom | pulses with duty (50% as `%1@4`, the others as `#WAV` tables, below), triangle (`%1@8`), noise (`%1@9`/`@10`); envelopes, sweeps, length and linear counters; DPCM and `$4011` samples |
 | Game Boy | Game Boy | pulses with duty, the wave channel as `#WAV` tables, 15/7-bit noise; envelopes, sweep, length, panning |
 | YM2612 / YM3438, YM2203, YM2608, YM2610 | Mega Drive, PC-88/98, Neo Geo | FM voices (`#OPN@`, `%6@n`) taken from the patch registers, plus the SSG part as an AY-3-8910; DAC (YM2612), ADPCM-A (YM2610) and ADPCM-B (YM2608, YM2610) samples |
 | YM2151 | X68000, arcade boards | FM voices (`#OPM@`) |
+
+Tone channels (the PSGs, NES, Game Boy):
+
+- A pitch change without a key-on (arpeggios, slides, vibrato) carries the note on, slurred (`c&e`, with `k` for
+  the fraction), and so does a change of waveform within the module (a pulse's duty, the VRC6 saw's rate: `@n` in
+  the slur): the chips' tone generators keep running through both, while a new note in SiON restarts its
+  waveform, which every frame of an arpeggio is a buzz at the driver's frame rate. The NES triangle and noise
+  never restart (writing `$400B`/`$400F` reloads counters and the envelope only); the NES pulses restart when
+  `$4003` is written, the SN76489 and Game Boy noise when their registers are written.
+- Pulses other than 50% are 16-step wavetables whose two levels balance around zero (12.5%: `126` against `-18`,
+  for 1/8 and 7/8 of the period), at a full pulse's peak-to-peak swing. SiON's pulses swing from -full to +full, so a narrow one sits
+  mostly at -full: a DC offset that would follow every volume step. The chips' pulses rise from 0 to their volume,
+  and the systems' output high-pass filters take their DC out.
 
 FM patches become SiON voices with the carriers' total level taken out as the note volume, so fades and the same
 patch at different volumes share one voice. The song is played once, without its loop.
@@ -170,6 +185,46 @@ don't carry), ADPCM fed by the CPU instead of from memory, compressed data block
 special mode, SSG-EG, the second chip of dual-chip files, and other chips (OPL/OPLL family, PCM chips such as
 SegaPCM, RF5C68 and the OKI ADPCM chips, SCC, HuC6280...).
 
+## NSF / NSFE
+
+An NSF is the game's own sound driver, not a log, so `src/nsf.rs` plays it the way an NSF player does: it runs
+the driver on a 6502 (`src/cpu.rs`: every documented instruction and the stable undocumented ones, with cycle
+counts, checked against Klaus Dormann's functional test) — INIT once with the song number, then PLAY at the
+file's rate — and logs every write to the sound chips at the CPU cycle it happens on. That log goes through the
+same chip models and frame sampling as a VGM's (above), so everything said there about the NES APU, DPCM and
+`$4011` samples applies. NSF (with bankswitching), NSFE and NSF2 (metadata after the program) files are read;
+NTSC unless the file is PAL-only.
+
+An NSF holds several songs (`--track N`; the notes name the track and, in an NSFE, its title) and no song
+lengths, so the converter works out where each one ends:
+
+- The machine's state (RAM, work RAM, banks) comes round to a state it was in at the start of an earlier frame:
+  from there the driver can only do the same again, so the song loops exactly there.
+- Otherwise (drivers that count frames), the frames' writes repeat to the end, at least twice, with a loop of at
+  least a second: the song loops there.
+- The same writes every frame to the end, for a second or more: the song has stopped (or holds its last chord)
+  and ends there. A loop that is silent is the same: the song ends with its last sound.
+- Otherwise the NSFE's track time (plus fade) when it gives one, or the first 10 minutes (with a note).
+
+DPCM samples are read from the program's memory as it is banked when each one starts. The DMC level starts at
+0, as on the console, and a driver setting it now and then (`$4011`, a few writes: a DC step) isn't a sample.
+
+Expansion sound:
+
+| Chip | Converted as |
+| --- | --- |
+| Konami VRC6 | pulses with duty in sixteenths (16-step `#WAV` tables, below; 8/16 as `%1@4`), the sawtooth as a 7-step `#WAV` table (its accumulator rate sets the level; rates past 42 wrap and change the shape, as on the chip; a rate change during a note, as a volume envelope makes, switches the table with `@n` inside the slur instead of restarting the note); `$9003` frequency scaling and halt |
+| Nintendo MMC5 | its two pulses (no sweep units) |
+| Sunsoft 5B | a YM2149 at half the CPU clock (as an AY-3-8910 above) |
+
+The VRC6 is mixed level with the APU: a full-volume VRC6 pulse as loud as a full-volume APU pulse (as the
+NESdev wiki has it; on Shovel Knight, each VRC6 voice comes out within a dB of libgme's level against the APU).
+The 5B's level against the APU is not measured (the cartridge amplifies it). Not converted (reported as notes):
+VRC7, Famicom Disk System and Namco 163 sound, MMC5 PCM, and the VRC6 pulses' digitized mode. The driver still
+runs with them (FDS RAM, N163 sound RAM, the MMC5 multiplier and ExRAM are there), so the APU part converts.
+
+Sizes: Shovel Knight's NSFE tracks (APU and VRC6) become 25-90 KB of MML; each takes a few seconds to convert.
+
 ### `#PCMB`: samples in MML
 
 `#PCMBn{data}rate,key,loop,flags;` defines sample `n` (0..255) for the `sion` crate's `%7@n` (pitched) and `%10`
@@ -197,7 +252,9 @@ uses its own feedback (the last output at full depth).
 
 ## Tests
 
-`cargo test --release` builds small NES, SN76489, Game Boy, YM2151 and ProTracker files in code, and VGM files
+`cargo test --release` builds small NES, SN76489, Game Boy, YM2151 and ProTracker files in code, NSF and NSFE
+files (hand-assembled drivers: a bankswitched one that loops and plays DPCM, one that stops, one playing the
+VRC6), and VGM files
 that play YM2612 DAC samples (from the data bank, written directly, and by DAC stream), NES DPCM and `$4011`
 levels, and YM2610 ADPCM-A and -B, converts them (by default and with `--exact-pcm`, each checked against the
 chip's output), checks the notes and the Mega Drive's mix (PSG against FM, one-sided pan, feedback level, fast

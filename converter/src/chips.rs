@@ -34,6 +34,22 @@ pub trait Chip {
 /// Release as fast as the chip does (SiON's default release rate 28 rings for most of a second).
 const CUT: &str = "s63";
 
+/// A pulse wave high for `h` sixteenths of its period, and the amplitude factor it needs: 50% is SiON's square
+/// (`%1@4`); other widths are 16-step wavetables whose two levels balance around zero, at the same peak-to-peak
+/// swing as a full-scale pulse. (SiON's pulses swing between -full and +full, so a narrow one sits mostly at
+/// -full: a large DC offset that follows every volume step, a buzz at the driver's frame rate. The chips' pulses
+/// rise from 0 to their volume, and the systems' output high-pass filters take the DC out.)
+fn pulse(defs: &mut Defs, h: usize) -> (String, f32) {
+    if h == 8 { return ("%1@4".into(), 1.0) }
+    let (mut a, mut b) = (16 - h, h); // high : low = -(16 - h) : h, so h * high + (16 - h) * low = 0
+    let g = (1..=b).rev().find(|g| a % g == 0 && b % g == 0).unwrap();
+    (a, b) = (a / g, b / g);
+    let k = (127 / a).min(128 / b) as i32;
+    let (hi, lo) = (k * a as i32, -k * b as i32);
+    let w: Vec<i32> = (0..16).map(|j| if j < h { hi } else { lo }).collect();
+    (format!("%4@{}", defs.wave(&w)), 255.0 / (hi - lo) as f32)
+}
+
 fn frame(st: &mut Stream, instr: &str, pitch: f32, amp: f32, pan: i32, trig: bool) -> Option<Frame> {
     (amp > 0.0 && pitch.is_finite()).then(|| Frame { pitch: pitch.clamp(0.0, 119.0), amp, tone: st.tone(instr, CUT, false), pan, trig, pos: 0.0, lfo: (0, 0), rel: false })
 }
@@ -165,6 +181,8 @@ pub struct NesApu {
     lin: (u8, bool),
     trig: [bool; 4],
     fds: bool,
+    /// The MMC5's two extra pulses: an APU without sweep units (so no sweep muting either).
+    mmc5: bool,
     dmc: Dmc,
 }
 
@@ -196,8 +214,13 @@ impl NesApu {
         // Channels start enabled: rips of NSF music start after the player's init, which enables them.
         let mut r = [0; 0x18];
         r[0x15] = 0x0f;
-        NesApu { cpu: (clock & 0x7fff_ffff) as f64, r, seq: 0.0, step: 0, len: [0; 4], env: [(false, 0, 0); 3], timer: [0; 2], sweep: [(0, false); 2], lin: (0, false), trig: [false; 4], fds: false, dmc }
+        NesApu { cpu: (clock & 0x7fff_ffff) as f64, r, seq: 0.0, step: 0, len: [0; 4], env: [(false, 0, 0); 3], timer: [0; 2], sweep: [(0, false); 2], lin: (0, false), trig: [false; 4], fds: false, mmc5: false, dmc }
     }
+    /// The MMC5 cartridge chip's pulses (NSF expansion sound): registers $5000-$5007 and $5015 as $00-$07, $15.
+    pub fn mmc5(clock: u32) -> Self { NesApu { mmc5: true, ..NesApu::new(clock) } }
+    /// An APU from power-on, as an NSF's driver finds it: the DMC output at 0 (VGM rips start partway into a
+    /// song, so `new` leaves it at its center).
+    pub fn power_on(clock: u32) -> Self { let mut a = NesApu::new(clock); a.dmc.raw.start_at(0.0); a }
     /// DMC output rate (bits per second) for rate index `i`: NTSC or PAL timer periods, by the CPU clock.
     fn dmc_rate(&self, i: u8) -> f64 {
         const NTSC: [u16; 16] = [428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54];
@@ -238,7 +261,7 @@ impl NesApu {
         let d = t >> (s & 7);
         if s & 8 != 0 { t - d - (c == 0) as i32 } else { t + d }
     }
-    fn muted(&self, c: usize) -> bool { self.timer[c] < 8 || self.sweep_target(c) > 0x7ff }
+    fn muted(&self, c: usize) -> bool { self.timer[c] < 8 || !self.mmc5 && self.sweep_target(c) > 0x7ff }
     fn quarter(&mut self) {
         for (i, reg) in [(0, 0), (1, 4), (2, 12)] {
             let (r, e) = (self.r[reg], &mut self.env[i]);
@@ -258,7 +281,7 @@ impl NesApu {
         for c in 0..2 {
             let s = self.r[c * 4 + 1];
             let (div, reload) = self.sweep[c];
-            if div == 0 && s & 0x80 != 0 && s & 7 != 0 && !self.muted(c) { self.timer[c] = self.sweep_target(c).clamp(0, 0x7ff) as u16 }
+            if div == 0 && s & 0x80 != 0 && s & 7 != 0 && !self.muted(c) && !self.mmc5 { self.timer[c] = self.sweep_target(c).clamp(0, 0x7ff) as u16 }
             self.sweep[c] = if div == 0 || reload { ((s >> 4) & 7, false) } else { (div - 1, false) };
         }
     }
@@ -281,11 +304,11 @@ impl Chip for NesApu {
             }
             0x0b => {
                 if enabled(2, &self.r) { self.len[2] = NES_LEN[d as usize >> 3] }
-                (self.lin.1, self.trig[2]) = (true, true);
+                self.lin.1 = true;
             }
             0x0f => {
                 if enabled(3, &self.r) { self.len[3] = NES_LEN[d as usize >> 3] }
-                (self.env[2].0, self.trig[3]) = (true, true);
+                self.env[2].0 = true;
             }
             0x10 => {
                 // A rate change bends a playing sample.
@@ -314,24 +337,27 @@ impl Chip for NesApu {
         }
     }
     fn chans(&self) -> usize { 4 }
-    fn frame(&mut self, st: &mut Stream, _: &mut Defs, out: &mut Vec<Option<Frame>>) {
+    fn frame(&mut self, st: &mut Stream, defs: &mut Defs, out: &mut Vec<Option<Frame>>) {
         for c in 0..2 {
             let r0 = self.r[c * 4];
             let v = if r0 & 0x10 != 0 { r0 & 15 } else { self.env[c].2 };
             let hz = self.cpu / (16.0 * (self.timer[c] as f64 + 1.0));
-            let duty = ["%1@1", "%1@2", "%1@4", "%1@6"][r0 as usize >> 6];
+            let (duty, gain) = pulse(defs, [2, 4, 8, 12][r0 as usize >> 6]);
             let on = self.len[c] > 0 && !self.muted(c) && audible(hz);
-            out.push(if on { frame(st, duty, hz_key(hz), v as f32 / 15.0, 0, self.trig[c]) } else { None });
+            out.push(if on { frame(st, &duty, hz_key(hz), v as f32 / 15.0 * gain, 0, self.trig[c]) } else { None });
         }
         let t = (self.r[10] as u32 | ((self.r[11] & 7) as u32) << 8) as f64;
         let hz = self.cpu / (32.0 * (t + 1.0));
         let on = self.len[2] > 0 && self.lin.0 > 0 && t >= 2.0 && audible(hz);
-        out.push(if on { frame(st, "%1@8", hz_key(hz), 1.13, 0, self.trig[2]) } else { None });
-        // Noise: SiON's APU noise (`%1@9` long, `%1@10` short) takes the period index from the note.
+        // (Writing $400B reloads the counters but leaves the waveform running: not a new note.)
+        out.push(if on { frame(st, "%1@8", hz_key(hz), 1.13, 0, false) } else { None });
+        // Noise: SiON's APU noise (`%1@9` long, `%1@10` short) takes the period index from the note. (Writing
+        // $400F restarts the envelope, which the volumes follow, but not the shift register: a new note would
+        // restart SiON's noise table, the same few samples again every frame of a drum's decay, a buzz.)
         let (rc, re) = (self.r[12], self.r[14]);
         let v = if rc & 0x10 != 0 { rc & 15 } else { self.env[2].2 };
         let instr = if re & 0x80 != 0 { "%1@10" } else { "%1@9" };
-        out.push(if self.len[3] > 0 { frame(st, instr, (48 + (re & 15)) as f32, v as f32 / 15.0 * 0.66, 0, self.trig[3]) } else { None });
+        out.push(if self.len[3] > 0 { frame(st, instr, (48 + (re & 15)) as f32, v as f32 / 15.0 * 0.66, 0, false) } else { None });
         self.trig = [false; 4];
     }
     fn warnings(&self) -> Vec<String> {
@@ -360,6 +386,56 @@ impl Chip for NesApu {
         }
         out.extend(self.dmc.raw.hits(defs, end));
         out
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+/// Konami VRC6 (NSF expansion sound): two pulses with eight duties in sixteenths and a 7-step sawtooth. Writes
+/// address `reg` = channel * 4 + register ($9000-$9002 → 0-2, $A000 → 4-6, $B000 → 8-10), and 3 for $9003.
+pub struct Vrc6 { cpu: f64, r: [u8; 12], trig: [bool; 3] }
+
+impl Vrc6 {
+    pub fn new(clock: f64) -> Self { Vrc6 { cpu: clock, r: [0; 12], trig: [false; 3] } }
+    /// The 12-bit period of channel `c`, after $9003's frequency scaling (None: halted).
+    fn period(&self, c: usize) -> Option<f64> {
+        let ctl = self.r[3];
+        if ctl & 1 != 0 { return None }
+        let p = self.r[c * 4 + 1] as u32 | ((self.r[c * 4 + 2] & 15) as u32) << 8;
+        Some((if ctl & 4 != 0 { p >> 8 } else if ctl & 2 != 0 { p >> 4 } else { p }) as f64)
+    }
+}
+
+impl Chip for Vrc6 {
+    fn write(&mut self, _: u8, reg: u8, d: u8) {
+        let reg = reg as usize;
+        if reg >= 12 { return }
+        // (A channel switched on starts its waveform from the top.)
+        if reg % 4 == 2 && d & 0x80 != 0 && self.r[reg] & 0x80 == 0 { self.trig[reg / 4] = true }
+        self.r[reg] = d;
+    }
+    fn chans(&self) -> usize { 3 }
+    fn frame(&mut self, st: &mut Stream, defs: &mut Defs, out: &mut Vec<Option<Frame>>) {
+        for c in 0..2 {
+            let (r0, on) = (self.r[c * 4], self.r[c * 4 + 2] & 0x80 != 0);
+            let hz = self.period(c).map_or(0.0, |p| self.cpu / (16.0 * (p + 1.0)));
+            // Duty (d + 1) / 16. (The mode bit holds the output at the volume, a level with nothing to hear.)
+            let (instr, gain) = pulse(defs, (r0 >> 4 & 7) as usize + 1);
+            let ok = on && r0 & 0x80 == 0 && audible(hz);
+            out.push(if ok { frame(st, &instr, hz_key(hz), (r0 & 15) as f32 / 15.0 * gain, 0, self.trig[c]) } else { None });
+        }
+        // Saw: the accumulator adds the rate six times (each held two clocks) and resets; the output is its top 5
+        // bits, so the rate sets the level (and past 42 wraps, changing the shape).
+        let a = (self.r[8] & 63) as u32;
+        let levels: Vec<u32> = (0..7).map(|i| ((i * a) & 0xff) >> 3).collect();
+        let (lo, hi) = (*levels.iter().min().unwrap(), *levels.iter().max().unwrap());
+        let hz = self.period(2).map_or(0.0, |p| self.cpu / (14.0 * (p + 1.0)));
+        out.push(if self.r[10] & 0x80 != 0 && hi > lo && audible(hz) {
+            let w: Vec<i32> = (0..256).map(|j| ((levels[j * 7 / 256] - lo) as f32 / (hi - lo) as f32 * 255.0).round() as i32 - 128).collect();
+            let instr = format!("%4@{}", defs.wave(&w));
+            // (Same DAC steps as the pulses: a swing of 15 is a full pulse.)
+            frame(st, &instr, hz_key(hz), (hi - lo) as f32 / 15.0, 0, self.trig[2])
+        } else { None });
+        self.trig = [false; 3];
     }
 }
 
@@ -468,9 +544,9 @@ impl Chip for GameBoy {
         let pan = |c: usize| match (nr51 >> (c + 4) & 1, nr51 >> c & 1) { (1, 1) => Some(0), (1, 0) => Some(-64), (0, 1) => Some(64), _ => None };
         for c in 0..2 {
             let hz = 131072.0 / (2048.0 - self.freq[c] as f64);
-            let duty = ["%1@1", "%1@2", "%1@4", "%1@6"][self.nr(c, 1) as usize >> 6];
-            let amp = self.env[c].0 as f32 / 15.0 * master;
-            out.push(pan(c).filter(|_| self.on[c] && audible(hz)).and_then(|p| frame(st, duty, hz_key(hz), amp, p, self.trig[c])));
+            let (duty, gain) = pulse(defs, [2, 4, 8, 12][self.nr(c, 1) as usize >> 6]);
+            let amp = self.env[c].0 as f32 / 15.0 * master * gain;
+            out.push(pan(c).filter(|_| self.on[c] && audible(hz)).and_then(|p| frame(st, &duty, hz_key(hz), amp, p, self.trig[c])));
         }
         let hz = 65536.0 / (2048.0 - self.freq[2] as f64);
         let shift = [0.0, 1.0, 0.5, 0.25][(self.r[0x0c] >> 5 & 3) as usize];
