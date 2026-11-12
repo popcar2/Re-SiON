@@ -1,0 +1,22 @@
+cargo-features = ["panic-immediate-abort"]
+
+[package]
+name = "sion-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "WebAssembly build (sion.wasm) of the SiON MML player"
+
+[lib]
+name = "sion"
+crate-type = ["cdylib"]
+
+[dependencies]
+sion_core = { package = "sion", path = "../sion" }
+
+[profile.release]
+# Smallest size. (The `small` speed-optimised hot paths add ~6 KB and gain nothing measurable under a wasm JIT.)
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "immediate-abort"
+strip = true
