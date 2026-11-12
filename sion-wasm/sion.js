@@ -5,6 +5,9 @@
 //   const buf = new Float32Array(2 * 1024);              // interleaved stereo, sion.rate Hz
 //   while (song.render(buf)) { /* play buf */ }          // returns false once finished
 //   song.free();
+//
+//   Seeking: song.skip(frames) jumps ahead (song.position tells where it is); sion.length(mml) gives a song's
+//   length in frames. To go back, make a new song and skip from the start.
 
 export class Sion {
   static async load(source) {
@@ -31,6 +34,25 @@ export class Sion {
     return new Song(this, handle);
   }
 
+  /** Length in frames of one pass through the MML (until every track ends or loops back once), without rendering. */
+  length(mml) {
+    const bytes = new TextEncoder().encode(mml);
+    const ptr = this.#copyIn(bytes);
+    const frames = this.x.sion_length(ptr, bytes.length);
+    this.x.sion_dealloc(ptr, bytes.length);
+    return frames;
+  }
+
+  /** For MML with a `$` loop: the frame playback carries on from after `length` frames (where the loop
+   *  point is). -1 if the song ends instead. */
+  loopStart(mml) {
+    const bytes = new TextEncoder().encode(mml);
+    const ptr = this.#copyIn(bytes);
+    const frame = this.x.sion_loop_start(ptr, bytes.length);
+    this.x.sion_dealloc(ptr, bytes.length);
+    return frame;
+  }
+
   #copyIn(bytes) {
     const ptr = this.x.sion_alloc(Math.max(bytes.length, 1));
     new Uint8Array(this.x.memory.buffer, ptr, bytes.length).set(bytes);
@@ -54,6 +76,13 @@ export class Song {
     buf.set(new Float32Array(x.memory.buffer, this.#out, frames * 2));
     return playing !== 0;
   }
+
+  /** Move `frames` ahead without output, for seeking: fast, and close to (not exactly) what playing up to
+   *  there would give. Returns false once the song has finished. */
+  skip(frames) { return this.#s.x.sion_song_skip(this.#h, frames) !== 0; }
+
+  /** Frames played (rendered or skipped) so far. */
+  get position() { return this.#s.x.sion_song_position(this.#h); }
 
   /** Set PCM sample `n` (0..255) for %7 / %10: mono Float32Array in -1..1 at `rate` Hz, MIDI `key` (60 = as recorded).
    *  `loopStart`: frame to loop from (-1 = no loop); `bidi`: loop back and forth. */

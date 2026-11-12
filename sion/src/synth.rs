@@ -275,6 +275,25 @@ impl Op {
             3 => if hi { 1024.0 } else { 512.0 + l * 4.0 }, 4 => if hi { 512.0 } else { 1024.0 - l * 4.0 }, 5 => 0.0, _ => 1024.0 })
     }
 
+    /// Advance the envelope `n` samples at once, as that many `eg` calls would (to rounding), stage by stage.
+    /// Returns how many of them it was sounding for.
+    fn leap(&mut self, n0: f32, fr: f32) -> f32 {
+        let mut n = n0;
+        while self.st != 0 && n > 0.0 {
+            let a = self.rate * fr;
+            // Attack: lv + 16 shrinks by (1 - a/16) per sample, until lv reaches 0. Other stages: lv rises by a, to tgt.
+            let c = 1.0 - a / 16.0;
+            let k = if a <= 0.0 { f32::INFINITY } else if self.st == 1 { if c > 0.0 && self.lv > 0.0 { (16.0 / (self.lv + 16.0)).log2() / c.log2() } else { 0.0 } }
+                else { (self.tgt - self.lv) / a };
+            let k = (-(-k).floor()).max(1.0); // samples until the stage ends
+            let m = k.min(n);
+            if self.st == 1 { self.lv = (self.lv + 16.0) * (m * c.log2()).exp2() - 16.0 } else { self.lv += a * m }
+            if k <= n { self.shift(if self.st == 1 { 2 } else if self.st == 3 && self.ssg > 0 { 1 } else { self.st + 1 }) }
+            n -= m;
+        }
+        n0 - n
+    }
+
     #[cfg_attr(feature = "small", optimize(speed))]
     fn level(&self, sh: &Shared, lv: f32, am: f32) -> f32 {
         let ksl = if self.ksl == 0 { 0 } else { self.kc >> (5 - self.ksl) };
@@ -467,11 +486,75 @@ impl Chan {
         self.on = false;
     }
 
+    /// Advance `n` samples without producing output, for seeking: envelopes, PCM playback position, LFO,
+    /// filter sweep and oscillator phases move on as `n` calls of `sample` would (to rounding); what only
+    /// lasts a moment (feedback, filter and plucked-string memory) is left to settle in the samples after.
+    pub fn leap(&mut self, sh: &Shared, n: u64) {
+        if !self.ks && !self.f_on && self.silent() { return }
+        let (live, fr, nf) = (self.ops[0].st != 0, self.fratio, n as f32);
+        let eg = if self.pcm >= 0 || self.n == 5 { 1 } else { self.ops.len() };
+        // Phases and the LFO only move while the channel sounds (see `sample`).
+        let on = self.ops[..eg].iter_mut().fold(0f32, |on, o| on.max(o.leap(nf, fr)));
+        let on = if self.ks || self.f_on { nf } else { on };
+        for o in &mut self.ops { o.ph = wrap(o.ph + o.step * on) }
+        if self.pmd != 0 || self.amd > 0 {
+            self.lfo_t -= self.lfo_step * on;
+            if self.lfo_t < 0.0 {
+                let k = (-self.lfo_t * fr).floor() + 1.0;
+                self.lfo_t += k / fr;
+                self.lfo_ph = (self.lfo_ph + k as usize) & 255;
+                let (a, p) = (self.amd, self.pmd);
+                self.set_am(a);
+                self.set_pm(p);
+                self.stale = true;
+            }
+        }
+        if let (true, Some(s)) = (self.pcm >= 0 && live, sh.samples.get(self.sidx).and_then(Option::as_ref)) {
+            self.sfrac += self.sstep * nf;
+            let k = self.sfrac as usize;
+            (self.spos, self.sfrac) = (self.spos + k, self.sfrac - k as f32);
+            let o = &mut self.ops[0];
+            if self.spos >= s.data.len() { match s.wrap(self.spos) { Some(u) => self.spos = u, None => o.st = 0 } }
+            if self.slen > 0.0 { self.sleft -= self.sstep * nf; if self.sleft <= 0.0 { o.st = 0 } }
+        }
+        if self.f_on {
+            let mut m = n as i64;
+            while self.f_cnt.max(1) as i64 <= m {
+                m -= self.f_cnt.max(1) as i64;
+                self.cutoff += self.f_inc;
+                self.f_cnt = self.f_step;
+                if self.cutoff == self.f_next { self.f_shift(self.f_st + 1) }
+            }
+            self.f_cnt -= m as i32;
+        }
+    }
+
+    /// No operator is sounding (a filter or plucked string may still be ringing out).
+    pub fn silent(&self) -> bool { self.ops.iter().all(|o| o.st == 0) }
+
+    /// Recompute the operator pitches and PCM speed after a pitch, LFO or operator change; `late` is how far
+    /// into the frame just played (0..1) the change came.
+    pub fn refresh(&mut self, sh: &Shared, late: f32) {
+        let (pm, pitch, fine, ks) = (self.pm, self.pitch, self.fine, self.ks);
+        for o in &mut self.ops { if !ks { (o.pi, o.pf) = (pitch, fine) } o.pitch(sh, pm) }
+        if self.pcm >= 0 {
+            // `%10` picks the sample by note number and plays it at its own rate.
+            self.sidx = if self.pcm == 10 { (pitch >> 6).max(0) as usize } else { self.smp };
+            let semi = |s: &Sample| if self.pcm == 7 { (((pitch + self.ops[0].det + pm - s.key * 64) as f32 + fine) / 768.0).exp2() } else { 1.0 };
+            let step = sh.samples.get(self.sidx).and_then(Option::as_ref).map_or(0.0, |s| s.rate / RATE * semi(s));
+            // The new speed applies from the event's exact time, partway into the frame just played.
+            self.sfrac += (step - self.sstep) * late;
+            while self.sfrac < 0.0 && self.spos > 0 { (self.spos, self.sfrac) = (self.spos - 1, self.sfrac + 1.0) }
+            self.sstep = step;
+        }
+        self.stale = false;
+    }
+
     /// Produce one sample. `pipes` carry signals between tracks (`@i`, `@o`, `@r`).
     #[cfg_attr(feature = "small", optimize(speed))]
     pub fn sample(&mut self, sh: &Shared, pipes: &mut [f32; 4]) -> f32 {
         let late = core::mem::take(&mut self.slate);
-        if !self.ks && !self.f_on && self.ops.iter().all(|o| o.st == 0) { return 0.0 }
+        if !self.ks && !self.f_on && self.silent() { return 0.0 }
         if self.pmd != 0 || self.amd > 0 {
             self.lfo_t -= self.lfo_step;
             if self.lfo_t < 0.0 {
@@ -483,21 +566,8 @@ impl Chan {
                 self.stale |= self.pm != pm0;
             }
         }
-        let (am, pm, fr, pitch, fine, ks) = (self.am, self.pm, self.fratio, self.pitch, self.fine, self.ks);
-        if self.stale {
-            for o in &mut self.ops { if !ks { (o.pi, o.pf) = (pitch, fine) } o.pitch(sh, pm) }
-            if self.pcm >= 0 {
-                // `%10` picks the sample by note number and plays it at its own rate.
-                self.sidx = if self.pcm == 10 { (pitch >> 6).max(0) as usize } else { self.smp };
-                let semi = |s: &Sample| if self.pcm == 7 { (((pitch + self.ops[0].det + pm - s.key * 64) as f32 + fine) / 768.0).exp2() } else { 1.0 };
-                let step = sh.samples.get(self.sidx).and_then(Option::as_ref).map_or(0.0, |s| s.rate / RATE * semi(s));
-                // The new speed applies from the event's exact time, partway into the frame just played.
-                self.sfrac += (step - self.sstep) * late;
-                while self.sfrac < 0.0 && self.spos > 0 { (self.spos, self.sfrac) = (self.spos - 1, self.sfrac + 1.0) }
-                self.sstep = step;
-            }
-            self.stale = false;
-        }
+        if self.stale { self.refresh(sh, late) }
+        let (am, pm, fr, pitch) = (self.am, self.pm, self.fratio, self.pitch);
         let fbin = if self.inp.0 > 0 { pipes[self.inp.1] * pow2(self.inp.0 - 3) } else if self.fb > 0 {
             let o = &self.ops[self.fbc];
             // (The chips' sum also cancels at the sample rate, so deep feedback doesn't break into oscillation.)

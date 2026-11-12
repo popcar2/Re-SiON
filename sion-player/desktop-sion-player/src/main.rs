@@ -41,6 +41,14 @@ fn fail(parts: &[&str]) {
     }
 }
 
+/// Volume that brings a song to a common loudness, so no song is much louder or quieter than the rest.
+/// Measured for each song in `songs/` when the player is built (see build.rs); other songs play at full volume.
+fn volume(file: &std::path::Path) -> f32 {
+    const VOLUMES: &[(&str, f32)] = include!(concat!(env!("OUT_DIR"), "/volumes.rs"));
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    VOLUMES.iter().find(|(n, _)| *n == name).map_or(1.0, |(_, v)| *v)
+}
+
 fn main() {
     #[cfg(all(unix, not(target_os = "macos")))]
     open_terminal();
@@ -54,13 +62,16 @@ fn main() {
     if songs.is_empty() { return fail(&["no songs in ", &dir.to_string_lossy(), "\n"]) }
     let name = |i: usize| songs[i].file_stem().unwrap_or_default().to_string_lossy();
 
-    let playing = Arc::new(Mutex::new(None::<sion::Song>));
+    let playing = Arc::new(Mutex::new(None::<(sion::Song, f32)>)); // song and its volume
     let shared = playing.clone();
     let params = OutputDeviceParameters { channels_count: 2, sample_rate: sion::RATE as usize, channel_sample_count: 2048 };
     let Ok(_device) = run_output_device(params, move |out| {
         out.fill(0.0);
         if let Ok(mut song) = shared.lock() {
-            if song.as_mut().is_some_and(|s| !s.render(out)) { *song = None }
+            let Some((s, vol)) = song.as_mut() else { return };
+            let playing = s.render(out);
+            for x in out.iter_mut() { *x *= *vol }
+            if !playing { *song = None }
         }
     }) else { return fail(&["cannot open audio output\n"]) };
 
@@ -74,7 +85,11 @@ fn main() {
             ("q", _) => break,
             ("s", _) => set(None),
             (_, Ok(n)) if (1..=songs.len()).contains(&n) => match std::fs::read(&songs[n - 1]) {
-                Ok(mml) => { set(Some(sion::Song::new(&String::from_utf8_lossy(&mml)))); say(&["playing: ", &name(n - 1), "\n"]) }
+                Ok(mml) => {
+                    let mml = String::from_utf8_lossy(&mml);
+                    set(Some((sion::Song::new(&mml), volume(&songs[n - 1]))));
+                    say(&["playing: ", &name(n - 1), "\n"])
+                }
                 Err(_) => say(&["cannot read song\n"]),
             },
             ("", _) => {}

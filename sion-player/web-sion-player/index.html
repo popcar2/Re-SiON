@@ -1,0 +1,281 @@
+<!doctype html>
+<!-- SiON player for the browser. Serve this folder over HTTP (e.g. `python3 -m http.server`), then open it.
+     Needs sion.js, sion.wasm, worklet.js, length.js, songs.json and songs/ next to it. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SiON Player</title>
+<style>
+  :root {
+    --bg: #fafaf9; --fg: #1c1b1a; --muted: #8a8780; --line: #e8e6e1; --hover: #f1f0ec;
+    --accent: #e0562b; --accent-soft: #fbe9e2;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #151514; --fg: #ecebe8; --muted: #7d7a74; --line: #262624; --hover: #1d1d1b;
+            --accent: #ff7a4d; --accent-soft: #2b1d17; }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); }
+  body { font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 600px; margin: 0 auto; padding: 48px 16px 150px; }
+
+  header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 24px; }
+  h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.02em; margin: 0; }
+  header span { color: var(--muted); font-size: 13px; }
+
+  input[type=search] {
+    width: 100%; padding: 10px 12px; margin-bottom: 12px; font: inherit; color: inherit;
+    background: transparent; border: 1px solid var(--line); border-radius: 8px; outline: none;
+  }
+  input[type=search]:focus { border-color: var(--muted); }
+
+  ol { list-style: none; margin: 0; padding: 0; }
+  li {
+    display: grid; grid-template-columns: 28px 1fr; gap: 8px; align-items: baseline;
+    padding: 8px 10px; border-radius: 8px; cursor: pointer; user-select: none;
+  }
+  li[hidden] { display: none; }
+  li:hover { background: var(--hover); }
+  li .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
+  li .t { display: flex; gap: 8px; align-items: baseline; min-width: 0; white-space: nowrap; }
+  li .t span { overflow: hidden; text-overflow: ellipsis; }
+  li .t .a { flex: none; max-width: 40%; margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 400; }
+  li.on { background: var(--accent-soft); }
+  li.on .t { color: var(--accent); font-weight: 550; }
+  li.on .n { color: transparent; position: relative; }
+  li.on .n::after {
+    content: ""; position: absolute; right: 2px; top: 50%; width: 10px; height: 10px; margin-top: -5px;
+    background: linear-gradient(var(--accent) 0 0) 0 100% / 2px 100%,
+                linear-gradient(var(--accent) 0 0) 4px 100% / 2px 60%,
+                linear-gradient(var(--accent) 0 0) 8px 100% / 2px 80%;
+    background-repeat: no-repeat;
+  }
+  body.playing li.on .n::after { animation: eq 0.9s steps(3) infinite; }
+  @keyframes eq { 50% { background-size: 2px 40%, 2px 100%, 2px 30%; } }
+  .empty { color: var(--muted); padding: 24px 10px; }
+
+  footer {
+    position: fixed; left: 0; right: 0; bottom: 0; background: var(--bg); border-top: 1px solid var(--line);
+  }
+  footer div.bar { max-width: 600px; margin: 0 auto; padding: 10px 16px 14px; }
+  footer div.row { display: flex; align-items: center; gap: 12px; }
+  footer div.seek { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  footer .now { flex: 1; min-width: 0; }
+  footer .now .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 550; }
+  footer .now .a { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  footer time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; min-width: 34px; }
+  footer time#pos { text-align: right; }
+
+  input[type=range] {
+    --p: 0%; flex: 1; height: 16px; margin: 0; background: transparent; cursor: pointer; -webkit-appearance: none; appearance: none;
+  }
+  input[type=range]:disabled { cursor: default; }
+  input[type=range]::-webkit-slider-runnable-track {
+    height: 4px; border-radius: 2px; background: linear-gradient(var(--accent) 0 0) 0 / var(--p) 100% no-repeat, var(--line);
+  }
+  input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; background: var(--line); }
+  input[type=range]::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--accent); }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 12px; height: 12px; margin-top: -4px; border: 0; border-radius: 50%;
+    background: var(--accent); transform: scale(0); transition: transform 0.12s;
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 12px; height: 12px; border: 0; border-radius: 50%; background: var(--accent); transform: scale(0); transition: transform 0.12s;
+  }
+  input[type=range]:not(:disabled):is(:hover, :active, :focus-visible)::-webkit-slider-thumb { transform: scale(1); }
+  input[type=range]:not(:disabled):is(:hover, :active, :focus-visible)::-moz-range-thumb { transform: scale(1); }
+  input[type=range]:focus { outline: none; }
+  button {
+    width: 36px; height: 36px; flex: none; display: grid; place-items: center; padding: 0; cursor: pointer;
+    color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 50%;
+  }
+  button:hover:not(:disabled) { background: var(--hover); }
+  button:disabled { opacity: 0.35; cursor: default; }
+  button.main { background: var(--fg); color: var(--bg); border-color: var(--fg); width: 40px; height: 40px; }
+  button.main:hover:not(:disabled) { background: var(--fg); opacity: 0.85; }
+  svg { width: 14px; height: 14px; fill: currentColor; }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>SiON</h1><span id="count">MML player</span></header>
+  <input type="search" id="q" placeholder="Search songs" autocomplete="off" spellcheck="false">
+  <ol id="list"></ol>
+</main>
+<footer>
+  <div class="bar">
+  <div class="seek">
+    <time id="pos">0:00</time>
+    <input type="range" id="seek" min="0" max="1" step="any" value="0" disabled aria-label="Seek">
+    <time id="dur">0:00</time>
+  </div>
+  <div class="row">
+    <button id="prev" title="Previous" disabled><svg viewBox="0 0 16 16"><path d="M3 3h2v10H3zM14 3v10L6 8z"/></svg></button>
+    <button id="play" class="main" title="Play / pause (space)" disabled><svg viewBox="0 0 16 16"><path id="icon" d="M4 2.5v11L13.5 8z"/></svg></button>
+    <button id="next" title="Next" disabled><svg viewBox="0 0 16 16"><path d="M11 3h2v10h-2zM2 3v10l8-5z"/></svg></button>
+    <div class="now"><div class="t" id="title">Nothing playing</div><div class="a" id="artist">Pick a song</div></div>
+  </div>
+  </div>
+</footer>
+
+<script type="module">
+const PLAY = "M4 2.5v11L13.5 8z", PAUSE = "M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z";
+const $ = (id) => document.getElementById(id);
+
+// songs.json: [{file, volume}], written by the desktop player's build (build.rs), which measures each song
+// to find the volume that brings it to a common loudness.
+const files = await (await fetch("songs.json")).json();
+const songs = files.map(({ file, volume = 1 }, i) => {
+  const name = file.replace(/\.(sion)?mml$/i, "");
+  const cut = name.indexOf(" - ");
+  return cut < 0 ? { i, file, volume, title: name, artist: "" }
+                 : { i, file, volume, artist: name.slice(0, cut), title: name.slice(cut + 3) };
+});
+$("count").textContent = `${songs.length} songs`;
+const wasm = fetch("sion.wasm").then((r) => r.arrayBuffer());
+
+// ---- Song list ----
+const rows = songs.map((s) => {
+  const li = document.createElement("li");
+  li.innerHTML = `<span class="n">${s.i + 1}</span><div class="t"><span></span><span class="a"></span></div>`;
+  li.querySelector(".t span").textContent = s.title;
+  li.querySelector(".a").textContent = s.artist;
+  li.onclick = () => play(s.i);
+  $("list").append(li);
+  return li;
+});
+const empty = Object.assign(document.createElement("li"), { className: "empty", textContent: "No matches" });
+$("q").oninput = () => {
+  const q = $("q").value.trim().toLowerCase();
+  let shown = 0;
+  songs.forEach((s, i) => {
+    const hit = !q || `${s.artist} ${s.title}`.toLowerCase().includes(q);
+    rows[i].hidden = !hit;
+    shown += hit;
+  });
+  shown ? empty.remove() : $("list").append(empty);
+};
+
+// ---- Audio ----
+const RATE = 44100;
+let ctx, node, current = -1, ready;
+let pos = 0, dur = 0, loop = -1, dragging = false; // in frames; dur = 0 until measured, loop = -1 unless it loops
+
+// Song lengths are measured in a worker, so neither the page nor the audio thread stalls.
+const lengths = new Worker("length.js", { type: "module" });
+lengths.onmessage = ({ data }) => {
+  if (data.id !== current) return;
+  if ("frames" in data) dur = data.frames;
+  if ("loop" in data) loop = data.loop;
+  showTime();
+};
+
+function audio() {
+  return ready ??= (async () => {
+    ctx = new AudioContext({ sampleRate: RATE });
+    await ctx.audioWorklet.addModule("worklet.js");
+    node = new AudioWorkletNode(ctx, "sion", { numberOfInputs: 0, outputChannelCount: [2] });
+    node.connect(ctx.destination);
+    const bytes = await wasm;
+    await new Promise((ok) => {
+      node.port.onmessage = ({ data }) => data.ready && ok();
+      node.port.postMessage({ wasm: bytes }, [bytes]);
+    });
+    node.port.onmessage = ({ data }) => {
+      if ("pos" in data) { pos = data.pos; showTime() }
+      if (data.ended) current + 1 < songs.length ? play(current + 1) : stop();
+    };
+  })();
+}
+
+async function play(i) {
+  const s = songs[i];
+  current = i;
+  pos = dur = 0;
+  loop = -1;
+  show();
+  const [mml] = await Promise.all([fetch("songs/" + encodeURIComponent(s.file)).then((r) => r.text()), audio()]);
+  if (current !== i) return; // another song was picked while this one loaded
+  node.port.postMessage({ mml, volume: s.volume });
+  lengths.postMessage({ id: i, mml });
+  await ctx.resume();
+  show();
+  rows[i].scrollIntoView({ block: "nearest" });
+}
+
+function stop() {
+  node?.port.postMessage({ mml: null });
+  current = -1;
+  pos = dur = 0;
+  loop = -1;
+  show();
+}
+
+function seek(frame) {
+  if (current < 0 || !node) return;
+  pos = Math.max(0, dur ? Math.min(frame, dur) : frame);
+  node.port.postMessage({ seek: pos });
+  showTime();
+}
+
+async function toggle() {
+  if (current < 0) return play(0);
+  ctx.state === "running" ? await ctx.suspend() : await ctx.resume();
+  show();
+}
+
+function show() {
+  const s = songs[current], playing = !!s && ctx?.state === "running";
+  rows.forEach((li, i) => li.classList.toggle("on", i === current));
+  document.body.classList.toggle("playing", playing);
+  $("title").textContent = s ? s.title : "Nothing playing";
+  $("artist").textContent = s ? s.artist || " " : "Pick a song";
+  $("icon").setAttribute("d", playing ? PAUSE : PLAY);
+  $("play").disabled = false;
+  $("prev").disabled = !s || current === 0;
+  $("next").disabled = !s || current === songs.length - 1;
+  showTime();
+}
+
+const clock = (frames) => { const t = Math.floor(frames / RATE); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}` };
+
+// Songs with a `$` loop play on forever: each time playback reaches the end, the bar and clock jump back to the
+// loop point. (A song that ends instead can ring a moment past its length; the bar just stays full until it stops.)
+const shown = () => {
+  if (!dur || pos < dur) return pos;
+  return loop >= 0 && loop < dur ? loop + (pos - dur) % (dur - loop) : dur;
+};
+
+function showTime() {
+  const bar = $("seek");
+  bar.disabled = current < 0 || !dur;
+  if (!dragging) {
+    bar.max = dur || 1;
+    bar.value = dur ? shown() : 0; // until the length is known, max is a placeholder 1 — keep the bar empty
+    $("pos").textContent = clock(shown());
+  }
+  bar.style.setProperty("--p", `${dur ? Math.min(1, bar.value / dur) * 100 : 0}%`);
+  $("dur").textContent = dur ? clock(dur) : current < 0 ? "0:00" : "–:––";
+}
+
+$("seek").oninput = () => { dragging = true; $("pos").textContent = clock(+$("seek").value); showTime() };
+$("seek").onchange = () => { dragging = false; seek(+$("seek").value) };
+
+$("play").onclick = toggle;
+$("prev").onclick = () => current > 0 && play(current - 1);
+$("next").onclick = () => current >= 0 && current + 1 < songs.length && play(current + 1);
+addEventListener("keydown", (e) => {
+  if (e.target === $("q")) { if (e.key === "Escape") $("q").blur(); return; }
+  if (e.target === $("seek") && e.key.startsWith("Arrow")) return; // the slider handles its own arrows
+  if (e.key === " ") { e.preventDefault(); toggle(); }
+  else if (e.key === "Escape") stop();
+  else if (e.key === "/") { e.preventDefault(); $("q").focus(); }
+  else if (e.key === "ArrowLeft") seek(shown() - 5 * RATE);
+  else if (e.key === "ArrowRight") seek(shown() + 5 * RATE);
+});
+show();
+</script>
+</body>
+</html>

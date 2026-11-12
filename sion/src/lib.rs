@@ -236,6 +236,8 @@ const CMD: [&str; 44] = [
 
 struct Track {
     s: Arc<[u8]>, i: usize, loops: Vec<(usize, i32)>, rep: Option<usize>, moved: bool, end: bool,
+    /// Has reached the end of its sequence at least once (ended, or jumped back to its `$` loop point).
+    once: bool,
     at: f64, koff: f64, kon: f64, q: f64, qc: f64, kd: f64,
     oct: i32, len: i32, ns: i32, vel: i32, vsh: i32, x: i32, kt: i32, k: i32, kf: f32, note: i32, slur: bool, md: i32, tone: i32,
     /// Envelope settings for [key-off, key-on] x [amplitude, tone, note, pitch, filter]: (table, frames per step).
@@ -251,17 +253,20 @@ struct Track {
     tset: f64,
     /// How far into the frame just played (0..1) the command being run fell.
     late: f32,
+    /// While skipping (see `Song::skip`): frames the channel has yet to be leapt along by, the frame up to
+    /// which `res` has counted down, and the first frame the track may have something to do.
+    lag: u64, seen: u64, next: u64,
     ch: Chan,
 }
 
 impl Track {
     fn new(s: Vec<u8>, sh: &Shared) -> Track {
         let mut t = Track {
-            s: s.into(), i: 0, loops: vec![], rep: None, moved: false, end: false,
+            s: s.into(), i: 0, loops: vec![], rep: None, moved: false, end: false, once: false,
             at: 0.0, koff: INF, kon: INF, q: (sh.quant * 3 / 4) as f64 / sh.quant as f64, qc: 0.0, kd: 0.0,
             oct: 5, len: 480, ns: 0, vel: 256, vsh: sh.vmode.2, x: 128, kt: 0, k: 0, kf: 0.0, note: 0, slur: false, md: 0, tone: 0,
             set: [[None; 5]; 2], xoff: [false; 2], sweep: [0; 2], swe0: 0.0, modt: [None, None], env: [None; 5], menv: None,
-            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 0.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0,
+            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 0.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0,
             ch: Chan::new(),
         };
         t.ch.vm = (sh.vmode.0, sh.vmode.1);
@@ -388,15 +393,47 @@ impl Track {
                 self.exec(&s, &mut i, sh, bpm, true);
                 self.i = i;
             } else if let (Some(r), true) = (self.rep, self.moved) {
-                (self.i, self.moved) = (r, false);
+                (self.i, self.moved, self.once) = (r, false, true);
             } else {
-                self.end = true;
+                (self.end, self.once) = (true, true);
             }
         }
         if due >= self.kon { self.late = late(self.kon, *bpm); self.kon = INF; self.key_on(sh); self.ch.stale = true }
         if due >= self.koff { self.key_off(sh); self.ch.stale = true }
         self.res -= 1.0;
         if self.res <= 0.0 { self.frame(sh); self.res += self.itv; self.ch.stale = true }
+    }
+
+    /// Count down to the next envelope frame for the frames up to `pos` the track has been left alone for,
+    /// and with `replay` run the envelope frames due in them (exactly as running each frame would).
+    fn catch(&mut self, sh: &Shared, pos: u64, replay: bool) {
+        let mut k = pos - self.seen;
+        (self.lag, self.seen) = (self.lag + k, pos);
+        while replay {
+            let f = (-(-self.res).floor()).max(1.0);
+            if f > k as f32 { break }
+            (self.res, k) = (self.res - f, k - f as u64);
+            self.frame(sh);
+            (self.res, self.ch.stale) = (self.res + self.itv, true);
+        }
+        self.res -= k as f32;
+    }
+
+    /// While skipping, whether the channel has to leap along at each envelope frame: they move its pitch,
+    /// its LFO depth or its PCM sample's speed, or its LFO is on (and the pitch is taken up at each frame).
+    /// Otherwise they're replayed when the track is next run.
+    fn ticks(&self) -> bool {
+        self.pact || self.ch.pcm >= 0 || self.ch.pmd != 0 || self.ch.amd > 0 || (self.menv.is_some() && self.modt.iter().any(Option::is_some))
+    }
+
+    /// The first frame from `pos` (whose tick is `now`) on that may have something for `run` to do (a
+    /// command, key on/off, or with `ticks` an envelope frame due), given the ticks per frame. Errs early:
+    /// a frame early just means running it the slow way.
+    fn next(&self, pos: u64, now: f64, step: f64, ticks: bool) -> u64 {
+        let until = |at: f64| (at - now) / step - 2.0;
+        let cmd = if self.end { INF } else { until(self.at) };
+        let res = if ticks { (self.res - (pos - self.seen) as f32) as f64 - 1.0 } else { INF };
+        pos.saturating_add(res.min(until(self.kon)).min(until(self.koff)).min(cmd).max(0.0) as u64)
     }
 
     /// Execute the command at `s[*i]`. `main` is false for a voice's init sequence, where loops are ignored.
@@ -602,6 +639,8 @@ struct Slot { fx: Vec<Fx>, vol: f32, pan: i32, mono: bool, buf: Vec<[f32; 2]> }
 
 pub struct Song {
     tracks: Vec<Track>, sh: Shared, slots: Vec<Slot>, bpm: f64, now: f64, tail: usize,
+    /// Frames played (rendered or skipped) so far.
+    pos: u64,
     /// Tick and tempo at the last tempo change, and frames since: `now` is computed from these rather than summed
     /// frame by frame, so rounding can't build up over a long song.
     base: (f64, f64, u64),
@@ -883,7 +922,120 @@ impl Song {
         }
         let mut next = 511;
         let tracks = seqs.into_iter().map(|s| Track::new(statics(&inline(&s, &mut sh.tables, &mut next), &sh), &sh)).collect();
-        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, base: (0.0, 120.0, 0) }
+        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, pos: 0, base: (0.0, 120.0, 0) }
+    }
+
+    /// Frames played so far (rendered or skipped): the playback position, in `RATE`ths of a second.
+    pub fn position(&self) -> u64 { self.pos }
+
+    /// Length of one pass through the MML in frames, without rendering any audio: until every track has
+    /// reached its end, or jumped back to its `$` loop point, at least once. Capped at one hour.
+    pub fn length(mml: &str) -> u64 { Song::pass(mml).0.pos }
+
+    /// Where a song with a `$` loop carries on from once it has played `length` frames: the frame of the
+    /// loop point of the track that finished its first pass last (the one `length` measures; if tracks put
+    /// their `$` at different times, the others drift against it). None if the song ends instead.
+    pub fn loop_start(mml: &str) -> Option<u64> {
+        let (s, marks) = Song::pass(mml);
+        s.tracks.iter().zip(marks).filter(|(t, _)| !t.end).filter_map(|(_, m)| m).max().map(|(_, at)| at)
+    }
+
+    /// Sequence one pass through the MML (see `length`), without rendering. Also gives, per track that has
+    /// a `$` loop point, (frame its first pass ended, frame it first reached `$`).
+    fn pass(mml: &str) -> (Song, Vec<Option<(u64, u64)>>) {
+        let mut s = Song::new(mml);
+        let (mut marks, mut loops) = (vec![None; s.tracks.len()], vec![None; s.tracks.len()]);
+        while s.pos < 3600 * RATE as u64 && !s.tracks.iter().all(|t| t.once) {
+            let at = s.pos;
+            s.sequence(3600 * RATE as u64, false, false);
+            for ((m, l), t) in marks.iter_mut().zip(&mut loops).zip(&s.tracks) {
+                if m.is_none() && t.rep.is_some() { *m = Some(at) }
+                if let (None, true, Some(m)) = (*l, t.once, *m) { *l = Some((at, m)) }
+            }
+        }
+        (s, loops)
+    }
+
+    /// Move playback `frames` ahead without producing output, for seeking. The sequencer runs (notes, tempo,
+    /// envelope tables), leaping straight from one event to the next, and each channel's slow-moving state
+    /// (envelopes, PCM sample positions, LFO, filter sweep, oscillator phases) leaps along with it. Plucked
+    /// strings (`%11`) are synthesized in full for the last two seconds, and the last moment (a quarter
+    /// second with effect units, else a twentieth) is rendered in full, so feedback, filters and effects
+    /// (reverb, delay..) settle. The result is close to, though not exactly, what continuous playback would
+    /// give there: echoes of what played before that last moment are missing, and the phases of oscillators
+    /// with vibrato drift. Returns false once the song has finished, as `render` does.
+    /// To seek backwards, make a new `Song` and skip forward from the start.
+    pub fn skip(&mut self, frames: u64) -> bool {
+        let end = self.pos + frames;
+        let at = |s: f32| end.saturating_sub((s * RATE) as u64);
+        // Effects need longer to build up (delay lines fill, reverb rings in) than anything else does.
+        let fx = self.slots.iter().any(|s| !s.fx.is_empty());
+        let (strings, tail) = (at(2.0), at(if fx { 0.25 } else { 0.05 }));
+        for t in &mut self.tracks { (t.lag, t.seen, t.next) = (0, self.pos, self.pos) }
+        while self.pos < strings { self.sequence(strings, true, false) }
+        for t in self.tracks.iter_mut().filter(|t| t.ch.ks) { t.next = t.next.min(self.pos) }
+        while self.pos < tail { self.sequence(tail, true, true) }
+        self.catch_up();
+        let (mut buf, mut playing) = ([0f32; 512], self.tail < RATE as usize / 2);
+        while self.pos < end { playing = self.render(&mut buf[..2 * (end - self.pos).min(256) as usize]) }
+        playing
+    }
+
+    /// Sequence on towards frame `end` without rendering: leap to the next frame some track has something
+    /// to do in (see `Track::next`) and run those tracks for it. With `synth`, leap the channels along
+    /// too (see `skip`), sampling them at those frames, and every frame for plucked strings with `strings`.
+    fn sequence(&mut self, end: u64, synth: bool, strings: bool) {
+        let (pos, bpm) = (self.pos, self.bpm);
+        let next = self.tracks.iter().map(|t| t.next).fold(end, u64::min);
+        if next > pos {
+            self.advance(next - pos);
+        } else {
+            let mut pipes = [0f32; 4];
+            for t in self.tracks.iter_mut().filter(|t| t.next <= pos) {
+                t.catch(&self.sh, pos, synth);
+                // Leap a channel along just before what changes how it leaps: commands, key on/off, and
+                // envelope frames that do (see `Track::ticks`).
+                let due = self.now + 1e-6;
+                let cmd = t.ticks() || (!t.end && due >= t.at) || due >= t.kon || due >= t.koff;
+                if synth && cmd { t.ch.leap(&self.sh, core::mem::take(&mut t.lag)) }
+                t.run(&self.sh, self.now, &mut self.bpm);
+                // Strings are synthesized; other channels pick up what the commands changed and leap on.
+                if synth && strings && t.ch.ks { t.ch.sample(&self.sh, &mut pipes); } else if synth {
+                    let late = core::mem::take(&mut t.ch.slate);
+                    if cmd && t.ch.stale { t.ch.refresh(&self.sh, late) }
+                    t.lag += 1;
+                }
+                t.seen = pos + 1;
+            }
+            self.advance(1);
+            let step = self.bpm * 8.0 / RATE as f64;
+            for t in self.tracks.iter_mut().filter(|t| t.seen > pos || self.bpm != bpm) {
+                t.next = if strings && t.ch.ks { self.pos } else { t.next(self.pos, self.now, step, synth && t.ticks()) };
+            }
+        }
+        if !synth { return }
+        let ended = self.tracks.iter().all(|t| t.end && t.koff == INF && t.kon == INF) && { self.catch_up(); self.tracks.iter().all(|t| t.ch.silent()) };
+        self.tail = if ended { self.tail + (self.pos - pos) as usize } else { 0 };
+    }
+
+    /// Bring every track and channel up to the current frame (see `sequence`).
+    fn catch_up(&mut self) {
+        for t in &mut self.tracks {
+            t.catch(&self.sh, self.pos, true);
+            t.ch.leap(&self.sh, core::mem::take(&mut t.lag));
+        }
+    }
+
+    /// Step the clock `n` frames, after the tracks have run (only the first can have changed the tempo).
+    fn advance(&mut self, n: u64) {
+        if self.bpm != self.base.1 {
+            // The tempo changed partway into this frame: count the part after the change at the new tempo.
+            let at = self.tracks.iter().map(|t| t.tset).fold(self.base.0, f64::max).min(self.now);
+            self.base = (at + (self.now - at) * self.bpm / self.base.1, self.bpm, 0);
+        }
+        self.base.2 += n;
+        self.pos += n;
+        self.now = self.base.0 + self.base.2 as f64 * self.bpm * 8.0 / RATE as f64;
     }
 
     /// Fill `out` with interleaved stereo samples; returns false once the song has finished.
@@ -909,13 +1061,7 @@ impl Song {
                     }
                 }
             }
-            if self.bpm != self.base.1 {
-                // The tempo changed partway into this frame: count the part after the change at the new tempo.
-                let at = self.tracks.iter().map(|t| t.tset).fold(self.base.0, f64::max).min(self.now);
-                self.base = (at + (self.now - at) * self.bpm / self.base.1, self.bpm, 0);
-            }
-            self.base.2 += 1;
-            self.now = self.base.0 + self.base.2 as f64 * self.bpm * 8.0 / RATE as f64;
+            self.advance(1);
         }
         let (master, sends) = self.slots.split_first_mut().unwrap();
         for s in sends.iter_mut().filter(|s| !s.fx.is_empty()) {

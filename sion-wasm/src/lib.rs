@@ -122,6 +122,48 @@ pub unsafe extern "C" fn sion_song_render(song: *mut Song, out: *mut f32, frames
     song.render(slice::from_raw_parts_mut(out, frames * 2)) as i32
 }
 
+/// Move playback `frames` ahead without output, for seeking (see `Song::skip`). Returns 1 while the song
+/// plays, 0 once it has finished. To seek backwards, make a new song and skip from the start.
+///
+/// # Safety
+/// `song` must be a live song.
+#[no_mangle]
+pub unsafe extern "C" fn sion_song_skip(song: *mut Song, frames: u32) -> i32 {
+    song.as_mut().map_or(0, |s| s.skip(frames as u64) as i32)
+}
+
+/// Frames played (rendered or skipped) so far. (A float, so JS gets a plain number rather than a BigInt.)
+///
+/// # Safety
+/// `song` must be a live song.
+#[no_mangle]
+pub unsafe extern "C" fn sion_song_position(song: *const Song) -> f64 {
+    song.as_ref().map_or(0.0, |s| s.position() as f64)
+}
+
+/// Length in frames of one pass through `len` bytes of MML (until every track ends or loops once), computed
+/// without rendering. 0 if `mml` is 0.
+///
+/// # Safety
+/// `mml` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sion_length(mml: *const u8, len: usize) -> f64 {
+    if mml.is_null() { return 0.0 }
+    Song::length(&String::from_utf8_lossy(slice::from_raw_parts(mml, len))) as f64
+}
+
+/// For MML with a `$` loop (`len` bytes): the frame playback carries on from after `sion_length` frames,
+/// i.e. where the loop point is (of the track that finishes its first pass last, if tracks differ).
+/// -1 if it ends.
+///
+/// # Safety
+/// `mml` must point to `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn sion_loop_start(mml: *const u8, len: usize) -> f64 {
+    if mml.is_null() { return -1.0 }
+    Song::loop_start(&String::from_utf8_lossy(slice::from_raw_parts(mml, len))).map_or(-1.0, |f| f as f64)
+}
+
 /// Set PCM sample `n` (0..255) for `%7` / `%10`, replacing any `#PCMB` of that number.
 /// `data` is `frames` mono floats in -1..1, played at `rate` Hz at MIDI note `key` (60 = as recorded).
 /// `loop_start` is the frame looping restarts from (negative: no loop); `bidi` nonzero loops back and forth.
