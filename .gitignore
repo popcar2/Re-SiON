@@ -41,3 +41,6 @@ desktop.ini
 *.tmp
 *.orig
 *.rej
+
+# Exported release binaries
+exports/

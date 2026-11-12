@@ -57,7 +57,7 @@ fn len(s: &[u8], i: &mut usize, l: i32) -> i32 {
     let mut total = 0;
     loop {
         ws(s, i);
-        let mut d = if s.get(*i) == Some(&2) { *i += 1; num(s, i).unwrap_or(l) } else { match num(s, i) { Some(n) if n > 0 => 1920 / n, _ => l } };
+        let mut d = if s.get(*i) == Some(&2) { *i += 1; num(s, i).unwrap_or(l) } else { match num(s, i) { Some(n) if n > 0 => 1920 / n, Some(0) => 0, _ => l } };
         let mut h = d;
         ws(s, i);
         while s.get(*i) == Some(&b'.') { *i += 1; h /= 2; d += h }
