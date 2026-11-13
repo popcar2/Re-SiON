@@ -148,10 +148,8 @@ pub unsafe extern "C" fn sion_song_position(song: *const Song) -> f64 {
 #[no_mangle]
 pub unsafe extern "C" fn sion_song_notes(song: *const Song, out: *mut i32, max: usize) -> usize {
     let (Some(song), false) = (song.as_ref(), out.is_null()) else { return 0 };
-    let out = slice::from_raw_parts_mut(out, max);
-    let mut n = 0;
-    for (k, src) in song.notes().enumerate() { if k < max { out[k] = src } n += 1 }
-    n
+    let mut notes = song.notes();
+    slice::from_raw_parts_mut(out, max).iter_mut().zip(&mut notes).map(|(o, src)| *o = src).count() + notes.count()
 }
 
 /// Length in frames of one pass through `len` bytes of MML (until every track ends or loops once), computed

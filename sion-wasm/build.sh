@@ -13,11 +13,7 @@ if ! command -v wasm-opt >/dev/null 2>&1; then
 fi
 
 before=$(wc -c < "$WASM")
-# Features rustc emits for wasm32-unknown-unknown, plus the simd128 enabled in .cargo/config.toml.
-wasm-opt "$WASM" -Oz --converge \
-  --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
-  --enable-mutable-globals --enable-multivalue --enable-reference-types \
-  --strip-debug --strip-producers \
-  -o "$WASM.opt"
+# wasm-opt takes the features to allow from the target_features section (kept by `strip = "debuginfo"`).
+wasm-opt "$WASM" -Oz --converge --strip-debug --strip-producers --strip-target-features -o "$WASM.opt"
 mv "$WASM.opt" "$WASM"
 echo "wasm-opt: $before -> $(wc -c < "$WASM") bytes"

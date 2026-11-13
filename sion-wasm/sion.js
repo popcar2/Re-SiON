@@ -11,15 +11,15 @@
 //
 //   Following along: song.notes() gives, per track, the byte offset in the MML of the note it is playing.
 
+const enc = new TextEncoder();
+
 export class Sion {
   static async load(source) {
     source = await source;
-    const { instance } = source instanceof WebAssembly.Module
-      ? { instance: await WebAssembly.instantiate(source, {}) }
-      : typeof Response !== "undefined" && source instanceof Response
-        ? await WebAssembly.instantiateStreaming(source, {})
-        : await WebAssembly.instantiate(source, {});
-    return new Sion(instance.exports);
+    const r = typeof Response !== "undefined" && source instanceof Response
+      ? await WebAssembly.instantiateStreaming(source, {})
+      : await WebAssembly.instantiate(source, {}); // a Module gives an Instance, bytes give { module, instance }
+    return new Sion((r.instance ?? r).exports);
   }
 
   constructor(exports) {
@@ -28,37 +28,23 @@ export class Sion {
   }
 
   /** Parse MML text into a Song. */
-  song(mml) {
-    const bytes = new TextEncoder().encode(mml);
-    const ptr = this.#copyIn(bytes);
-    const handle = this.x.sion_song_new(ptr, bytes.length);
-    this.x.sion_dealloc(ptr, bytes.length);
-    return new Song(this, handle);
-  }
+  song(mml) { return new Song(this, this.#withMml(mml, this.x.sion_song_new)); }
 
   /** Length in frames of one pass through the MML (until every track ends or loops back once), without rendering. */
-  length(mml) {
-    const bytes = new TextEncoder().encode(mml);
-    const ptr = this.#copyIn(bytes);
-    const frames = this.x.sion_length(ptr, bytes.length);
-    this.x.sion_dealloc(ptr, bytes.length);
-    return frames;
-  }
+  length(mml) { return this.#withMml(mml, this.x.sion_length); }
 
   /** For MML with a `$` loop: the frame playback carries on from after `length` frames (where the loop
    *  point is). -1 if the song ends instead. */
-  loopStart(mml) {
-    const bytes = new TextEncoder().encode(mml);
-    const ptr = this.#copyIn(bytes);
-    const frame = this.x.sion_loop_start(ptr, bytes.length);
-    this.x.sion_dealloc(ptr, bytes.length);
-    return frame;
-  }
+  loopStart(mml) { return this.#withMml(mml, this.x.sion_loop_start); }
 
-  #copyIn(bytes) {
-    const ptr = this.x.sion_alloc(Math.max(bytes.length, 1));
-    new Uint8Array(this.x.memory.buffer, ptr, bytes.length).set(bytes);
-    return ptr;
+  #withMml(mml, f) { return this._with(enc.encode(mml), f); }
+
+  /** (Internal.) Copy typed array `data` into wasm memory, call `f(ptr, data.length)`, free the copy, return f's result. */
+  _with(data, f) {
+    const x = this.x, len = Math.max(data.byteLength, 1);
+    const ptr = x.sion_alloc(len);
+    new data.constructor(x.memory.buffer, ptr, data.length).set(data);
+    try { return f(ptr, data.length); } finally { x.sion_dealloc(ptr, len); }
   }
 }
 
@@ -86,14 +72,13 @@ export class Song {
   /** Per track, the byte offset in the MML text (as UTF-8) of the note it is playing now, -1 for none. */
   notes() {
     const x = this.#s.x;
-    for (;;) {
-      if (!this.#notes) { this.#cap ||= 16; this.#notes = x.sion_alloc(this.#cap * 4) }
-      const n = x.sion_song_notes(this.#h, this.#notes, this.#cap);
-      if (n <= this.#cap) return Array.from(new Int32Array(x.memory.buffer, this.#notes, n));
-      x.sion_dealloc(this.#notes, this.#cap * 4);
-      this.#notes = 0;
-      this.#cap = n;
+    let n = this.#notes ? x.sion_song_notes(this.#h, this.#notes, this.#cap) : 16;
+    while (n > this.#cap) { // first call, or more tracks than fit: (re)allocate and ask again
+      if (this.#notes) x.sion_dealloc(this.#notes, this.#cap * 4);
+      this.#notes = x.sion_alloc((this.#cap = n) * 4);
+      n = x.sion_song_notes(this.#h, this.#notes, this.#cap);
     }
+    return Array.from(new Int32Array(x.memory.buffer, this.#notes, n));
   }
 
   /** Frames played (rendered or skipped) so far. */
@@ -102,11 +87,8 @@ export class Song {
   /** Set PCM sample `n` (0..255) for %7 / %10: mono Float32Array in -1..1 at `rate` Hz, MIDI `key` (60 = as recorded).
    *  `loopStart`: frame to loop from (-1 = no loop); `bidi`: loop back and forth. */
   setSample(n, data, rate, key = 60, loopStart = -1, bidi = false) {
-    const x = this.#s.x, len = data.length * 4;
-    const ptr = x.sion_alloc(Math.max(len, 1));
-    new Float32Array(x.memory.buffer, ptr, data.length).set(data);
-    x.sion_song_set_sample(this.#h, n, ptr, data.length, rate, key, loopStart, bidi ? 1 : 0);
-    x.sion_dealloc(ptr, Math.max(len, 1));
+    this.#s._with(data instanceof Float32Array ? data : Float32Array.from(data), (ptr, frames) =>
+      this.#s.x.sion_song_set_sample(this.#h, n, ptr, frames, rate, key, loopStart, bidi ? 1 : 0));
   }
 
   free() {

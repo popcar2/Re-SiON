@@ -20,4 +20,4 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "immediate-abort"
-strip = true
+strip = "debuginfo" # keep the target_features section: wasm-opt reads it to know which features to allow
