@@ -200,7 +200,7 @@ fn midi_written_by_bars() {
     assert!(out.mml.contains("// Track 1, channel 1\n") && out.mml.contains("// Track 2, drums: kick"), "{}", out.mml);
     assert!(out.mml.contains("\no5c d e\no5f2.&\no5f2.;"), "{}", out.mml);
     // The drum hits aren't cut at the bar lines: their lines run on to the next hit.
-    assert!(out.mml.contains("np0\no4a1^1^4\no4a;") && out.mml.contains("\nr o6c1^1\no6c;"), "{}", out.mml);
+    assert!(out.mml.contains("np0\no3a-1^1^4\no3a-;") && out.mml.contains("\nr o6c1^1\no6c;"), "{}", out.mml);
 }
 
 /// Signal-to-difference (dB) of SiON's left channel against `want` (mono, in VGM time), up to overall level.

@@ -9,6 +9,7 @@
 <title>SiON Converter</title>
 <link rel="stylesheet" href="style.css">
 <style>
+  .note { text-align: center; color: var(--muted); font-size: 13px; line-height: 1.5; margin: 32px auto 0; max-width: 560px; }
   .drop {
     display: grid; place-items: center; gap: 6px; padding: 44px 16px; text-align: center; cursor: pointer;
     border: 1.5px dashed color-mix(in srgb, var(--muted) 45%, transparent); border-radius: 12px; transition: border-color 0.12s, background 0.12s;
@@ -117,6 +118,8 @@
       <button id="listen"><svg viewBox="0 0 16 16"><path d="M4 2.5v11L13.5 8z"/></svg>Play</button>
     </div>
   </section>
+
+  <p class="note">Note: SiON may not be able to replicate certain sounds and effects, so the converted audio might sound different from the source (especially on formats like MIDI).</p>
 </main>
 
 <script type="module">

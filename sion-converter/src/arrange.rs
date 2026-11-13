@@ -30,12 +30,24 @@ pub struct Arranged {
     /// The score's sections and loop point, in output ticks.
     pub sections: Vec<u64>,
     pub lp: Option<u64>,
+    /// The master volume (`x`, before each track's own gain).
+    x: i32,
 }
 
 impl Arranged {
-    /// The master volume (`x`) every track starts with.
-    pub fn master(&self) -> i32 { self.tracks.first().and_then(|t| t.x).unwrap_or(128) }
-    pub fn set_master(&mut self, x: i32) { for t in &mut self.tracks { t.x = (x < 128).then_some(x.clamp(1, 128)) } }
+    /// The master volume (`x`) of the loudest tracks.
+    pub fn master(&self) -> i32 { self.x }
+    pub fn set_master(&mut self, x: i32) {
+        self.x = x.clamp(1, 128);
+        for t in &mut self.tracks { t.set_x(self.x) }
+    }
+}
+
+impl Track {
+    fn set_x(&mut self, x: i32) {
+        let x = ((x as f32 * self.rel).round() as i32).clamp(1, 128);
+        self.x = (x < 128).then_some(x);
+    }
 }
 
 pub struct Track {
@@ -46,6 +58,8 @@ pub struct Track {
     drum: Option<bool>,
     /// Master volume (`x`), when below full.
     x: Option<i32>,
+    /// Its channel's gain (`Score::gains`) relative to the loudest channel's: scales the master volume.
+    rel: f32,
     /// Tempo commands carried by this track: (tick, `t...`).
     tempo: Vec<(u64, String)>,
     /// Rest until this tick after the last note (the song's end).
@@ -123,9 +137,14 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
 
     // Volume: relative to the loudest moment, in 16 steps (`v1`..`v16`); a master volume (`x`, and the drum
     // envelope peak) keeps the busiest chord from clipping.
-    let mut mix: Vec<(u64, u64, f32)> = sc.mix.iter().map(|&(s, e, a)| { let (s, e) = span(s, e); (s, e, a) }).collect();
-    if mix.is_empty() { mix = sc.notes.iter().map(|n| { let (s, e) = span(n.start, n.end); (s, e, n.amp) }).collect() }
-    let mut amax = mix.iter().map(|m| m.2).fold(0.0, f32::max).max(1e-6);
+    // (Each channel's gain goes in its tracks' `x`: the `v`s stay relative to the loudest note, the gains count
+    // only toward how loud the busiest moment gets. `Score::mix` has them already.)
+    let gain = |ch: u32| sc.gains.get(ch as usize).copied().unwrap_or(1.0).max(0.0);
+    let gmax = sc.notes.iter().map(|n| gain(n.ch)).fold(0.0, f32::max);
+    let rel = |ch: u32| if gmax > 0.0 { gain(ch) / gmax } else { 1.0 };
+    let mut mix: Vec<(u64, u64, f32)> = sc.mix.iter().map(|&(s, e, a)| { let (s, e) = span(s, e); (s, e, a / gmax.max(1e-6)) }).collect();
+    if mix.is_empty() { mix = sc.notes.iter().map(|n| { let (s, e) = span(n.start, n.end); (s, e, n.amp * rel(n.ch)) }).collect() }
+    let mut amax = sc.notes.iter().map(|n| n.amp).fold(0.0, f32::max).max(1e-6);
     if sc.mix.is_empty() { amax = sc.notes.iter().flat_map(|n| n.vols.iter().map(|v| v.1)).fold(amax, f32::max) }
     let mut edges: Vec<(u64, bool, f32)> = mix.iter().flat_map(|&(s, e, a)| [(s, true, a), (e, false, a)]).collect();
     edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
@@ -196,7 +215,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
             let busy = if n.drum.is_some() { start } else { end };
             match slot { Some(v) => { v.0 = busy; v.1.push(note) } None => voices.push((busy, vec![note], n.drum)) }
         }
-        tracks.extend(voices.into_iter().map(|(_, notes, drum)| Track { ch, notes, drum, x: None, tempo: vec![], end: 0, lp: None, vmax, kmilli: sc.kmilli }));
+        tracks.extend(voices.into_iter().map(|(_, notes, drum)| Track { ch, notes, drum, x: None, rel: rel(ch), tempo: vec![], end: 0, lp: None, vmax, kmilli: sc.kmilli }));
     }
 
     // Tempo: one `t` command per change, carried by whichever track has a convenient spot for it.
@@ -222,7 +241,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     if sc.db { header.push("#VMODE{%v1,1}".into()) } else if sc.fine { header.push("#VMODE{%v0,0}".into()) }
     header.extend(sc.header.iter().cloned());
     header.extend(header_tabs);
-    if x < 128 { for t in &mut tracks { t.x = Some(x) } }
+    for t in &mut tracks { t.set_x(x) }
     for (t, bpm) in tm {
         let val = (bpm * unit).round() as i64;
         if t == 0 && val as f64 == 120.0 * unit && tm_lp != Some(0) { continue }
@@ -248,7 +267,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     let notes = tracks.iter().map(|t| t.notes.len()).sum();
     let mut sections: Vec<u64> = sc.sections.iter().map(|&t| map(t)).filter(|&t| t < end).collect();
     sections.dedup();
-    Arranged { header, tracks, notes, sections, lp }
+    Arranged { header, tracks, notes, sections, lp, x }
 }
 
 /// A value's changes while a note sounds (from `start` to `end`): the last at or before `start` becomes `init`,

@@ -34,6 +34,9 @@ pub struct Score {
     pub sections: Vec<u64>,
     /// Per channel: its comment after "Track n, " (e.g. `channel 2: Lead`), when it has one.
     pub names: Vec<String>,
+    /// Per channel: how loud it is relative to the others (missing: 1). Applied through each track's master
+    /// volume (`x`), so every track keeps the full `v` range for its own dynamics.
+    pub gains: Vec<f32>,
     pub title: String,
 }
 

@@ -45,11 +45,18 @@ const r = conv.convert(fileBytes, { grid, gain, wavetables, exact, exactPcm, tra
 
 - Timing stays exact. When the MIDI resolution doesn't divide SiON's 480 ticks per quarter, the converter counts in MIDI ticks and scales the tempo instead.
 - Each channel is split into monophonic tracks, one per simultaneous voice. Handles the sustain pedal, velocity × CC7 × CC11 (`v1`..`v16`, plus a master `x`), pan (`@p`), and pitch bend with RPN range (`k`, with mid-note bends written as `&` slurs). Tempo changes become `t`.
-- Instruments: GM program families map to the NES APU module (`%1@2` 25% pulse, `%1@4` 50% pulse, `%1@8` triangle).
-- Drums (channel 10): kick and toms are sine waves with a fast downward pitch sweep (`%5@0` + `np` table); snares layer
-  white noise over a short swept tone; hats, cymbals and ride use high-passed noise (`%2@3`), each with its own decay.
-  Each drum type gets its own track. To change sounds, edit `instrument()` and `drum()` in `src/midi.rs`
-  (render with `--wav` to listen).
+- Instruments: GM program families map to the NES APU module (`%1@2` 25% pulse, `%1@4` 50% pulse, `%1@8` triangle),
+  each with an envelope shaped like the GM instrument's (`%1@2,63,0,12,38,0`: attack, fade while held, release), so
+  short notes stay short instead of ringing on in SiON's default half-second release.
+- Balance: velocity, CC7 and CC11 follow the GM loudness curve (squared), and every program has a gain (`PROG_DB` in
+  `src/midi.rs`, measured against a GM sound font by loudness as heard: K-weighted, ITU-R BS.1770) applied through its tracks' `x`, so bass, lead and drums sit
+  in the mix as a GM synthesizer plays them. Each program a channel uses gets its own tracks.
+- Drums (channel 10): kick and toms are sine waves that drop 4–8 semitones within a frame or two (`%5@0` + `np`
+  table) and hold their body before a fast fade (`%5@0,63,26,42,42,1`: a kick is gone in about 110 ms); the kick
+  adds a few milliseconds of noise for the beater's click; snares layer white noise over a short swept tone; hats,
+  cymbals and ride use high-passed noise (`%2@3`), each with its own decay. Each sound was fitted hit by hit
+  against a GM sound font (level over time, spectrum and loudness). Each drum type gets its own track. To change
+  sounds, edit `instrument()` and `drum()` in `src/midi.rs` (render with `--wav` to listen).
 
 ## Tracker modules (MOD, S3M, XM, IT)
 

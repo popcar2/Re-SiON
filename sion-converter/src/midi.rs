@@ -126,61 +126,125 @@ fn track(b: &[u8], trk: usize, out: &mut Vec<(u64, usize, usize, Msg)>) {
 
 const DRUMS: u8 = 9;
 
-/// Pitch sweeps for the drum kit (`#TABLE` + `np`, 1/64 semitones per frame): kick, toms.
-const DRUM_TABLES: [&str; 3] = ["(0,-1536)5 -1536", "(0,-1024)9 -1024", "(0,-768)4 -768"];
+/// Pitch drops for the drum kit (`#TABLE` + `np`, 1/64 semitones per 1/60 s frame): kick and toms fall 4 or 8
+/// semitones within a frame or two, as GM's do; the snare body sweeps further.
+const DRUM_TABLES: [&str; 5] = ["0 -512", "0 -128 -256", "0 -256", "0 -256 -512", "(0,-768)4 -768"];
 
-/// SiON tone for a General MIDI program (NES-style APU module `%1`).
-fn instrument(prog: u8) -> &'static str {
+/// The waveform for a General MIDI program.
+fn wave(prog: u8) -> u8 {
     match prog {
-        32..=39 | 72..=79 => "%1@8",                      // bass, pipe: triangle
-        0..=15 | 24..=31 | 80..=87 | 104..=111 => "%1@2", // piano, chromatic percussion, guitar, lead, ethnic: 25% pulse
-        _ => "%1@4",                                      // organ, strings, brass, reed, pads...: 50% pulse
+        32..=39 | 72..=79 => 8,                      // bass, pipe: triangle
+        0..=15 | 24..=31 | 80..=87 | 104..=111 => 2, // piano, chromatic percussion, guitar, lead, ethnic: 25% pulse
+        _ => 4,                                      // organ, strings, brass, reed, pads...: 50% pulse
     }
 }
 
-struct Drum { group: usize, instr: &'static str, tone: u8, note: u8, decay: u8, ptab: Option<u8>, gain: f32 }
+/// How loud each GM program comes out against the drum kit (dB), for notes as loud as a GM synthesizer plays
+/// them: measured by playing every program through a GM sound font and through its SiON tone, and comparing
+/// loudness as heard (K-weighted, ITU-R BS.1770), not raw level: the kit's sines and noise and GM's samples
+/// spread their energy differently, and raw level understates how loud bright sounds (distorted guitars) are. SiON's pulse waves
+/// come out about 13 dB louder next to the drums than GM instruments do, its triangle about 7; and GM instruments
+/// differ among themselves (electric basses are loud, pads and effects quiet).
+const PROG_DB: [i8; 128] = [
+    -14, -13, -12, -12, -11, -12, -14, -14, -10, -12,  -8, -11, -11, -18,  -8, -11,
+    -13, -15, -22, -13, -13, -13, -13, -13, -12, -12,  -9, -14, -12, -11, -12,  -9,
+     -6,   3,   4,  -6, -10,  -7,  -7,  -8, -11, -11, -11, -12, -14, -13, -11, -16,
+    -14, -18, -13, -13, -15, -11, -10, -15, -15, -15, -15, -15, -13, -18, -17, -11,
+    -12, -15, -13, -14, -12, -12, -12, -11,  -8,  -8,  -5,  -6,  -8,  -9,  -4,  -3,
+    -13,  -5, -12, -16, -13, -13, -13, -12, -11, -17, -15, -12, -15, -18, -16, -15,
+    -15, -15, -11, -15, -13, -19, -18, -14,  -8, -10, -14, -10,  -9,  -9,  -8,  -9,
+    -12, -14, -10, -19,  -9, -13,  -8, -20, -22, -24, -24, -14, -13, -24, -21, -14,
+];
 
-/// Drum groups 0 (kick), 4 (toms) and 6 (snare body) are tones: sine waves (`%5@0`) swept down in pitch
-/// (written that many semitones above where they land), held until the next hit and faded by their envelope's
-/// decay. The others are noise (`%2@0` white, `%2@3` high-passed) keyed off at once (`q0`) and faded by their
-/// release. Decay/release rate: 28 takes about 0.9 s to fade, every +4 halves it.
+fn prog_gain(prog: u8) -> f32 { 10f32.powf(PROG_DB[prog as usize & 127] as f32 / 20.0) }
+
+/// SiON tone for a General MIDI program (NES-style APU module `%1`): the waveform, and an envelope shaped like
+/// the GM instrument's (`@wave,ar,dr,sr,rr,sl`): attack, how fast a held note fades, and its release. SiON's
+/// default release takes half a second, which smears short notes (staccato guitar, bass) into a drone; GM
+/// instruments stop within a few tens of milliseconds of their note-off, except pianos, mallets, ensembles and pads.
+/// Rates: release 28 fades out in about 0.3 s, 32 in 0.12 s, 36 in 30 ms; sustain rate 12 loses 3 dB per second,
+/// 16 about 7, 20 about 14; attack 24 takes 0.16 s, 32 40 ms (each +4 halves the time).
+fn instrument(prog: u8) -> (&'static str, String) {
+    let wave = wave(prog);
+    let (ar, sr, rr) = match prog {
+        0..=7 => (63, 15, 29),     // piano: decays while held, rings a little after
+        8..=15 => (63, 19, 28),    // chromatic percussion (mallets, bells)
+        16..=23 => (63, 0, 36),    // organ
+        29 | 30 => (35, 12, 38),   // overdriven, distortion guitar (fading in over 25 ms, as GM's do)
+        24..=31 => (63, 16, 36),   // guitar
+        32..=39 => (63, 17, 38),   // bass
+        45 => (63, 21, 36),        // pizzicato strings
+        46 | 47 => (63, 17, 30),   // harp, timpani
+        40..=44 => (30, 0, 32),    // strings
+        48..=55 => (26, 0, 29),    // ensemble, choir
+        56..=63 => (32, 0, 36),    // brass
+        64..=79 => (30, 0, 36),    // reed, pipe
+        80..=87 => (63, 0, 38),    // lead
+        88..=95 => (24, 0, 27),    // pad
+        96..=103 => (30, 0, 28),   // synth effects
+        104..=111 => (63, 16, 34), // ethnic (plucked)
+        112..=119 => (63, 22, 32), // percussive
+        _ => (63, 0, 32),          // sound effects
+    };
+    ("%1", format!("@{wave},{ar},0,{sr},{rr},0"))
+}
+
+/// One sound of a drum hit. `env`: for tones, decay rate, the level it decays to (`sl`, 3 dB steps) and the
+/// rate after that; for noise, the release rate (the others unused).
+struct Drum { group: usize, instr: &'static str, tone: u8, note: u8, env: [u8; 3], ptab: Option<u8>, gain: f32 }
+
+/// Drum groups 0 (kick), 4 (toms) and 6 (snare body) are tones: sine waves (`%5@0`) dropping in pitch
+/// (written that many semitones above where they land), held until the next hit and shaped by their envelope:
+/// a slow decay to just below full (`sl` 1), then a fast one, so a kick holds its body for 50 ms and is gone by
+/// 110 ms, as GM's is. Fitted against a GM sound font, hit by hit (level over time and spectrum). The others
+/// are noise (`%2@0` white, `%2@3` high-passed) keyed off at once (`q0`) and faded by their release.
+/// Decay/release rate: 28 takes about 0.9 s to fade, every +4 halves it.
 fn tonal(group: usize) -> bool { matches!(group, 0 | 4 | 6) }
 
 /// GM drum key → the sounds layered for it. Each group becomes its own track(s).
 fn drum(key: u8) -> Vec<Drum> {
-    let d = |group, instr, tone, note, decay, ptab, gain| Drum { group, instr, tone, note, decay, ptab, gain };
-    let body = |note: u8| d(6, "%5", 0, note + 12, 40, Some(2), 0.6);
+    let d = |group, instr, tone, note, decay, ptab, gain| Drum { group, instr, tone, note, env: [decay, 0, 0], ptab, gain };
+    let t = |group, note, ptab, dr, sl, sr, gain| Drum { group, instr: "%5", tone: 0, note, env: [dr, sl, sr], ptab: Some(ptab), gain };
+    let body = |note: u8| t(6, note + 12, 4, 40, 15, 40, 0.61);
     match key {
-        35 => vec![d(0, "%5", 0, 31 + 24, 34, Some(0), 1.0)],
-        36 => vec![d(0, "%5", 0, 33 + 24, 34, Some(0), 1.0)],
-        38 => vec![d(1, "%2", 0, 72, 38, None, 0.9), body(54)],
-        40 => vec![d(1, "%2", 0, 76, 39, None, 0.9), body(56)],
+        // (With the beater's click: a few milliseconds of noise.)
+        35 => vec![t(0, 31 + 8, 0, 30, 1, 48, 0.8), d(7, "%2", 0, 84, 52, None, 0.5)],
+        36 => vec![t(0, 36 + 8, 0, 26, 1, 42, 0.73), d(7, "%2", 0, 84, 52, None, 0.46)],
+        38 => vec![d(1, "%2", 0, 72, 38, None, 0.85), body(54)],
+        40 => vec![d(1, "%2", 0, 76, 39, None, 0.95), body(56)],
         39 => vec![d(1, "%2", 0, 74, 41, None, 0.9)],
-        37 => vec![d(1, "%2", 3, 80, 46, None, 1.0)],
-        41 => vec![d(4, "%5", 0, 40 + 16, 32, Some(1), 0.9)],
-        43 => vec![d(4, "%5", 0, 43 + 16, 32, Some(1), 0.9)],
-        45 => vec![d(4, "%5", 0, 45 + 16, 32, Some(1), 0.9)],
-        47 => vec![d(4, "%5", 0, 48 + 16, 33, Some(1), 0.9)],
-        48 => vec![d(4, "%5", 0, 50 + 16, 33, Some(1), 0.9)],
-        50 => vec![d(4, "%5", 0, 53 + 16, 33, Some(1), 0.9)],
-        42 => vec![d(2, "%2", 3, 92, 44, None, 0.8)],
-        44 => vec![d(2, "%2", 3, 90, 46, None, 0.8)],
-        46 => vec![d(2, "%2", 3, 92, 34, None, 0.7)],
-        49 | 57 => vec![d(3, "%2", 3, 86, 27, None, 0.5)],
-        52 => vec![d(3, "%2", 3, 82, 29, None, 0.5)],
-        55 => vec![d(3, "%2", 3, 90, 31, None, 0.5)],
-        51 | 59 => vec![d(3, "%2", 3, 96, 32, None, 0.5)],
-        53 => vec![d(3, "%2", 3, 100, 30, None, 0.5)],
-        54 => vec![d(5, "%2", 3, 98, 40, None, 0.7)],
-        56 => vec![d(5, "%1", 4, 80, 40, None, 0.4)],
+        37 => vec![d(1, "%2", 3, 80, 46, None, 0.73)],
+        41 => vec![t(4, 40 + 4, 1, 26, 1, 24, 0.33)],
+        43 => vec![t(4, 44 + 4, 2, 26, 1, 24, 0.39)],
+        45 => vec![t(4, 46 + 8, 3, 30, 1, 24, 0.45)],
+        47 => vec![t(4, 50 + 8, 0, 26, 2, 28, 0.36)],
+        48 => vec![t(4, 52 + 4, 1, 30, 1, 28, 0.45)],
+        50 => vec![t(4, 56 + 8, 0, 30, 1, 28, 0.39)],
+        42 => vec![d(2, "%2", 3, 92, 44, None, 0.72)],
+        44 => vec![d(2, "%2", 3, 90, 46, None, 0.71)],
+        46 => vec![d(2, "%2", 3, 92, 34, None, 0.87)],
+        49 | 57 => vec![d(3, "%2", 3, 86, 27, None, 0.68)],
+        52 => vec![d(3, "%2", 3, 82, 29, None, 0.52)],
+        55 => vec![d(3, "%2", 3, 90, 31, None, 0.74)],
+        51 | 59 => vec![d(3, "%2", 3, 96, 32, None, 0.38)],
+        53 => vec![d(3, "%2", 3, 100, 30, None, 0.43)],
+        54 => vec![d(5, "%2", 3, 98, 40, None, 0.8)],
+        56 => vec![d(5, "%1", 4, 80, 40, None, 0.61)],
         _ => vec![d(5, "%2", 3, 88, 40, None, 0.6)],
     }
 }
 
+/// GM loudness curves: velocity, channel volume (CC7) and expression (CC11) each scale the amplitude by their
+/// square (40·log10(x/127) dB), as GM synthesizers do; SiON's `v` is linear in amplitude.
+fn gm(x: u8) -> f32 { gm_f(x as f32 / 127.0) }
+fn gm_f(x: f32) -> f32 { x * x }
+
 struct Raw { ch: u8, key: u8, start: u64, end: u64, amp: f32, prog: u8, pan: u8 }
 
-/// The performance: channels split by voice later; channel `c` is score channel `16c` and drum group `g`
-/// is `16 * 9 + g`, so the tracks come out in channel order.
+
+
+/// The performance: channels split by voice later; channel `c` is score channels `16c..` (one per program it
+/// plays) and drum group `g` is `16 * 9 + g`, so the tracks come out in channel order.
 pub fn to_score(smf: &Smf) -> Score {
     struct Ch { prog: u8, vol: f32, expr: f32, pan: u8, pedal: bool, range: f32, rpn: (u8, u8), on: Vec<Option<(u64, f32, u8, u8)>>, held: Vec<bool> }
     let mut chs: Vec<Ch> = (0..16).map(|_| Ch {
@@ -197,7 +261,7 @@ pub fn to_score(smf: &Smf) -> Score {
             Msg::On { ch, key, vel } => {
                 let c = &mut chs[ch as usize];
                 close(c, ch, key, t, &mut raw);
-                c.on[key as usize] = Some((t, vel as f32 / 127.0 * c.vol * c.expr, c.prog, c.pan));
+                c.on[key as usize] = Some((t, gm(vel) * gm_f(c.vol) * gm_f(c.expr), c.prog, c.pan));
             }
             Msg::Off { ch, key } => {
                 let c = &mut chs[ch as usize];
@@ -247,14 +311,19 @@ pub fn to_score(smf: &Smf) -> Score {
     raw.retain(|n| n.end > n.start || n.ch == DRUMS);
     raw.sort_by_key(|n| (n.ch, n.start, std::cmp::Reverse(n.key)));
 
-    let (mut notes, mut tables) = (vec![], [false; 3]);
+    // Each program a channel plays is a score channel of its own (`16c + i`, by first use), with its own gain.
+    let mut progs: Vec<Vec<u8>> = vec![vec![]; 16];
+    for n in &raw { if n.ch != DRUMS && !progs[n.ch as usize].contains(&n.prog) { progs[n.ch as usize].push(n.prog) } }
+    let slot = |ch: u8, prog: u8| progs[ch as usize].iter().position(|&p| p == prog).unwrap_or(0).min(15) as u32;
+    let (mut notes, mut tables) = (vec![], [false; 5]);
     for n in &raw {
         let pan = n.pan as i32 - 64;
         if n.ch == DRUMS {
             for d in drum(n.key) {
                 if let Some(t) = d.ptab { tables[t as usize] = true }
                 let mut note = Note::new(16 * DRUMS as u32 + d.group as u32, n.start, n.start + 1, d.note, n.amp * d.gain, d.instr.into());
-                note.env = if tonal(d.group) { format!("@{},63,{},0,{},15", d.tone, d.decay, d.decay) } else { format!("@{}s{}", d.tone, d.decay) };
+                let [dr, sl, sr] = d.env;
+                note.env = if tonal(d.group) { format!("@{},63,{dr},{sr},{sr},{sl}", d.tone) } else { format!("@{}s{dr}", d.tone) };
                 (note.pan, note.ptab, note.drum) = (pan, d.ptab, Some(!tonal(d.group)));
                 notes.push(note);
             }
@@ -262,20 +331,24 @@ pub fn to_score(smf: &Smf) -> Score {
         }
         let b = &bends[n.ch as usize];
         let i = b.partition_point(|x| x.0 <= n.start);
-        let mut note = Note::new(16 * n.ch as u32, n.start, n.end, n.key, n.amp, instrument(n.prog).into());
-        note.pan = pan;
+        let (instr, env) = instrument(n.prog);
+        let mut note = Note::new(16 * n.ch as u32 + slot(n.ch, n.prog), n.start, n.end, n.key, n.amp, instr.into());
+        (note.pan, note.env) = (pan, env);
         note.k0 = if i > 0 { b[i - 1].1 } else { 0 };
         note.bends = b[i..].iter().take_while(|x| x.0 < n.end).copied().collect();
         notes.push(note);
     }
     let header = DRUM_TABLES.iter().enumerate().filter(|(i, _)| tables[*i]).map(|(i, t)| format!("#TABLE{i}{{{t}}}")).collect();
-    let mix = raw.iter().map(|n| (n.start, n.end, n.amp)).collect();
-    let mut names = vec![String::new(); 16 * 16];
-    for c in 0..16 { names[16 * c] = format!("channel {}", c + 1) }
-    for (g, n) in ["kick", "snare", "hi-hat", "cymbals", "toms", "percussion", "snare body"].iter().enumerate() {
+    let mix = raw.iter().map(|n| (n.start, n.end, n.amp * if n.ch == DRUMS { 1.0 } else { prog_gain(n.prog) })).collect();
+    let (mut names, mut gains) = (vec![String::new(); 16 * 16], vec![1.0; 16 * 16]);
+    for (c, ps) in progs.iter().enumerate() {
+        names[16 * c] = format!("channel {}", c + 1);
+        for (i, &p) in ps.iter().enumerate().take(16) { (names[16 * c + i], gains[16 * c + i]) = (format!("channel {}", c + 1), prog_gain(p)) }
+    }
+    for (g, n) in ["kick", "snare", "hi-hat", "cymbals", "toms", "percussion", "snare body", "kick click"].iter().enumerate() {
         names[16 * DRUMS as usize + g] = format!("drums: {n}");
     }
-    let mut sc = Score { ppq: smf.ppq, tempos, header, notes, mix, end: 0, lp: None, fine: false, db: false, kmilli: false, names, ..Score::default() };
+    let mut sc = Score { ppq: smf.ppq, tempos, header, notes, mix, end: 0, lp: None, fine: false, db: false, kmilli: false, names, gains, ..Score::default() };
     sc.set_bars(&bars);
     sc
 }
