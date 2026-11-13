@@ -90,7 +90,7 @@ struct Note {
     plen: f64,
 }
 
-fn gcd(a: u64, b: u64) -> u64 { if b == 0 { a } else { gcd(b, a % b) } }
+pub(crate) fn gcd(a: u64, b: u64) -> u64 { if b == 0 { a } else { gcd(b, a % b) } }
 
 pub fn build(sc: &Score, opt: &Options) -> Arranged {
     // Ticks: SiON counts 480 per quarter note. Keep timing exact: rescale when the source resolution allows,
@@ -133,7 +133,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     for (_, on, a) in edges { sum += if on { a } else { -a }; smax = smax.max(sum) }
     let master = opt.gain.map_or((5.0 * amax / smax).min(1.0), |g| (g * amax).min(1.0));
     let x = ((128.0 * master).round() as i32).clamp(1, 128);
-    let vmax: u16 = if sc.db { 128 } else if sc.fine { 256 } else { 16 };
+    let vmax = sc.vmax();
     let vol = |amp: f32, min: i32| {
         let v = if !sc.db { vmax as f32 * amp / amax } else if amp <= 0.0 { 0.0 } else { 128.0 + 20.0 * (amp / amax).log10() / 0.75 };
         (v.round() as i32).clamp(min, vmax as i32) as u16
@@ -178,24 +178,9 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
                 if pans.last().is_some_and(|x| x.0 == t) { pans.pop(); }
                 pans.push((t, p));
             }
-            let mut lfos: Vec<(u64, (i32, i32))> = vec![];
-            let mut lfo0 = n.lfo0;
-            for &(t, l) in &n.lfos {
-                let t = map(t);
-                if t <= start { lfo0 = l; continue }
-                if t >= end { break }
-                if lfos.last().is_some_and(|x| x.0 == t) { lfos.pop(); }
-                if lfos.last().map_or(lfo0, |x| x.1) != l { lfos.push((t, l)) }
-            }
-            let mut waves: Vec<(u64, String)> = vec![];
-            let mut instr = n.instr.clone();
-            for (t, w) in &n.waves {
-                let t = map(*t);
-                if t <= start { instr = w.clone(); continue }
-                if t >= end { break }
-                if waves.last().is_some_and(|x| x.0 == t) { waves.pop(); }
-                if waves.last().map_or(&instr, |x| &x.1) != w { waves.push((t, w.clone())) }
-            }
+            let (mut lfo0, mut instr) = (n.lfo0, n.instr.clone());
+            let lfos = changes(&mut lfo0, n.lfos.iter().map(|&(t, l)| (map(t), l)), start, end);
+            let waves = changes(&mut instr, n.waves.iter().map(|(t, w)| (map(*t), w.clone())), start, end);
             // (SiON has 255 tables; sweeps past that are left out.)
             let rtab = (!n.rel.is_empty()).then(|| {
                 *tab_ids.entry(&n.rel[..]).or_insert_with(|| {
@@ -266,6 +251,19 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     Arranged { header, tracks, notes, sections, lp }
 }
 
+/// A value's changes while a note sounds (from `start` to `end`): the last at or before `start` becomes `init`,
+/// and of changes on the same tick only the last counts; ones that repeat the value before them are left out.
+fn changes<T: PartialEq>(init: &mut T, src: impl Iterator<Item = (u64, T)>, start: u64, end: u64) -> Vec<(u64, T)> {
+    let mut out: Vec<(u64, T)> = vec![];
+    for (t, x) in src {
+        if t <= start { *init = x; continue }
+        if t >= end { break }
+        if out.last().is_some_and(|o| o.0 == t) { out.pop(); }
+        if out.last().map_or(&*init, |o| &o.1) != &x { out.push((t, x)) }
+    }
+    out
+}
+
 /// Detune at the note's start, then thinned changes (at least `step` ticks apart) while it sounds.
 fn thin(k0: i32, b: impl Iterator<Item = (u64, i32)>, s: u64, e: u64, step: u64) -> (i32, Vec<(u64, i32)>) {
     let mut b = b.peekable();
@@ -297,9 +295,13 @@ pub fn tokens(tr: &Track, gate: bool, lens: &Lengths) -> Vec<Tok> {
         *cur = to;
     };
     let kcmd = |k: i32| if tr.kmilli { format!("k{}", k as f64 / 1000.0) } else { format!("k{k}") };
+    let ph_cmd = |(ofs, len): (f64, f64)| if len > 0.0 { format!("@ph{ofs},{len}") } else { format!("@ph{ofs}") };
+    let rtab_cmd = |r: Option<usize>| r.map_or("_np".into(), |i| format!("_np{i}"));
+    let ptab_cmd = |p: Option<u8>| p.map_or("np".into(), |t| format!("np{t}"));
     let mut gates = vec![]; // (index of the note's first piece, index of its last piece)
-    let rest_to = |out: &mut Vec<Tok>, t: &mut u64, until: u64, tempo: &mut std::iter::Peekable<std::slice::Iter<(u64, String)>>| {
-        while let Some((tt, s)) = tempo.next_if(|x| x.0 <= until) {
+    // Rest until `until`, putting the tempo changes on the way (and one at `until` itself with `incl`).
+    let rest_to = |out: &mut Vec<Tok>, t: &mut u64, until: u64, incl: bool, tempo: &mut std::iter::Peekable<std::slice::Iter<(u64, String)>>| {
+        while let Some((tt, s)) = tempo.next_if(|x| x.0 < until || (incl && x.0 == until)) {
             if *tt > *t { out.push(Tok::Rest((*tt - *t) as u32)); *t = *tt }
             out.push(Tok::Cmd(s.clone()));
         }
@@ -317,14 +319,10 @@ pub fn tokens(tr: &Track, gate: bool, lens: &Lengths) -> Vec<Tok> {
         let until = $until;
         if let Some(l) = tr.lp.filter(|&l| mark.is_none() && l >= t && l <= until) {
             // (A tempo change at the loop point goes after the `$`, so going back plays it again.)
-            while let Some((tt, s)) = tempo.next_if(|x| x.0 < l) {
-                if *tt > t { out.push(Tok::Rest((*tt - t) as u32)); t = *tt }
-                out.push(Tok::Cmd(s.clone()));
-            }
-            if l > t { out.push(Tok::Rest((l - t) as u32)); t = l }
+            rest_to(&mut out, &mut t, l, false, &mut tempo);
             loop_point!()
         }
-        rest_to(&mut out, &mut t, until, &mut tempo);
+        rest_to(&mut out, &mut t, until, true, &mut tempo);
     }} }
     for n in &tr.notes {
         // The previous note's release silenced (on the chip, by its driver) before this note.
@@ -340,15 +338,12 @@ pub fn tokens(tr: &Track, gate: bool, lens: &Lengths) -> Vec<Tok> {
             env = &n.env;
         }
         lfo_cmds(&mut out, &mut lfo, n.lfo0);
-        if n.rtab != rtab { out.push(Tok::Cmd(n.rtab.map_or("_np".into(), |i| format!("_np{i}")))); rtab = n.rtab }
+        if n.rtab != rtab { out.push(Tok::Cmd(rtab_cmd(n.rtab))); rtab = n.rtab }
         if n.v != v { out.push(Tok::Cmd(format!("v{}", n.v))); v = n.v }
         if n.pan != pan { out.push(Tok::Cmd(format!("@p{}", n.pan))); pan = n.pan }
-        if n.ptab != ptab { out.push(Tok::Cmd(n.ptab.map_or("np".into(), |t| format!("np{t}")))); ptab = n.ptab }
+        if n.ptab != ptab { out.push(Tok::Cmd(ptab_cmd(n.ptab))); ptab = n.ptab }
         if n.k0 != k { out.push(Tok::Cmd(kcmd(n.k0))); k = n.k0 }
-        if (n.ofs, n.plen) != ph {
-            out.push(Tok::Cmd(if n.plen > 0.0 { format!("@ph{},{}", n.ofs, n.plen) } else { format!("@ph{}", n.ofs) }));
-            ph = (n.ofs, n.plen);
-        }
+        if (n.ofs, n.plen) != ph { ph = (n.ofs, n.plen); out.push(Tok::Cmd(ph_cmd(ph))) }
         // Pieces joined by slurs where the pitch bend or volume changes or a tempo change falls mid-note.
         let first = out.len();
         let (mut bend, mut vols, mut pans) = (n.bends.iter().peekable(), n.vols.iter().peekable(), n.pans.iter().peekable());
@@ -405,12 +400,12 @@ pub fn tokens(tr: &Track, gate: bool, lens: &Lengths) -> Vec<Tok> {
             if s.instr != instr || (s.env.is_empty() && !env.is_empty()) { out.push(Tok::Cmd(s.instr.into())); (env, ph, lfo) = ("", (0.0, 0.0), (0, 0)) }
             if s.env != env { out.push(Tok::Cmd(s.env.into())); lfo = (0, 0) }
             lfo_cmds(&mut out, &mut lfo, s.lfo);
-            if s.ph != ph { out.push(Tok::Cmd(if s.ph.1 > 0.0 { format!("@ph{},{}", s.ph.0, s.ph.1) } else { format!("@ph{}", s.ph.0) })) }
+            if s.ph != ph { out.push(Tok::Cmd(ph_cmd(s.ph))) }
         }
-        if s.rtab != rtab { out.push(Tok::Cmd(s.rtab.map_or("_np".into(), |i| format!("_np{i}")))) }
+        if s.rtab != rtab { out.push(Tok::Cmd(rtab_cmd(s.rtab))) }
         if s.v != v { out.push(Tok::Cmd(format!("v{}", s.v))) }
         if s.pan != pan { out.push(Tok::Cmd(format!("@p{}", s.pan))) }
-        if s.ptab != ptab { out.push(Tok::Cmd(s.ptab.map_or("np".into(), |t| format!("np{t}")))) }
+        if s.ptab != ptab { out.push(Tok::Cmd(ptab_cmd(s.ptab))) }
         if s.k != k { out.push(Tok::Cmd(kcmd(s.k))) }
     }
     if tr.drum.is_some() {

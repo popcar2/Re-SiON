@@ -500,8 +500,7 @@ pub fn to_score(m: &Module, wavetables: bool, tidy: bool) -> (Score, Vec<String>
     let mut names: Vec<Vec<String>> = vec![];
     let name = |names: &mut Vec<Vec<String>>, c: usize, ins: usize| {
         if names.len() <= c { names.resize(c + 1, vec![]) }
-        let n = m.instruments.get(ins.wrapping_sub(1)).map_or(String::new(), |i| i.name.clone());
-        if !n.is_empty() && !names[c].contains(&n) { names[c].push(n) }
+        if let Some(i) = m.instruments.get(ins.wrapping_sub(1)).filter(|i| !i.name.is_empty() && !names[c].contains(&i.name)) { names[c].push(i.name.clone()) }
     };
     let mut sections: Vec<u64> = vec![];
     let mut last_ord = usize::MAX;

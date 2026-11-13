@@ -42,7 +42,7 @@ const CUT: &str = "s63";
 fn pulse(defs: &mut Defs, h: usize) -> (String, f32) {
     if h == 8 { return ("%1@4".into(), 1.0) }
     let (mut a, mut b) = (16 - h, h); // high : low = -(16 - h) : h, so h * high + (16 - h) * low = 0
-    let g = (1..=b).rev().find(|g| a % g == 0 && b % g == 0).unwrap();
+    let g = crate::arrange::gcd(a as u64, b as u64) as usize;
     (a, b) = (a / g, b / g);
     let k = (127 / a).min(128 / b) as i32;
     let (hi, lo) = (k * a as i32, -k * b as i32);
@@ -267,7 +267,7 @@ impl NesApu {
         let until = if lp { f64::INFINITY } else { t + n as f64 * 44100.0 / rate };
         // (`smp` indexes `played` until the samples are numbered in `hits`.)
         self.dmc.played.push((i, lp));
-        let h = Hit::new(0, t, until, self.dmc.played.len() - 1, def_rate, 60.0 + 12.0 * (rate / def_rate).log2(), 128.0 * DMC_UNIT, 0);
+        let h = Hit::new(0, t, until, self.dmc.played.len() - 1, def_rate, Hit::key_for(rate, def_rate), 128.0 * DMC_UNIT, 0);
         self.dmc.pos = (0.0, t, rate, i, self.dmc.level);
         self.dmc.play = Some((until, h, if lp { self.dmc.level } else { end_level }));
     }
@@ -428,14 +428,14 @@ impl Chip for NesApu {
         if let Some((_, mut h, _)) = self.dmc.play.take() { h.end = h.end.min(end); self.dmc.hits.push(h) }
         // Number the samples played (a looping one loops all but its first frame, the level it starts from).
         let mut out: Vec<Hit> = vec![];
-        let hits: Vec<Hit> = self.dmc.hits.drain(..).collect();
+        let hits = std::mem::take(&mut self.dmc.hits);
         for mut h in hits {
             let (i, lp) = self.dmc.played[h.smp];
             let Some(n) = self.dpcm_def(defs, self.dmc.defn[i].1, lp) else { continue };
             (h.smp, h.dmc) = (n, true);
             out.push(h);
         }
-        out.extend(self.dmc.raw.hits(defs, end));
+        out.extend(self.dmc.raw.hits(defs));
         out
     }
 }

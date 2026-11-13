@@ -4,6 +4,7 @@
 //! sections (a tracker's patterns, bars for the other formats), or which `mml` minifies (`--exact` modules).
 
 mod arrange;
+mod bytes;
 mod chips;
 mod cpu;
 mod fm;
@@ -55,11 +56,17 @@ pub fn detect(data: &[u8]) -> Option<Format> {
 pub fn convert(data: &[u8], opt: &Options) -> Result<Converted, String> {
     match detect(data) {
         Some(Format::Midi) => midi_to_mml(data, opt),
-        // (Chip logs have no bars of their own: the tempo makes a row a 1/16 note, so a line is 16 rows.)
-        Some(Format::Vgm) => { let (mut score, w) = vgm::to_score(data, opt.exact_pcm)?; score.set_bars(&[]); Ok(write(&score, opt, w)) }
-        Some(Format::Nsf) => { let (mut score, w) = nsf::to_score(data, opt.exact_pcm, opt.track)?; score.set_bars(&[]); Ok(write(&score, opt, w)) }
-        Some(Format::Spc) => { let (mut score, w) = spc::to_score(data)?; score.set_bars(&[]); Ok(write(&score, opt, w)) }
         Some(Format::Module) => Ok(module_to_mml(&tracker::load(data)?, opt)),
+        Some(f) => {
+            let (mut score, w) = match f {
+                Format::Vgm => vgm::to_score(data, opt.exact_pcm)?,
+                Format::Nsf => nsf::to_score(data, opt.exact_pcm, opt.track)?,
+                _ => spc::to_score(data)?,
+            };
+            // (Chip logs have no bars of their own: the tempo makes a row a 1/16 note, so a line is 16 rows.)
+            score.set_bars(&[]);
+            Ok(write(&score, opt, w))
+        }
         None => Err("unrecognized file (supported: MIDI, MOD, S3M, XM, IT, VGM/VGZ, NSF/NSFE, SPC)".into()),
     }
 }
@@ -104,15 +111,17 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
     let limit = loop_secs.map_or(60.0 * 30.0, |_| secs + 1.0);
     let mut lens = mml::Lengths::new();
     let mut plain: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, false, &lens)).collect();
+    let mut plain_mml = mml::plain(&song.header, &plain, &lens);
     // The volume estimate can't know how loud SiON's waveforms and FM voices really come out: if the result
     // would clip, turn the master volume down until it doesn't.
     // (Rendered samples are limited to ±1, so a clipping peak only says "too loud": step down until it fits.)
     if opt.gain.is_none() {
         for _ in 0..8 {
-            let (peak, x) = (peak(&mml::plain(&song.header, &plain, &lens), limit), song.master());
+            let (peak, x) = (peak(&plain_mml, limit), song.master());
             if peak <= 0.98 || x <= 1 { break }
             song.set_master(((x as f32 * if peak >= 0.999 { 0.75 } else { 0.95 / peak }) as i32).min(x - 1));
             plain = song.tracks.iter().map(|t| arrange::tokens(t, false, &lens)).collect();
+            plain_mml = mml::plain(&song.header, &plain, &lens);
         }
     }
     // (The plain MML keeps the data as it was made, so a check against it covers the compacted data too.)
@@ -121,14 +130,14 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
         let toks: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, true, &lens)).collect();
         mml::minify(&header, &toks, &mut lens)
     } else {
-        let tracks: Vec<(String, Vec<_>)> = song.tracks.iter().zip(&plain).enumerate().map(|(i, (t, toks))| {
+        let tracks: Vec<(String, &[_])> = song.tracks.iter().zip(&plain).enumerate().map(|(i, (t, toks))| {
             let name = score.names.get(t.ch as usize).filter(|n| !n.is_empty()).map_or(String::new(), |n| format!(", {n}"));
-            (format!("Track {}{name}", i + 1), toks.clone())
+            (format!("Track {}{name}", i + 1), &toks[..])
         }).collect();
-        pretty::write(&score.title, &header, &tracks, &song.sections, song.lp, if score.db { 128 } else if score.fine { 256 } else { 16 }, &mut lens)
+        pretty::write(&score.title, &header, &tracks, &song.sections, song.lp, score.vmax(), &mut lens)
     };
     Converted {
-        plain: mml::plain(&song.header, &plain, &lens),
+        plain: plain_mml,
         mml,
         tracks: song.tracks.len(),
         notes: song.notes,
@@ -138,16 +147,31 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
     }
 }
 
-/// Loudest sample of the rendered MML (at most `secs` seconds).
-fn peak(mml: &str, secs: f64) -> f32 {
-    let (mut song, mut buf, mut peak, mut frames) = (sion::Song::new(mml), vec![0f32; 8192], 0f32, 0usize);
+/// Render MML in chunks of interleaved stereo samples, passing each to `f`, until the song ends or `secs`
+/// seconds are rendered (the last chunk may reach past that).
+pub fn render_chunks(mml: &str, secs: f64, mut f: impl FnMut(&[f32])) {
+    let (mut song, mut buf, mut frames) = (sion::Song::new(mml), vec![0f32; 8192], 0usize);
     loop {
         buf.fill(0.0);
         let more = song.render(&mut buf);
-        peak = buf.iter().fold(peak, |p, s| p.max(s.abs()));
+        f(&buf);
         frames += buf.len() / 2;
-        if !more || frames as f64 >= sion::RATE as f64 * secs { return peak }
+        if !more || frames as f64 >= sion::RATE as f64 * secs { return }
     }
+}
+
+/// Render MML (at most `secs` seconds, see `render_chunks`).
+pub fn render(mml: &str, secs: f64) -> Vec<f32> {
+    let mut out = vec![];
+    render_chunks(mml, secs, |b| out.extend_from_slice(b));
+    out
+}
+
+/// Loudest sample of the rendered MML (at most `secs` seconds).
+fn peak(mml: &str, secs: f64) -> f32 {
+    let mut peak = 0f32;
+    render_chunks(mml, secs, |b| peak = b.iter().fold(peak, |p, s| p.max(s.abs())));
+    peak
 }
 
 #[cfg(test)]

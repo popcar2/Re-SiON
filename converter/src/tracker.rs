@@ -4,6 +4,8 @@
 //! Notes are numbered 0..119; after the instrument's note map and `note_ofs`, 48 is the reference note a
 //! sample's `c4` rate is given for (MOD C-2, S3M and XM C-4, IT C-5). Effects are translated to one set with Impulse Tracker semantics (`Fx`).
 
+use crate::bytes::{byte, u16be, u16le, u32le};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind { Mod, S3m, Xm, It }
 
@@ -158,11 +160,6 @@ fn text(d: &[u8], o: usize, n: usize) -> String {
     b.iter().map(|&c| if (32..127).contains(&c) { c as char } else { ' ' }).collect::<String>().trim().to_string()
 }
 
-fn u16le(d: &[u8], o: usize) -> u16 { d.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])) }
-fn u32le(d: &[u8], o: usize) -> u32 { d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) }
-fn u16be(d: &[u8], o: usize) -> u16 { d.get(o..o + 2).map_or(0, |b| u16::from_be_bytes([b[0], b[1]])) }
-fn byte(d: &[u8], o: usize) -> u8 { d.get(o).copied().unwrap_or(0) }
-
 pub fn detect(d: &[u8]) -> Option<Kind> {
     if d.starts_with(b"IMPM") { return Some(Kind::It) }
     if d.starts_with(b"Extended Module: ") { return Some(Kind::Xm) }
@@ -210,12 +207,12 @@ fn mod_fx(fx: u8, p: u8, xm: bool) -> Fx {
         2 if p != 0 || xm => Fx::PortaDown(p),
         3 => Fx::TonePorta(p),
         4 => Fx::Vibrato(p),
-        5 => Fx::TonePortaVol(xy_slide(p, xm)),
-        6 => Fx::VibratoVol(xy_slide(p, xm)),
+        5 => Fx::TonePortaVol(xy_slide(p)),
+        6 => Fx::VibratoVol(xy_slide(p)),
         7 => Fx::Tremolo(p),
         8 => Fx::Pan(p),
         9 => Fx::Offset(p),
-        10 if p != 0 || xm => Fx::VolSlide(xy_slide(p, xm)),
+        10 if p != 0 || xm => Fx::VolSlide(xy_slide(p)),
         11 => Fx::Jump(p),
         12 => Fx::SetVol(p.min(64)),
         13 => Fx::Break(x * 10 + y),
@@ -243,7 +240,7 @@ fn mod_fx(fx: u8, p: u8, xm: bool) -> Fx {
 }
 
 /// MOD / XM `Axy` (x up, y down; up wins) as an IT `Dxy`.
-fn xy_slide(p: u8, _xm: bool) -> u8 { if p >> 4 != 0 { p & 0xf0 } else { p & 15 } }
+fn xy_slide(p: u8) -> u8 { if p >> 4 != 0 { p & 0xf0 } else { p & 15 } }
 
 fn load_mod(d: &[u8]) -> Result<Module, String> {
     let chans = mod_chans(d).ok_or("unknown MOD format")?;
@@ -461,7 +458,7 @@ fn load_xm(d: &[u8]) -> Result<Module, String> {
             cell.fx = match fx {
                 0..=15 => mod_fx(fx, prm, true),
                 16 => Fx::GlobalVol(prm.min(64) * 2),
-                17 => Fx::GlobalVolSlide(xy_slide(prm, true)),
+                17 => Fx::GlobalVolSlide(xy_slide(prm)),
                 20 => Fx::KeyOff(prm),
                 21 => Fx::EnvPos(prm),
                 25 => Fx::PanSlide(if x != 0 { x } else { y << 4 }), // XM P: x0 right, 0y left

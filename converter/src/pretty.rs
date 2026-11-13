@@ -125,11 +125,10 @@ fn len_text(len: u32, l: u32, lens: &Lengths) -> String {
     parts.join("^")
 }
 
-const SHARP: [&str; 12] = ["c", "c+", "d", "d+", "e", "f", "f+", "g", "g+", "a", "a+", "b"];
 const FLAT: [&str; 12] = ["c", "d-", "d", "e-", "e", "f", "g-", "g", "a-", "a", "b-", "b"];
 
 /// Spell black keys as flats: when the notes fit a flat key better than a sharp one.
-fn flats(tracks: &[Vec<Tok>]) -> bool {
+fn flats<'a>(tracks: impl Iterator<Item = &'a [Tok]>) -> bool {
     let mut n = [0usize; 12];
     for t in tracks { for tok in t { if let Tok::Note { key, .. } = tok { n[*key as usize % 12] += 1 } } }
     // Notes outside the major scale of each key; the best sharp key against the best flat one.
@@ -273,7 +272,7 @@ fn structure(ids: &[usize], lp: Option<usize>) -> Vec<Item> {
 
 /// Readable MML for these tracks: `tracks` as (comment, tokens), cut at `sections` (ticks), looping to `lp`.
 /// `vmax`: the loudest `v`, a track's volume before it sets one.
-pub fn write(title: &str, header: &[String], tracks: &[(String, Vec<Tok>)], sections: &[u64], lp: Option<u64>, vmax: u16, lens: &mut Lengths) -> String {
+pub fn write(title: &str, header: &[String], tracks: &[(String, &[Tok])], sections: &[u64], lp: Option<u64>, vmax: u16, lens: &mut Lengths) -> String {
     let mut out = String::new();
     if !title.is_empty() { out += &format!("#TITLE{{{}}};\n", title.replace(['{', '}', ';'], "")) }
     let is_data = |h: &str| h.starts_with("#WAV") || h.starts_with("#PCMB");
@@ -281,8 +280,7 @@ pub fn write(title: &str, header: &[String], tracks: &[(String, Vec<Tok>)], sect
     let mut bounds: Vec<u64> = sections.iter().copied().chain(lp).filter(|&t| t > 0).collect();
     bounds.sort_unstable();
     bounds.dedup();
-    let all: Vec<Vec<Tok>> = tracks.iter().map(|t| t.1.clone()).collect();
-    let names = if flats(&all) { &FLAT } else { &SHARP };
+    let names = if flats(tracks.iter().map(|t| t.1)) { &FLAT } else { &crate::mml::NAMES };
     for (label, toks) in tracks {
         // Commands after the last note restore the state for the loop: each line restates it anyway, except the tone.
         let last = toks.iter().rposition(|t| !matches!(t, Tok::Cmd(_))).map_or(0, |i| i + 1);

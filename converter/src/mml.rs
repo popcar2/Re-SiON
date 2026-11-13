@@ -115,7 +115,7 @@ impl Lengths {
     }
 }
 
-const NAMES: [&str; 12] = ["c", "c+", "d", "d+", "e", "f", "f+", "g", "g+", "a", "a+", "b"];
+pub(crate) const NAMES: [&str; 12] = ["c", "c+", "d", "d+", "e", "f", "f+", "g", "g+", "a", "a+", "b"];
 
 /// One command per token, absolute octave on every note, explicit lengths: the reference the minified
 /// output must sound identical to.
@@ -176,6 +176,13 @@ fn rest_text(lens: &Lengths, len: u32, l: u32) -> String {
 fn black(key: u8) -> i64 { matches!(key % 12, 1 | 3 | 6 | 8 | 10) as i64 }
 
 impl Pool {
+    /// Add macro `i` with this body (its `has_l` is the body's).
+    fn add_mac(&mut self, i: usize, body: &[u32], lens: &Lengths) -> u32 {
+        let id = self.add(Atom::Mac(i), lens);
+        self.has_l[id as usize] = body.iter().any(|&b| self.has_l[b as usize]);
+        id
+    }
+
     fn add(&mut self, a: Atom, lens: &Lengths) -> u32 {
         if let Some(&id) = self.ids.get(&a) { return id }
         let (cost, text) = match &a {
@@ -268,7 +275,8 @@ fn suffix_array(s: &[u32]) -> Vec<usize> {
     let mut rank: Vec<u64> = s.iter().map(|&x| x as u64).collect();
     let mut tmp = vec![0u64; n];
     let mut k = 1;
-    while n > 1 {
+    if n <= 1 { return sa }
+    loop {
         {
             let r = &rank;
             let key = |i: usize| (r[i], if i + k < n { r[i + k] + 1 } else { 0 });
@@ -340,8 +348,7 @@ fn macros(pool: &mut Pool, seqs: &mut Vec<Vec<u32>>, ntracks: usize, lens: &Leng
         let (sav, h, occ) = best;
         if sav <= 0 { break }
         let body = cat[occ[0]..occ[0] + h].to_vec();
-        let id = pool.add(Atom::Mac(seqs.len() - ntracks), lens);
-        pool.has_l[id as usize] = body.iter().any(|&b| pool.has_l[b as usize]);
+        let id = pool.add_mac(seqs.len() - ntracks, &body, lens);
         for &p in occ.iter().rev() {
             let si = starts.partition_point(|&st| st <= p) - 1;
             let off = p - starts[si];
@@ -561,18 +568,12 @@ fn render(pool: &Pool, header: &[String], seqs: &[Vec<u32>], ntracks: usize, sig
 /// Default lengths (`l`) through a track, by Viterbi over the candidate lengths: returns the tokens with
 /// `l` commands inserted and the default length in force at each token. `penalty` is added per change on top
 /// of its text, which keeps sections uniform (better for repeats).
-fn assign_l(toks: &[Tok], lens: &mut Lengths, penalty: u32) -> (Vec<Tok>, Vec<u32>) {
-    let mut freq: HashMap<u32, usize> = HashMap::new();
-    for t in toks { if let Tok::Note { len, .. } | Tok::Rest(len) = t { *freq.entry(*len).or_default() += 1 } }
-    let mut cands: Vec<(usize, u32)> = freq.iter().filter(|(&l, _)| l <= 2 * WHOLE).map(|(&l, &c)| (c, l)).collect();
-    cands.sort_unstable_by(|a, b| b.cmp(a));
-    let mut cands: Vec<u32> = cands.into_iter().take(12).map(|x| x.1).collect();
-    if !cands.contains(&DEF_L) { cands.push(DEF_L) }
-    for &c in &cands { lens.prepare(c) }
+/// `cands`: the default lengths to choose from (`l_candidates`, prepared in `lens`).
+fn assign_l(toks: &[Tok], cands: &[u32], lens: &Lengths, penalty: u32) -> (Vec<Tok>, Vec<u32>) {
     let k = cands.len();
     let switch: Vec<u32> = cands.iter().map(|&c| 1 + lens.cost(c, 0) + penalty).collect();
     const INF: u32 = u32::MAX / 4;
-    let mut cost: Vec<u32> = cands.iter().map(|&c| if c == DEF_L { 0 } else { switch[cands.iter().position(|&x| x == c).unwrap()] }).collect();
+    let mut cost: Vec<u32> = cands.iter().enumerate().map(|(j, &c)| if c == DEF_L { 0 } else { switch[j] }).collect();
     let mut back: Vec<Vec<u8>> = vec![];
     let lt: Vec<usize> = (0..toks.len()).filter(|&i| matches!(toks[i], Tok::Note { .. } | Tok::Rest(_))).collect();
     // After the loop point (`$`) the default length is whatever the end of the track left: the first length
@@ -610,7 +611,6 @@ fn assign_l(toks: &[Tok], lens: &mut Lengths, penalty: u32) -> (Vec<Tok>, Vec<u3
     (out, ls)
 }
 
-/// The shortest MML found for these tracks.
 /// A data definition written compactly, decoding to exactly the same values: in `#WAV`/`#TABLE` numbers, runs of
 /// one value as `(v)n` (which both SiON and GDSiON expand to `n` copies; `[v]n` crashes GDSiON and `(v,v)n` rounds
 /// negative values differently); in `#PCMB`, arguments at their defaults left off the end.
@@ -644,18 +644,30 @@ pub fn compact(def: &str) -> String {
     def.to_string()
 }
 
-pub fn minify(header: &[String], tracks: &[Vec<Tok>], lens: &mut Lengths) -> String {
-    let mut best: Option<String> = None;
-    for penalty in [0, 3, 8, 1000] {
-        let s = minify_with(header, tracks, lens, penalty);
-        if best.as_ref().is_none_or(|b| s.len() < b.len()) { best = Some(s) }
-    }
-    best.unwrap_or_default()
+/// The default lengths worth considering for a track: its 12 most used note lengths, and `l4`.
+fn l_candidates(toks: &[Tok]) -> Vec<u32> {
+    let mut freq: HashMap<u32, usize> = HashMap::new();
+    for t in toks { if let Tok::Note { len, .. } | Tok::Rest(len) = t { *freq.entry(*len).or_default() += 1 } }
+    let mut cands: Vec<(usize, u32)> = freq.iter().filter(|(&l, _)| l <= 2 * WHOLE).map(|(&l, &c)| (c, l)).collect();
+    cands.sort_unstable_by(|a, b| b.cmp(a));
+    let mut cands: Vec<u32> = cands.into_iter().take(12).map(|x| x.1).collect();
+    if !cands.contains(&DEF_L) { cands.push(DEF_L) }
+    cands
 }
 
-fn minify_with(header: &[String], tracks: &[Vec<Tok>], lens: &mut Lengths, penalty: u32) -> String {
-    let tracks: Vec<(Vec<Tok>, Vec<u32>)> = tracks.iter().map(|t| assign_l(t, lens, penalty)).collect();
-    let lens = &*lens;
+/// The shortest MML found for these tracks (trying several `l` change penalties, in parallel).
+pub fn minify(header: &[String], tracks: &[Vec<Tok>], lens: &mut Lengths) -> String {
+    let cands: Vec<Vec<u32>> = tracks.iter().map(|t| l_candidates(t)).collect();
+    for &c in cands.iter().flatten() { lens.prepare(c) }
+    let (lens, cands) = (&*lens, &cands);
+    std::thread::scope(|s| {
+        let runs: Vec<_> = [0, 3, 8, 1000].map(|p| s.spawn(move || minify_with(header, tracks, cands, lens, p))).into_iter().collect();
+        runs.into_iter().map(|r| r.join().unwrap()).min_by_key(String::len).unwrap_or_default()
+    })
+}
+
+fn minify_with(header: &[String], tracks: &[Vec<Tok>], cands: &[Vec<u32>], lens: &Lengths, penalty: u32) -> String {
+    let tracks: Vec<(Vec<Tok>, Vec<u32>)> = tracks.iter().zip(cands).map(|(t, c)| assign_l(t, c, lens, penalty)).collect();
     let mut pool = Pool::default();
     let raw: Vec<Vec<u32>> = tracks.iter().map(|(t, ls)| t.iter().zip(ls).map(|(tok, &l)| {
         let a = match tok {
@@ -675,20 +687,13 @@ fn minify_with(header: &[String], tracks: &[Vec<Tok>], lens: &mut Lengths, penal
     let (mut map, mut kept) = (HashMap::new(), with_macros[..nt].to_vec());
     for (i, &l) in live.iter().enumerate() {
         if !l { continue }
-        let new = pool.add(Atom::Mac(kept.len() - nt), lens);
-        pool.has_l[new as usize] = with_macros[nt + i].iter().any(|&b| pool.has_l[b as usize]);
+        let new = pool.add_mac(kept.len() - nt, &with_macros[nt + i], lens);
         map.insert(pool.ids[&Atom::Mac(i)], new);
         kept.push(with_macros[nt + i].clone());
     }
     let kept: Vec<Vec<u32>> = kept.into_iter().map(|s| s.into_iter().map(|a| *map.get(&a).unwrap_or(&a)).collect()).collect();
     let kept: Vec<Vec<u32>> = kept.iter().map(|s| loops(&mut pool, s, lens)).collect();
 
-    let mut best: Option<String> = None;
-    for seqs in [&looped, &kept] {
-        for sign in 0..SIGNS.len() {
-            let s = render(&pool, header, seqs, nt, sign);
-            if best.as_ref().is_none_or(|b| s.len() < b.len()) { best = Some(s) }
-        }
-    }
-    best.unwrap_or_default()
+    [&looped, &kept].into_iter().flat_map(|seqs| (0..SIGNS.len()).map(|sign| render(&pool, header, seqs, nt, sign)))
+        .min_by_key(String::len).unwrap_or_default()
 }

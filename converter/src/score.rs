@@ -96,6 +96,15 @@ impl Score {
     /// The last tick anything sounds or the song ends.
     pub fn last(&self) -> u64 { self.notes.iter().map(|n| n.end).fold(self.end, u64::max) }
 
+    /// Loudest `v` (16, or 256 with `#VMODE{%v0,0}`, or 128 in dB).
+    pub fn vmax(&self) -> u16 { if self.db { 128 } else if self.fine { 256 } else { 16 } }
+
+    /// A loop of silence is the song having ended: it plays once, to its last sound.
+    pub fn drop_silent_loop(&mut self) {
+        if let Some(l) = self.lp { if !self.notes.iter().any(|n| n.end > l) { self.lp = None } }
+        if self.lp.is_none() { if let Some(last) = self.notes.iter().map(|n| n.end).max() { self.end = self.end.min(last) } }
+    }
+
     /// Sections for a source without its own (MIDI, VGM, NSF): one per `bars` (ticks, each change starting a bar
     /// from there; empty: 4/4), lined up with the loop point so the loop starts a line.
     pub fn set_bars(&mut self, bars: &[(u64, u64)]) {
@@ -116,7 +125,41 @@ impl Note {
     pub fn new(ch: u32, start: u64, end: u64, key: u8, amp: f32, instr: String) -> Note {
         Note { ch, start, end, key, amp, instr, env: String::new(), pan: 0, ptab: None, k0: 0, bends: vec![], vols: vec![], pans: vec![], lfo0: (0, 0), lfos: vec![], waves: vec![], rel: vec![], cut: None, ofs: 0.0, plen: 0.0, drum: None }
     }
+
+    /// Move every time of the note (start, end, its changes and cut) through `f`.
+    pub fn map_times(&mut self, f: impl Fn(u64) -> u64) {
+        (self.start, self.end) = (f(self.start), f(self.end));
+        for b in &mut self.bends { b.0 = f(b.0) }
+        for v in &mut self.vols { v.0 = f(v.0) }
+        for p in &mut self.pans { p.0 = f(p.0) }
+        for l in &mut self.lfos { l.0 = f(l.0) }
+        for w in &mut self.waves { w.0 = f(w.0) }
+        if let Some(c) = &mut self.cut { *c = f(*c) }
+    }
+
+    /// End the note at `end`, dropping the changes from then on.
+    pub fn clip(&mut self, end: u64) {
+        self.end = end;
+        self.bends.retain(|b| b.0 < end);
+        self.vols.retain(|v| v.0 < end);
+        self.pans.retain(|p| p.0 < end);
+        self.lfos.retain(|l| l.0 < end);
+        self.waves.retain(|w| w.0 < end);
+    }
 }
+
+/// One note at a time per channel: sorted, each ends by the time the next on its channel starts.
+pub fn monophonic(notes: &mut [Note]) {
+    notes.sort_by_key(|n| (n.ch, n.start));
+    for i in 1..notes.len() {
+        let (ch, next) = (notes[i].ch, notes[i].start);
+        let n = &mut notes[i - 1];
+        if n.ch == ch && n.end > next { let end = next.max(n.start + 1); n.clip(end) }
+    }
+}
+
+/// SiON's envelope rate step (`inc` in the `sion` crate): level units (1/64 octave) per 44.1 kHz frame.
+pub fn env_inc(r: i32) -> f64 { if r <= 0 { 0.0 } else { let r = r.min(60); 2.064e-4 * (1u32 << (r >> 2)) as f64 * (4 + (r & 3)) as f64 / 8.0 } }
 
 /// How a channel sounds during one frame.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -160,8 +203,10 @@ pub struct Stream {
 impl Stream {
     /// Index of a tone, adding it if new.
     pub fn tone(&mut self, instr: &str, env: &str, legato: bool) -> usize {
-        let t = Tone { instr: instr.into(), env: env.into(), legato };
-        self.tones.iter().position(|x| *x == t).unwrap_or_else(|| { self.tones.push(t); self.tones.len() - 1 })
+        self.tones.iter().position(|x| x.instr == instr && x.env == env && x.legato == legato).unwrap_or_else(|| {
+            self.tones.push(Tone { instr: instr.into(), env: env.into(), legato });
+            self.tones.len() - 1
+        })
     }
 
     /// Tone `a` can change to `b` during a note, without a new key-on: the same envelope, and another waveform
@@ -251,11 +296,7 @@ impl Stream {
         }
         // A PCM note that goes silent for good ends a tick later (the volume is already off by then).
         for n in out.iter_mut().filter(|_| self.exact) {
-            if let Some(&(t, _)) = n.vols.last().filter(|v| v.1 == 0.0 && v.0 + 1 < n.end) {
-                n.end = t + 1;
-                n.bends.retain(|b| b.0 < n.end);
-                n.pans.retain(|p| p.0 < n.end);
-            }
+            if let Some(&(t, _)) = n.vols.last().filter(|v| v.1 == 0.0 && v.0 + 1 < n.end) { n.clip(t + 1) }
         }
         // A release pitch that never moves needs no table, and one that settles needs none past that (the table holds
         // its last value).
@@ -300,16 +341,16 @@ pub struct Defs {
     /// `#TABLE`s, numbered down from 254 (custom LFO waveforms need 8..254).
     pub tables: Vec<String>,
     ids: std::collections::HashMap<String, usize>,
+    wave_ids: std::collections::HashMap<Vec<i32>, usize>,
 }
 
 impl Defs {
     /// Number of a wavetable (values -128..127; length a power of two up to 1024).
     pub fn wave(&mut self, w: &[i32]) -> usize {
-        let key = format!("w{w:?}");
-        if let Some(&i) = self.ids.get(&key) { return i }
+        if let Some(&i) = self.wave_ids.get(w) { return i }
         if self.waves.len() >= 256 { return 255 }
         self.waves.push(w.to_vec());
-        self.ids.insert(key, self.waves.len() - 1);
+        self.wave_ids.insert(w.to_vec(), self.waves.len() - 1);
         self.waves.len() - 1
     }
 

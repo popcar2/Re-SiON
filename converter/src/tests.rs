@@ -4,15 +4,7 @@
 use crate::tracker::*;
 use crate::{module_to_mml, play, snr, Options};
 
-fn render(mml: &str) -> Vec<f32> {
-    let (mut song, mut buf, mut out) = (sion::Song::new(mml), vec![0f32; 4096], vec![]);
-    loop {
-        buf.fill(0.0);
-        let more = song.render(&mut buf);
-        out.extend_from_slice(&buf);
-        if !more || out.len() > sion::RATE as usize * 2 * 60 * 30 { return out }
-    }
-}
+fn render(mml: &str) -> Vec<f32> { crate::render(mml, 60.0 * 30.0) }
 
 /// Convert, render, and compare with the reference: (SNR in dB, MML).
 fn compare(m: &Module) -> (f64, String) {

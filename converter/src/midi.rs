@@ -74,8 +74,7 @@ fn track(b: &[u8], trk: usize, out: &mut Vec<(u64, usize, usize, Msg)>) {
         Some(v)
     };
     let (mut i, mut tick, mut status, mut seq) = (0, 0u64, 0u8, 0);
-    loop {
-        let Some(dt) = var(&mut i) else { break };
+    while let Some(dt) = var(&mut i) {
         tick += dt as u64;
         let Some(c) = byte(&mut i) else { break };
         let msg = match c {

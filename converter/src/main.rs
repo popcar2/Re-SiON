@@ -72,34 +72,18 @@ fn main() {
     if verify && !check(&out.plain, &out.mml, secs) { exit(2) }
     if verify && opt.exact && !opt.wavetables && sion_converter::detect(&data) == Some(sion_converter::Format::Module) {
         let want = sion_converter::reference(&data).unwrap_or_else(|e| fail(&format!("{input}: {e}")));
-        let got = render(&out.mml, want.len() / 2);
+        let mut got = sion_converter::render(&out.mml, 60.0 * 30.0);
+        if got.len() < want.len() { got.resize(want.len(), 0.0) }
         let db = sion_converter::snr(&want, &got);
         println!("verify: {db:.1} dB signal-to-difference against the module mixed from its samples{}",
             if db >= 40.0 { "" } else { " (low: see the notes above for what the conversion left out)" });
     }
 }
 
-/// Render MML: at least `frames` frames (silence past the song's end), at most 30 minutes.
-fn render(mml: &str, frames: usize) -> Vec<f32> {
-    let (mut song, mut buf, mut out, mut more) = (sion::Song::new(mml), vec![0f32; 8192], vec![], true);
-    while (more || out.len() < frames * 2) && out.len() < sion::RATE as usize * 2 * 60 * 30 {
-        buf.fill(0.0);
-        if more { more = song.render(&mut buf) }
-        out.extend_from_slice(&buf);
-    }
-    out
-}
-
 /// Render MML to a 16-bit stereo WAV file (at most `secs` seconds).
 fn write_wav(path: &str, mml: &str, secs: f64) -> std::io::Result<()> {
-    let (mut song, mut buf, mut pcm) = (sion::Song::new(mml), vec![0f32; 8192], Vec::<u8>::new());
-    let rate = sion::RATE as u32;
-    loop {
-        buf.fill(0.0);
-        let more = song.render(&mut buf);
-        for s in &buf { pcm.extend(((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes()) }
-        if !more || pcm.len() as f64 >= rate as f64 * 4.0 * secs { break }
-    }
+    let (mut pcm, rate) = (Vec::<u8>::new(), sion::RATE as u32);
+    sion_converter::render_chunks(mml, secs, |b| for s in b { pcm.extend(((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes()) });
     let secs = pcm.len() as f64 / 4.0 / rate as f64;
     let mut f = Vec::with_capacity(44 + pcm.len());
     for (tag, v) in [(&b"RIFF"[..], 36 + pcm.len() as u32)] { f.extend(tag); f.extend(v.to_le_bytes()) }

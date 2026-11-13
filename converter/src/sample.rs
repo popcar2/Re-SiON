@@ -56,7 +56,7 @@ pub fn pcm(s: &Sample, defs: &mut Defs) -> Option<Sound> {
 }
 
 /// SiON's decay speed in dB per second for envelope rate `r` (as `synth.rs` computes it).
-fn decay_db(r: i32) -> f64 { 2.064e-4 * (1 << (r >> 2)) as f64 * (4 + (r & 3)) as f64 / 8.0 * 44100.0 * 6.0206 / 64.0 }
+fn decay_db(r: i32) -> f64 { crate::score::env_inc(r) * 44100.0 * 6.0206 / 64.0 }
 
 /// Envelope commands after the tone number: a sustained sound releases at once (the tracker stops it), a
 /// one-shot decays at the sample's own speed.
@@ -138,7 +138,7 @@ pub fn analyze(s: &Sample, defs: &mut Defs) -> Sound {
             let (tb, peak) = table(&lp, n as f64, 1024);
             if peak > 0.0 { return wave(defs, tb, envelope(None), false, peak, n as f64) }
         }
-        return noise(win, None, s, defs);
+        return noise(win, None, defs);
     }
     // One-shot: analyze around the loudest part; fit the decay from there on.
     let lv = levels(x);
@@ -163,11 +163,9 @@ pub fn analyze(s: &Sample, defs: &mut Defs) -> Sound {
         let (tb, peak) = table(&win[z..], t, pow2(t).min(512));
         if peak > 0.0 { return wave(defs, tb, envelope(decay), true, peak, t) }
     }
-    noise(win, decay, s, defs)
+    noise(win, decay, defs)
 }
 
-/// A sound without a clear period: noise at its brightness, or (very dull ones, like kick drums) a low tone
-/// at its zero-crossing rate.
 /// Zero crossings per frame, times two: about 1 for white noise, 2 / period for a tone.
 fn crossing_density(win: &[f32]) -> f64 {
     let mean = win.iter().sum::<f32>() / win.len().max(1) as f32;
@@ -175,7 +173,9 @@ fn crossing_density(win: &[f32]) -> f64 {
     (2.0 * crossings as f64 / win.len().max(2) as f64).clamp(0.002, 1.0)
 }
 
-fn noise(win: &[f32], decay: Option<f64>, _s: &Sample, defs: &mut Defs) -> Sound {
+/// A sound without a clear period: noise at its brightness, or (very dull ones, like kick drums) a low tone
+/// at its zero-crossing rate.
+fn noise(win: &[f32], decay: Option<f64>, defs: &mut Defs) -> Sound {
     let mean = win.iter().sum::<f32>() / win.len().max(1) as f32;
     let density = crossing_density(win);
     if density < 0.1 {

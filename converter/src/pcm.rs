@@ -44,6 +44,12 @@ impl Hit {
     pub fn new(voice: usize, at: f64, end: f64, smp: usize, rate: f64, key: f64, amp: f32, pan: i32) -> Hit {
         Hit { voice, at, end, cut: false, smp, ofs: 0.0, rate, key, amp, pan, vols: vec![], keys: vec![], dmc: false }
     }
+
+    /// The key that plays a sample of rate `base` (at key 60) at `rate` frames per second.
+    pub fn key_for(rate: f64, base: f64) -> f64 { 60.0 + 12.0 * (rate / base).log2() }
+
+    /// Frames per second the hit plays its sample at.
+    pub fn play_rate(&self) -> f64 { self.rate * 2f64.powf((self.key - 60.0) / 12.0) }
 }
 
 /// URL-safe base64, as `#PCMB` reads it (no `/`, so a sample can't contain a `//` comment).
@@ -62,8 +68,13 @@ pub fn b64(bytes: &[u8]) -> String {
 pub fn def(defs: &mut Defs, data: &[f32], rate: f32, lp: Option<usize>, bidi: bool) -> Option<usize> {
     let wide = data.iter().any(|v| (v * 128.0).fract() != 0.0);
     let bytes: Vec<u8> = if wide { data.iter().flat_map(|v| ((v * 32768.0) as i16).to_le_bytes()).collect() } else { data.iter().map(|v| (v * 128.0) as i8 as u8).collect() };
-    let flags = wide as u8 | (bidi as u8) << 1;
-    defs.pcm(format!("{{{}}}{rate},60,{},{flags}", b64(&bytes), lp.map_or(-1, |l| l as i64)))
+    defs.pcm(pcmb(&bytes, rate, 60.0, lp, wide as u8 | (bidi as u8) << 1))
+}
+
+/// The text of a `#PCMB` after its number: the data, the rate at `key`, the loop start and the flags (1: 16-bit,
+/// 2: ping-pong loop).
+pub fn pcmb(bytes: &[u8], rate: impl std::fmt::Display, key: f64, lp: Option<usize>, flags: u8) -> String {
+    format!("{{{}}}{rate},{key},{},{flags}", b64(bytes), lp.map_or(-1, |l| l as i64))
 }
 
 /// The frames in 8 bits, scaled to their peak: the frames, and the gain that restores their level.
@@ -104,7 +115,7 @@ impl Capture {
 
     /// The program writes `v` at frame `t`.
     pub fn set(&mut self, t: f64, v: f32, pan: i32) {
-        if self.run.is_some() && t - self.last >= GAP { self.stop(t) }
+        if self.run.is_some() && t - self.last >= GAP { self.stop() }
         if self.run.is_none() {
             if v == self.cur { return }
             self.run = Some(Run { pan, w: vec![] });
@@ -117,7 +128,7 @@ impl Capture {
     }
 
     /// The output is switched off at frame `t` (or the song ends): the run ends with its last change.
-    pub fn stop(&mut self, _t: f64) {
+    pub fn stop(&mut self) {
         if let Some(mut r) = self.run.take() {
             let last = self.last;
             r.w.retain(|w| w.0 <= last);
@@ -127,8 +138,8 @@ impl Capture {
         }
     }
 
-    pub fn hits(&mut self, defs: &mut Defs, _end: f64) -> Vec<Hit> {
-        self.stop(0.0);
+    pub fn hits(&mut self, defs: &mut Defs) -> Vec<Hit> {
+        self.stop();
         // SiON has 256 sample slots: if the runs don't fit (in the slots left, less a few for other chips), join
         // the closest ones (the output holding its value in between, as it did) until they do.
         let distinct = self.done.iter().map(|r| r.w.iter().map(|w| w.1.to_bits()).collect::<Vec<_>>()).collect::<std::collections::HashSet<_>>().len();
@@ -169,7 +180,7 @@ impl Capture {
                 Some(&s) => s,
                 None => { let Some(n) = def(defs, &data, rate as f32, None, false) else { continue }; shared.insert(key, (n, rate)); (n, rate) }
             };
-            out.push(Hit::new(self.voice, at, at + data.len() as f64 * 44100.0 / rate, n, base, 60.0 + 12.0 * (rate / base).log2(), self.amp, r.pan));
+            out.push(Hit::new(self.voice, at, at + data.len() as f64 * 44100.0 / rate, n, base, Hit::key_for(rate, base), self.amp, r.pan));
         }
         out.extend(self.held(defs, held));
         out
@@ -246,7 +257,7 @@ impl Bank {
             for &g in &group {
                 let r = runs[g];
                 let rate = rate_of(&r);
-                let mut h = Hit::new(self.voice, r.0, r.1 + 44100.0 / rate, n, base, 60.0 + 12.0 * (rate / base).log2(), self.amp, r.4);
+                let mut h = Hit::new(self.voice, r.0, r.1 + 44100.0 / rate, n, base, Hit::key_for(rate, base), self.amp, r.4);
                 (h.ofs, h.cut) = ((r.2 - lo) as f64, r.2 + r.3 < hi);
                 out.push(h);
             }

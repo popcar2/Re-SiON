@@ -92,7 +92,7 @@ pub fn to_score(data: &[u8], exact: bool) -> Result<(Score, Vec<String>), String
     let gz;
     let d = if data.starts_with(&[0x1f, 0x8b]) { gz = gunzip(data)?; &gz[..] } else { data };
     if d.len() < 0x40 || &d[..4] != b"Vgm " { return Err("not a VGM file".into()) }
-    let u32at = |o: usize| d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let u32at = |o: usize| crate::bytes::u32le(d, o);
     let version = u32at(8);
     let start = if version >= 0x150 && u32at(0x34) != 0 { 0x34 + u32at(0x34) as usize } else { 0x40 };
     // Header fields past the header's own size are not there (they overlap the data).
@@ -331,13 +331,7 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
     // frame), so a sample note ends within a twentieth of a frame of when its sound did.
     let sub = if fine && 120 % rowlen == 0 { 120 / rowlen } else { 1 };
     for n in &mut notes {
-        (n.start, n.end) = ((n.start + shift) * sub, (n.end + shift) * sub);
-        for b in &mut n.bends { b.0 = (b.0 + shift) * sub }
-        for v in &mut n.vols { v.0 = (v.0 + shift) * sub }
-        for l in &mut n.lfos { l.0 = (l.0 + shift) * sub }
-        for w in &mut n.waves { w.0 = (w.0 + shift) * sub }
-        for p in &mut n.pans { p.0 = (p.0 + shift) * sub }
-        if let Some(c) = &mut n.cut { *c = (*c + shift) * sub }
+        n.map_times(|t| (t + shift) * sub);
         // Release pitch per driver frame → per SiON frame (1/60 s, when key-off tables step).
         if !n.rel.is_empty() && period != 735.0 {
             let len = (n.rel.len() as f64 * period / 735.0).ceil() as usize;
@@ -349,17 +343,7 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
     // NES DPCM hits: the channel holds the level between them and plays a sample on until the next one starts,
     // so they share one track: each note ends by the time the next starts (where its sample may play on).
     let mut dmc: Vec<Note> = hits.iter().filter(|(_, h)| h.dmc).filter_map(note).collect();
-    dmc.sort_by_key(|n| (n.ch, n.start));
-    for i in 1..dmc.len() {
-        let (ch, start) = (dmc[i].ch, dmc[i].start);
-        let n = &mut dmc[i - 1];
-        if n.ch == ch && n.end > start {
-            n.end = start.max(n.start + 1);
-            let end = n.end;
-            n.bends.retain(|b| b.0 < end);
-            n.vols.retain(|v| v.0 < end);
-        }
-    }
+    crate::score::monophonic(&mut dmc);
     notes.extend(dmc);
     if defs.pcm.len() >= 256 { warnings.push("more than 256 different samples: the rest are left out".into()) }
     let ppq = 4 * (rowlen * sub) as u32;
@@ -387,7 +371,7 @@ fn hit_note(h: &Hit, ch: u32, phase: f64, period: f64, shift: u64) -> Option<Not
     let start = tick(h.at);
     let end = (((h.end - phase) / period).ceil().max(0.0) as u64).max(start + 1);
     let key = h.key.round().clamp(0.0, 127.0);
-    let rate = h.rate * 2f64.powf((h.key - 60.0) / 12.0);
+    let rate = h.play_rate();
     let mut n = Note::new(ch, start, end, key as u8, h.amp, "%7".into());
     n.env = format!("@{}s63", h.smp);
     n.pan = h.pan;
@@ -398,8 +382,6 @@ fn hit_note(h: &Hit, ch: u32, phase: f64, period: f64, shift: u64) -> Option<Not
     if h.cut { n.plen = (((h.end - start as f64 * period - phase) * rate / 44100.0) * 1000.0).round() / 1000.0 }
     for &(t, a) in &h.vols { let t = tick(t); if t > start && t < end { n.vols.push((t, a)) } }
     for &(t, k) in &h.keys { let t = tick(t); if t > start && t < end { n.bends.push((t, ((k - key) * 64.0).round() as i32)) } }
-    (n.start, n.end) = (n.start + shift, n.end + shift);
-    for b in &mut n.bends { b.0 += shift }
-    for v in &mut n.vols { v.0 += shift }
+    n.map_times(|t| t + shift);
     (h.end > h.at).then_some(n)
 }

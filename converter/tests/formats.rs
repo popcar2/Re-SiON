@@ -3,17 +3,7 @@
 
 use sion_converter::{convert, Options};
 
-/// Render MML and return its samples (at most `secs` seconds).
-fn render(mml: &str, secs: usize) -> Vec<f32> {
-    let (mut song, mut buf, mut out) = (sion::Song::new(mml), vec![0f32; 4096], vec![]);
-    while out.len() < sion::RATE as usize * 2 * secs {
-        buf.fill(0.0);
-        let more = song.render(&mut buf);
-        out.extend_from_slice(&buf);
-        if !more { break }
-    }
-    out
-}
+fn render(mml: &str, secs: usize) -> Vec<f32> { sion_converter::render(mml, secs as f64) }
 
 fn check(data: &[u8]) -> sion_converter::Converted { check_with(data, &Options::default()) }
 

@@ -78,7 +78,7 @@ impl Ch {
             let car = CARRIERS[self.alg as usize & 7];
             let rr = (0..4).filter(|i| car >> i & 1 != 0).map(|i| (self.op[i][5] & 15) as i32).min().unwrap_or(15);
             let r = (rr * 4 + 2).min(60);
-            let per_sample = 2.064e-4 * (1 << (r >> 2)) as f64 * (4 + (r & 3)) as f64 / 8.0;
+            let per_sample = crate::score::env_inc(r);
             if self.off as f64 > (480.0 / per_sample / 44100.0 * fps).min(2.0 * fps) { return None }
             return Some(Frame { pitch: hz_key(hz).clamp(0.0, 119.0), amp, tone: 0, pan: self.pan, trig: false, pos: 0.0, lfo: (0, 0), rel: true });
         }
@@ -274,7 +274,7 @@ impl Chip for Opn {
                 }
                 0x2b if self.kind == Kind::Ym2612 => {
                     self.dac = d & 0x80 != 0;
-                    if !self.dac { self.cap.stop(self.t); self.bank.stop() }
+                    if !self.dac { self.cap.stop(); self.bank.stop() }
                 }
                 // (The YM2203 has no LFO.)
                 0x22 if self.kind != Kind::Ym2203 => {
@@ -342,7 +342,7 @@ impl Chip for Opn {
         if self.exact || self.kind != Kind::Ym2612 || port != 0 || reg != 0x2a { return self.write(port, reg, d) }
         if !self.dac { return }
         // A bank byte: the direct-write capture ends where the bank takes over.
-        self.cap.stop(self.t);
+        self.cap.stop();
         let pan = self.ch.get(5).map_or(0, |c| c.pan);
         self.bank.write(self.t, src, pan);
     }
@@ -362,7 +362,7 @@ impl Chip for Opn {
     fn hits(&mut self, defs: &mut Defs, end: f64) -> Vec<Hit> {
         for c in 0..6 { Self::end_hit(self.play_a[c].take(), end, &mut self.hits) }
         Self::end_hit(self.play_b.take(), end, &mut self.hits);
-        let mut out = self.cap.hits(defs, end);
+        let mut out = self.cap.hits(defs);
         out.extend(self.bank.hits(defs, &self.dac_bank));
         // Decode each ADPCM region played: one-shots end with their data, at the rate they started at.
         for (mut h, r) in std::mem::take(&mut self.hits) {
@@ -370,8 +370,7 @@ impl Chip for Opn {
             h.smp = n;
             h.amp *= gain;
             for v in &mut h.vols { v.1 *= gain }
-            let rate = h.rate * 2f64.powf((h.key - 60.0) / 12.0);
-            let natural = h.at + len as f64 * 44100.0 / rate;
+            let natural = h.at + len as f64 * 44100.0 / h.play_rate();
             h.cut = h.end < natural;
             if !r.3 { h.end = h.end.min(natural) }
             if h.end > h.at { out.push(h) }

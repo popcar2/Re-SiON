@@ -12,8 +12,9 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
-use crate::pcm::b64;
-use crate::score::{hz_key, noise_key, noise_level, Defs, Note, Score};
+use crate::nsf::mix;
+use crate::pcm::pcmb;
+use crate::score::{env_inc, hz_key, noise_key, noise_level, Defs, Note, Score};
 use crate::spc700::{Bus, Cpu};
 
 pub fn detect(d: &[u8]) -> bool { d.starts_with(b"SNES-SPC700 Sound File Data") }
@@ -51,8 +52,6 @@ const NON: usize = 0x3d;
 const EON: usize = 0x4d;
 const DIR: usize = 0x5d;
 const EDL: usize = 0x7d;
-
-fn mix(h: u64, v: u64) -> u64 { (h.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95) }
 
 /// ID666 tag: names, and how long the song plays (with its fade), if given.
 #[derive(Default)]
@@ -103,6 +102,11 @@ struct Brr { data: Vec<i16>, lp: Option<usize> }
 /// A key-on: when it started (DSP samples), the voice, its sample (index into `Dsp::samples`), and all the DSP
 /// registers as they were.
 struct KeyOn { t: u64, voice: usize, smp: usize, regs: [u8; 128] }
+
+impl KeyOn {
+    /// What the key-on plays: voice, sample and pitch.
+    fn sig(&self) -> u64 { let r = self.voice * 16; mix(mix(self.voice as u64, self.smp as u64), (self.regs[r + 2] as u64) << 8 | self.regs[r + 3] as u64) }
+}
 
 /// The S-DSP as far as the conversion needs it: which voices play what, and their envelopes. (No audio: the
 /// samples' sound is SiON's to make.)
@@ -435,7 +439,7 @@ fn play(d: &[u8], warnings: &mut Vec<String>) -> Result<Played, String> {
     apu.dsp.sync(cpu.cycles, &apu.ram);
     let now = apu.dsp.t;
     let at = |cycles: u64| cycles / 32;
-    let (end, lp) = match exact {
+    let (mut end, mut lp) = match exact {
         Some((j, k)) => (at(ticks[k]), Some(at(ticks[j]))),
         None => {
             // The writes repeating (ticks with writes, so a driver's tempo counter can move them by a tick), with a
@@ -446,7 +450,7 @@ fn play(d: &[u8], warnings: &mut Vec<String>) -> Result<Played, String> {
             // Failing that (drivers whose vibrato runs on through the loop), the key-ons repeating: voice, sample
             // and pitch.
             let kons = &apu.dsp.keyons;
-            let ksig: Vec<u64> = kons.iter().map(|k| { let r = k.voice * 16; mix(mix(k.voice as u64, k.smp as u64), (k.regs[r + 2] as u64) << 8 | k.regs[r + 3] as u64) }).collect();
+            let ksig: Vec<u64> = kons.iter().map(|k| k.sig()).collect();
             let kps = kons.len() as f64 / (now as f64 / RATE).max(1.0);
             match crate::nsf::repeat(&sig, per_sec as usize) {
                 Some((j, p)) if j + p < busy.len() => (at(ticks[busy[j + p]]), Some(at(ticks[busy[j]]))),
@@ -460,40 +464,30 @@ fn play(d: &[u8], warnings: &mut Vec<String>) -> Result<Played, String> {
     };
     // A loop found by the driver's state can be several times round the music (its tempo counter coming back
     // into phase only then): if the key-ons repeat sooner within it, loop there.
-    let (end, lp) = match lp {
-        Some(l) => {
-            let kons: Vec<&KeyOn> = apu.dsp.keyons.iter().filter(|k| k.t < end).collect();
-            let ksig: Vec<u64> = kons.iter().map(|k| { let r = k.voice * 16; mix(mix(k.voice as u64, k.smp as u64), (k.regs[r + 2] as u64) << 8 | k.regs[r + 3] as u64) }).collect();
-            let kps = kons.len() as f64 / (end as f64 / RATE).max(1.0);
-            match crate::nsf::repeat(&ksig, (kps as usize).max(1)) {
-                Some((j, p)) if j + p < kons.len() && kons[j + p].t > l && kons[j + p].t - kons[j].t >= 2 * RATE as u64 && kons[j + p].t - kons[j].t < end - l => (kons[j + p].t, Some(kons[j].t)),
-                _ => (end, lp),
-            }
+    if let Some(l) = lp {
+        let kons: Vec<&KeyOn> = apu.dsp.keyons.iter().filter(|k| k.t < end).collect();
+        let ksig: Vec<u64> = kons.iter().map(|k| k.sig()).collect();
+        let kps = kons.len() as f64 / (end as f64 / RATE).max(1.0);
+        if let Some((j, p)) = crate::nsf::repeat(&ksig, (kps as usize).max(1))
+            .filter(|&(j, p)| j + p < kons.len() && kons[j + p].t > l && kons[j + p].t - kons[j].t >= 2 * RATE as u64 && kons[j + p].t - kons[j].t < end - l)
+        {
+            (end, lp) = (kons[j + p].t, Some(kons[j].t));
         }
-        None => (end, lp),
-    };
+    }
     // A loop found partway into a note: if the key-ons just before it come round the same way at the end, it
     // starts with the key-on before it (end and loop moved back together).
-    let (end, lp) = match lp {
-        Some(l) => {
-            let kons = &apu.dsp.keyons;
-            let same = |a: &KeyOn, b: &KeyOn| { let r = a.voice * 16; a.voice == b.voice && a.smp == b.smp && a.regs[r + 2..r + 4] == b.regs[r + 2..r + 4] };
-            let first = kons.iter().rev().find(|k| k.t <= l).map(|k| k.t);
-            match first {
-                Some(f) if l - f > 0 && l - f < RATE as u64 / 4 => {
-                    let span = end - l;
-                    let before: Vec<&KeyOn> = kons.iter().filter(|k| k.t >= f && k.t < l).collect();
-                    let again: Vec<&KeyOn> = kons.iter().filter(|k| k.t + span >= f + span && k.t < end && k.t + 64 >= f + span).filter(|k| k.t < l + span).collect();
-                    let ok = before.len() == again.len() && before.iter().zip(&again).all(|(a, b)| same(a, b) && (b.t as i64 - (a.t + span) as i64).abs() <= 64);
-                    if ok { (end - (l - f), Some(f)) } else { (end, lp) }
-                }
-                _ => (end, lp),
-            }
+    if let Some(l) = lp {
+        let kons = &apu.dsp.keyons;
+        let same = |a: &KeyOn, b: &KeyOn| { let r = a.voice * 16; a.voice == b.voice && a.smp == b.smp && a.regs[r + 2..r + 4] == b.regs[r + 2..r + 4] };
+        if let Some(f) = kons.iter().rev().find(|k| k.t <= l).map(|k| k.t).filter(|&f| l - f > 0 && l - f < RATE as u64 / 4) {
+            let span = end - l;
+            let before: Vec<&KeyOn> = kons.iter().filter(|k| k.t >= f && k.t < l).collect();
+            let again: Vec<&KeyOn> = kons.iter().filter(|k| k.t >= f && k.t < end && k.t + 64 >= f + span && k.t < l + span).collect();
+            let ok = before.len() == again.len() && before.iter().zip(&again).all(|(a, b)| same(a, b) && (b.t as i64 - (a.t + span) as i64).abs() <= 64);
+            if ok { (end, lp) = (end - (l - f), Some(f)) }
         }
-        None => (end, lp),
-    };
-    let regs0 = regs;
-    Ok(Played { dsp: apu.dsp, regs0, end: end.min(now), lp, tags })
+    }
+    Ok(Played { dsp: apu.dsp, regs0: regs, end: end.min(now), lp, tags })
 }
 
 /// A voice's envelope as the hardware runs it from a key-on.
@@ -517,14 +511,11 @@ impl Env {
     fn falls(self) -> bool { matches!(self, Env::Slope(4 | 5, r) if r > 0) || self == Env::Direct(0) }
 }
 
-/// SiON's envelope rate step (`inc` in the `sion` crate): level units (1/64 octave) per 44.1 kHz frame.
-fn sion_inc(r: i32) -> f64 { if r <= 0 { 0.0 } else { let r = r.min(60); 2.064e-4 * (1u32 << (r >> 2)) as f64 * (4 + (r & 3)) as f64 / 8.0 } }
-
 /// The SiON rate (1..63) whose step is closest to `a` units per frame; 0 for none.
 fn sion_rate(a: f64) -> i32 {
     if a <= 0.0 { return 0 }
-    if a > sion_inc(60) * 1.5 { return 63 }
-    (1..=60).min_by(|&x, &y| (sion_inc(x) / a).ln().abs().total_cmp(&(sion_inc(y) / a).ln().abs())).unwrap()
+    if a > env_inc(60) * 1.5 { return 63 }
+    (1..=60).min_by(|&x, &y| (env_inc(x) / a).ln().abs().total_cmp(&(env_inc(y) / a).ln().abs())).unwrap()
 }
 
 /// SiON rates for an exponential fall of one DSP step (-1/256 of the level) every `p` samples, a linear rise of
@@ -672,7 +663,7 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
     if dsp.keyons.is_empty() { return Err("the SPC plays no notes".into()) }
 
     // The register values as they change: replay the writes.
-    let at_reg = |from: &[u8; 128], t0: u64, t1: u64| dsp.writes[dsp.writes.partition_point(|w| w.0 < t0)..dsp.writes.partition_point(|w| w.0 < t1)].to_vec().into_iter().scan(*from, |r, (t, a, v)| { r[a as usize] = v; Some((t, a, *r)) }).collect::<Vec<_>>();
+    let at_reg = |from: &[u8; 128], t0: u64, t1: u64| dsp.writes[dsp.writes.partition_point(|w| w.0 < t0)..dsp.writes.partition_point(|w| w.0 < t1)].iter().scan(*from, |r, &(t, a, v)| { r[a as usize] = v; Some((t, a, *r)) });
 
     // Notes: each key-on, until the voice's next one (or it falls silent).
     let mut raws: Vec<Raw> = vec![];
@@ -686,7 +677,8 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         let (a, b) = ((k.t / 32) as usize, ((next / 32) as usize).min(envs.len()));
         let Some(last) = (a..b).rev().find(|&j| envs[j] > 0) else { continue };
         let heard = ((last as u64 + 1) * 32).min(next);
-        let off = dsp.offs.iter().find(|o| o.1 == v && o.0 > k.t && o.0 < heard).map(|o| o.0);
+        // (Key-offs are in time order.)
+        let off = dsp.offs[dsp.offs.partition_point(|o| o.0 <= k.t)..].iter().take_while(|o| o.0 < heard).find(|o| o.1 == v).map(|o| o.0);
         let bit = 1u8 << v;
         pmon |= k.regs[PMON] & bit != 0 && v > 0;
         let env = Env::of(&k.regs, v);
@@ -752,8 +744,12 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
     };
 
     // Echo: the settings that hold longest, as a delay on send 1.
-    let mut held: HashMap<Vec<u8>, u64> = HashMap::new();
-    let echo_regs = |r: &[u8; 128]| { let mut k = vec![r[EDL] & 15, r[EFB], r[EVOLL], r[EVOLR], r[MVOLL], r[MVOLR], r[FLG] & 0x20]; k.extend((0..8).map(|i| r[i * 16 + 15])); k };
+    let mut held: HashMap<[u8; 15], u64> = HashMap::new();
+    let echo_regs = |r: &[u8; 128]| -> [u8; 15] {
+        let mut k = [r[EDL] & 15, r[EFB], r[EVOLL], r[EVOLR], r[MVOLL], r[MVOLR], r[FLG] & 0x20, 0, 0, 0, 0, 0, 0, 0, 0];
+        for i in 0..8 { k[7 + i] = r[i * 16 + 15] }
+        k
+    };
     let (mut cur, mut since) = (regs0, 0u64);
     for &(t, a, v) in dsp.writes.iter().take_while(|w| w.0 < end) {
         let before = echo_regs(&cur);
@@ -793,7 +789,7 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
                 let key = bk.round();
                 let rate = (RATE * 2f64.powf((key - bk) / 12.0) * 1000.0).round() / 1000.0;
                 let bytes: Vec<u8> = soften(&b.data, b.lp).iter().flat_map(|v| v.to_le_bytes()).collect();
-                defs.pcm(format!("{{{}}}{rate},{key},{},1", b64(&bytes), b.lp.map_or(-1, |l| l as i64)))
+                defs.pcm(pcmb(&bytes, rate, key, b.lp, 1))
             }) else { full = true; continue };
             format!("%7@{n}")
         };
@@ -844,19 +840,8 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         for &(t, (_, p)) in &r.vols { n.pans.push((tick(t), p)) }
         notes.push(n);
     }
-    // A voice plays one note at a time: each ends by the time its next starts.
-    notes.sort_by_key(|n| (n.ch, n.start));
-    for i in 1..notes.len() {
-        let (ch, next) = (notes[i].ch, notes[i].start);
-        let n = &mut notes[i - 1];
-        if n.ch == ch && n.end > next {
-            n.end = next.max(n.start + 1);
-            let end = n.end;
-            n.bends.retain(|b| b.0 < end);
-            n.vols.retain(|v| v.0 < end);
-            n.pans.retain(|v| v.0 < end);
-        }
-    }
+    // A voice plays one note at a time.
+    crate::score::monophonic(&mut notes);
     // A voice switching samples all the time is a drum kit (or several parts sharing it): one track per sample,
     // so each keeps its tone. (Channels 8.. after the voices.)
     let mut names: Vec<String> = (0..8).map(|v| format!("voice {}", v + 1)).collect();
@@ -891,8 +876,6 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         ppq: 48, tempos: vec![(0, 15.0 / row)], header, notes, end: end_t, lp: lp_t.filter(|&l| l < end_t), db: true,
         names, title, ..Score::default()
     };
-    // A loop of silence is the song having ended: it plays once, to its last sound.
-    if let Some(l) = score.lp { if !score.notes.iter().any(|n| n.end > l) { score.lp = None } }
-    if score.lp.is_none() { if let Some(last) = score.notes.iter().map(|n| n.end).max() { score.end = score.end.min(last) } }
+    score.drop_silent_loop();
     Ok((score, warnings))
 }

@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use crate::chips::{Ay8910, Chip, NesApu, Vrc6};
+use crate::bytes::u16le;
 use crate::cpu::{Bus, Cpu};
 use crate::score::Score;
 use crate::vgm::{Log, Write};
@@ -44,15 +45,13 @@ struct Nsf {
     labels: Vec<String>,
 }
 
-fn u16at(d: &[u8], o: usize) -> u16 { d.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])) }
-
 fn parse(d: &[u8]) -> Result<Nsf, String> {
     let mut f = Nsf::default();
     if d.starts_with(b"NESM\x1a") {
         if d.len() < 0x80 { return Err("truncated NSF header".into()) }
         (f.songs, f.first) = (d[6].max(1) as usize, d[7].max(1) as usize - 1);
-        (f.load, f.init, f.play) = (u16at(d, 8), u16at(d, 0x0a), u16at(d, 0x0c));
-        (f.ntsc_us, f.pal_us) = (u16at(d, 0x6e), u16at(d, 0x78));
+        (f.load, f.init, f.play) = (u16le(d, 8), u16le(d, 0x0a), u16le(d, 0x0c));
+        (f.ntsc_us, f.pal_us) = (u16le(d, 0x6e), u16le(d, 0x78));
         let banks: [u8; 8] = d[0x70..0x78].try_into().unwrap();
         f.banks = banks.iter().any(|&b| b != 0).then_some(banks);
         f.pal = d[0x7a] & 3 == 1;
@@ -84,14 +83,14 @@ fn chunks(mut d: &[u8], f: &mut Nsf, meta: bool) -> Result<(), String> {
         match id {
             b"INFO" if !meta => {
                 if body.len() < 8 { return Err("NSFE INFO chunk too short".into()) }
-                (f.load, f.init, f.play) = (u16at(body, 0), u16at(body, 2), u16at(body, 4));
+                (f.load, f.init, f.play) = (u16le(body, 0), u16le(body, 2), u16le(body, 4));
                 (f.pal, f.chips) = (body[6] & 3 == 1, body[7]);
                 f.songs = body.get(8).map_or(1, |&n| n.max(1) as usize);
                 f.first = body.get(9).copied().unwrap_or(0) as usize;
             }
             b"DATA" if !meta => f.prog = body.to_vec(),
             b"BANK" if !meta => { let mut b = [0u8; 8]; b[..body.len().min(8)].copy_from_slice(&body[..body.len().min(8)]); f.banks = Some(b) }
-            b"RATE" if !meta => (f.ntsc_us, f.pal_us) = (u16at(body, 0), u16at(body, 2)),
+            b"RATE" if !meta => (f.ntsc_us, f.pal_us) = (u16le(body, 0), u16le(body, 2)),
             b"time" => f.times = body.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
             b"fade" => f.fades = body.chunks_exact(4).map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect(),
             b"tlbl" => f.labels = strings(body),
@@ -134,7 +133,7 @@ struct Nes {
 
 const SENTINEL: u16 = 0x4f00;
 
-fn mix(h: u64, v: u64) -> u64 { (h.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95) }
+pub(crate) fn mix(h: u64, v: u64) -> u64 { (h.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95) }
 
 impl Nes {
     fn bank(&mut self, slot: usize, b: u8) {
@@ -354,9 +353,7 @@ pub fn to_score(data: &[u8], exact: bool, track: Option<usize>) -> Result<(Score
     let level = vec![1.0; chips.len()];
     let log = Log { chips, level, writes, blocks: nes.blocks, end, loop_at, period: Some(44100.0 * us / 1e6), phase: Some(0.0), dac: None, shelf: false };
     let (mut score, w) = crate::vgm::render(log, warnings)?;
-    // A loop of silence is the song having ended: it plays once, to its last sound.
-    if let Some(l) = score.lp { if !score.notes.iter().any(|n| n.end > l) { score.lp = None } }
-    if score.lp.is_none() { if let Some(last) = score.notes.iter().map(|n| n.end).max() { score.end = score.end.min(last) } }
+    score.drop_silent_loop();
     if score.notes.is_empty() { return Err(format!("track {} plays no sound the converter can carry over", song + 1)) }
     Ok((score, w))
 }
