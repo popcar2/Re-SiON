@@ -1,7 +1,40 @@
-//! C interface to the SiON MML player. See `sion.h` for the API.
+//! C interface to the SiON MML player (`libsion.so` / `sion.dll`, built by `build-ffi.sh` with the `ffi` feature).
+//! See `sion.h` for the API.
 
-use core::{ffi::c_char, slice};
-use sion_core::{Sample, Song, RATE};
+use crate::{Sample, Song, RATE};
+use alloc::boxed::Box;
+use core::{alloc::{GlobalAlloc, Layout}, ffi::c_char, ptr::null_mut, slice};
+
+// ---- Runtime from the C library. Not std's: linking std into this crate would put std's `f32` methods in
+// scope, which take precedence over `m::M`, and the library would sound different from the wasm build. ----
+
+extern "C" {
+    fn malloc(size: usize) -> *mut u8;
+    fn calloc(n: usize, size: usize) -> *mut u8;
+    fn realloc(p: *mut u8, size: usize) -> *mut u8;
+    fn free(p: *mut u8);
+    fn abort() -> !;
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! { unsafe { abort() } }
+
+/// malloc's blocks are 16-aligned on the 64-bit targets; nothing in the crate needs more (it gets NULL).
+struct Malloc;
+
+#[global_allocator]
+static HEAP: Malloc = Malloc;
+
+unsafe impl GlobalAlloc for Malloc {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 { if l.align() <= 16 { malloc(l.size()) } else { null_mut() } }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 { if l.align() <= 16 { calloc(1, l.size()) } else { null_mut() } }
+    unsafe fn dealloc(&self, p: *mut u8, _: Layout) { free(p) }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        if l.align() <= 16 { realloc(p, new) } else { null_mut() }
+    }
+}
+
+// ---- Exports ----
 
 /// Output sample rate in Hz (44100).
 #[no_mangle]

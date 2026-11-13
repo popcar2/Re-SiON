@@ -21,12 +21,12 @@ pub trait M {
 }
 
 impl M for f32 {
-    fn trunc(self) -> f32 { if self < 0.0 { -(-self).floor() } else { self.floor() } }
+    fn trunc(self) -> f32 { if self < 0.0 { -M::floor(-self) } else { M::floor(self) } }
     fn floor(self) -> f32 { let r = round(self); if r > self { r - 1.0 } else { r } }
-    fn fract(self) -> f32 { self - self.trunc() }
+    fn fract(self) -> f32 { self - M::trunc(self) }
     fn rem_euclid(self, r: f32) -> f32 {
         let r = r.abs();
-        let x = if r == 1.0 { self - self.floor() } else { self - r * (self / r).floor() };
+        let x = if r == 1.0 { self - M::floor(self) } else { self - r * M::floor(self / r) };
         if x >= r { 0.0 } else { x }
     }
     fn exp2(self) -> f32 {
@@ -46,7 +46,7 @@ impl M for f32 {
         let s2 = s * s;
         e as f32 + 2.0 * LOG2_E * s * (1.0 + s2 * (1.0 / 3.0 + s2 * (0.2 + s2 * (1.0 / 7.0 + s2 * (1.0 / 9.0 + s2 * (1.0 / 11.0))))))
     }
-    fn powf(self, e: f32) -> f32 { if self == 0.0 { 0.0 } else { (e * self.log2()).exp2() } }
+    fn powf(self, e: f32) -> f32 { if self == 0.0 { 0.0 } else { M::exp2(e * M::log2(self)) } }
     fn powi(self, n: i32) -> f32 { let mut r = 1.0; for _ in 0..n.unsigned_abs() { r *= self } if n < 0 { 1.0 / r } else { r } }
     fn sqrt(self) -> f32 {
         if !(self > 0.0) { return if self == 0.0 { 0.0 } else { f32::NAN } }
@@ -60,10 +60,10 @@ impl M for f32 {
         let x2 = x * x;
         x * (1.0 - x2 * (1.0 / 6.0) * (1.0 - x2 * (1.0 / 20.0) * (1.0 - x2 * (1.0 / 42.0) * (1.0 - x2 * (1.0 / 72.0) * (1.0 - x2 * (1.0 / 110.0))))))
     }
-    fn cos(self) -> f32 { (self + FRAC_PI_2).sin() }
+    fn cos(self) -> f32 { M::sin(self + FRAC_PI_2) }
     fn sinh(self) -> f32 {
         if self.abs() < 0.5 { let x2 = self * self; return self * (1.0 + x2 * (1.0 / 6.0) * (1.0 + x2 * (1.0 / 20.0) * (1.0 + x2 * (1.0 / 42.0)))) }
-        let e = (self * LOG2_E).exp2();
+        let e = M::exp2(self * LOG2_E);
         0.5 * (e - 1.0 / e)
     }
 }

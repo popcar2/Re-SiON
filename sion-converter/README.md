@@ -30,6 +30,17 @@ volume and layout handling. Each line is one section of the source: a tracker pa
 automatic volume would still clip (FM voices and some waveforms come out louder than estimated), the result is
 rendered and the master volume (`x`) is lowered until it doesn't.
 
+## WebAssembly
+
+`./build-wasm.sh` builds the converter as `convert.wasm` (needs the nightly toolchain with the
+`wasm32-unknown-unknown` target; runs `wasm-opt` if Binaryen is installed). The exports are in `src/wasm.rs`, which
+is only compiled for wasm32; `convert.js` wraps them for the browser, Node and Deno:
+
+```js
+const conv = await Converter.load(fetch("convert.wasm"));
+const r = conv.convert(fileBytes, { grid, gain, wavetables, exact, exactPcm, track });
+```
+
 ## MIDI
 
 - Timing stays exact. When the MIDI resolution doesn't divide SiON's 480 ticks per quarter, the converter counts in MIDI ticks and scales the tempo instead.

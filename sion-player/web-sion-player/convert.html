@@ -1,0 +1,251 @@
+<!doctype html>
+<!-- MML converter: drop a MIDI, tracker module, VGM/VGZ, NSF/NSFE or SPC file to convert it to SiON MML, then
+     download or play the result. Runs convert.wasm in a worker (convert-worker.js, convert.js); plays through the
+     same player bar as the other pages (player.js and the rest). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SiON Converter</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .drop {
+    display: grid; place-items: center; gap: 6px; padding: 44px 16px; text-align: center; cursor: pointer;
+    border: 1.5px dashed color-mix(in srgb, var(--muted) 45%, transparent); border-radius: 12px; transition: border-color 0.12s, background 0.12s;
+  }
+  .drop:hover, .drop:focus-visible { background: var(--hover); outline: none; }
+  body.dragging .drop { border-color: var(--accent); background: var(--accent-soft); }
+  .drop svg { width: 26px; height: 26px; color: var(--muted); }
+  body.dragging .drop svg { color: var(--accent); }
+  .drop b { font-weight: 550; }
+  .drop u { color: var(--accent); text-decoration: none; }
+  .drop small { color: var(--muted); font-size: 12px; }
+
+  details { margin-top: 14px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; width: fit-content; user-select: none; }
+  summary:hover { color: var(--fg); }
+  .opts { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 12px 16px; margin-top: 12px; }
+  .opts label { display: grid; gap: 4px; font-size: 12px; color: var(--muted); }
+  .opts label.check { display: flex; align-items: flex-start; gap: 8px; color: var(--fg); font-size: 13px; grid-column: 1 / -1; }
+  .opts label.check span { color: var(--muted); font-size: 12px; }
+  .opts label.check input { margin: 2px 0 0; accent-color: var(--accent); }
+  .opts select, .opts input[type=number] {
+    height: 30px; padding: 0 8px; font: inherit; font-size: 13px; color: var(--fg); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 6px; width: 100%;
+  }
+  .opts select:focus, .opts input:focus { outline: none; border-color: var(--muted); }
+
+  .result { margin-top: 24px; border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .result[hidden] { display: none; }
+  .result .name { font-weight: 600; overflow-wrap: anywhere; }
+  .result .state { color: var(--muted); font-size: 13px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .result.error .state { color: #c4452a; }
+  @media (prefers-color-scheme: dark) { .result.error .state { color: #f08a6c; } }
+  .busy { height: 3px; margin-top: 12px; border-radius: 2px; background: var(--line); overflow: hidden; }
+  .busy::after { content: ""; display: block; width: 30%; height: 100%; background: var(--accent); border-radius: 2px; animation: slide 1.1s ease-in-out infinite; }
+  @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  .busy[hidden] { display: none; }
+  dl { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px 10px; margin: 16px 0 0; }
+  dl[hidden] { display: none; }
+  dl div { min-width: 0; }
+  dt { color: var(--muted); font-size: 11px; }
+  dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  ul.warn { margin: 14px 0 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+  ul.warn li { font-size: 12px; color: var(--muted); padding-left: 16px; position: relative; }
+  ul.warn li::before { content: "!"; position: absolute; left: 3px; font-weight: 700; color: var(--accent); }
+  .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+  .actions[hidden] { display: none; }
+  .actions button {
+    height: 32px; padding: 0 14px; display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    font: inherit; font-size: 13px; color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 6px;
+  }
+  .actions button:hover { background: var(--hover); }
+  .actions button.go { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+  .actions button.go:hover { opacity: 0.85; }
+  .actions svg { width: 12px; height: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>SiON</h1><span>MML converter</span>
+    <nav><a href="./">Songs</a><a href="playground.html">Playground</a><a href="convert.html" aria-current="page">Convert</a></nav>
+  </header>
+
+  <label class="drop" id="drop" tabindex="0">
+    <svg viewBox="0 0 16 16"><path d="M7 13.5V5.3L4.7 7.6 3.3 6.2 8 1.5l4.7 4.7-1.4 1.4L9 5.3v8.2zM2 14h12v1.5H2z"/></svg>
+    <div><b>Drop a file here</b> or <u>browse</u></div>
+    <small>MIDI · MOD, S3M, XM, IT · VGM, VGZ · NSF, NSFE · SPC</small>
+    <input type="file" id="file" hidden>
+  </label>
+
+  <details>
+    <summary>Options</summary>
+    <div class="opts">
+      <label>Timing
+        <select id="grid">
+          <option value="0">Exact</option>
+          <option value="16">Snap to 1/16 notes</option>
+          <option value="32">Snap to 1/32 notes</option>
+          <option value="48">Snap to 1/48 notes</option>
+          <option value="64">Snap to 1/64 notes</option>
+        </select>
+      </label>
+      <label>Volume
+        <input type="number" id="gain" min="0.05" max="8" step="0.05" placeholder="Automatic">
+      </label>
+      <label>Track (NSF)
+        <input type="number" id="track" min="1" step="1" placeholder="The file's first">
+      </label>
+      <label class="check"><input type="checkbox" id="exact">
+        <div>Tick by tick <span>— tracker modules: every volume, pan and pitch step, tick by tick (minified, not laid out by pattern)</span></div></label>
+      <label class="check"><input type="checkbox" id="wavetables">
+        <div>Wavetables <span>— tracker modules: approximate samples with wavetables and noise (much smaller; only chiptune samples come out close)</span></div></label>
+      <label class="check"><input type="checkbox" id="exactPcm">
+        <div>Exact PCM <span>— VGM and NSF: capture samples exactly as the chips output them (many times larger)</span></div></label>
+    </div>
+  </details>
+
+  <section class="result" id="result" hidden aria-live="polite">
+    <div class="name" id="name"></div>
+    <div class="state" id="state"></div>
+    <div class="busy" id="busy" hidden></div>
+    <dl id="stats" hidden></dl>
+    <ul class="warn" id="warnings"></ul>
+    <div class="actions" id="actions" hidden>
+      <button class="go" id="download"><svg viewBox="0 0 16 16"><path d="M7 2h2v6.5l2.3-2.3 1.4 1.4L8 12.3 3.3 7.6l1.4-1.4L7 8.5zM3 13h10v1.5H3z"/></svg>Download .mml</button>
+      <button id="listen"><svg viewBox="0 0 16 16"><path d="M4 2.5v11L13.5 8z"/></svg>Play</button>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+import { createPlayer } from "./player.js";
+const $ = (id) => document.getElementById(id);
+
+// ---- The worker ----
+// A new file (or new options) while one is converting: the worker is stopped and replaced, rather than waiting.
+let worker = null, busy = false, job = 0;
+function convert(bytes, options) {
+  if (busy) { worker.terminate(); worker = null }
+  worker ??= new Worker("convert-worker.js", { type: "module" });
+  busy = true;
+  const id = ++job;
+  return new Promise((resolve) => {
+    worker.onmessage = ({ data }) => { if (data.id === id) { busy = false; resolve(data) } };
+    worker.onerror = (e) => { busy = false; worker = null; resolve({ id, error: e.message || "the converter failed to load" }) };
+    worker.postMessage({ id, bytes, options });
+  });
+}
+
+// ---- Options ----
+const opts = () => ({
+  grid: +$("grid").value,
+  gain: +$("gain").value || 0,
+  track: Math.max(0, Math.floor(+$("track").value || 0)),
+  exact: $("exact").checked,
+  wavetables: $("wavetables").checked,
+  exactPcm: $("exactPcm").checked,
+});
+// Changing an option converts the current file again.
+for (const id of ["grid", "gain", "track", "exact", "wavetables", "exactPcm"]) $(id).addEventListener("change", () => current && run());
+
+// ---- Converting ----
+let current = null; // {name, bytes}
+let output = null;  // {mml, file, title}
+const FORMATS = { Midi: "MIDI", Module: "Tracker module", Vgm: "VGM", Nsf: "NSF", Spc: "SPC" };
+const time = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+const size = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`;
+
+async function open(file) {
+  if (!file) return;
+  // (A track number belongs to its file.)
+  if (current && current.name !== file.name) { $("track").value = ""; $("track").placeholder = "The file's first"; $("track").removeAttribute("max") }
+  current = { name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) };
+  run();
+}
+
+async function run() {
+  const { name, bytes } = current, base = name.replace(/\.[^.]*$/, "") || name;
+  output = null;
+  $("result").hidden = false;
+  $("result").classList.remove("error");
+  $("name").textContent = name;
+  $("busy").hidden = false;
+  $("stats").hidden = $("actions").hidden = true;
+  $("warnings").replaceChildren();
+  const t0 = performance.now(), me = job + 1;
+  const tick = setInterval(() => { if (job === me) $("state").textContent = `Converting… ${((performance.now() - t0) / 1000).toFixed(1)}s` }, 100);
+  $("state").textContent = "Converting…";
+  const { result, error } = await convert(bytes.slice(), opts());
+  clearInterval(tick);
+  if (job !== me) return; // superseded
+  $("busy").hidden = true;
+  const secs = ((performance.now() - t0) / 1000).toFixed(1);
+  if (error || !result.ok) {
+    $("result").classList.add("error");
+    $("state").textContent = `Could not convert: ${error ?? result.error}`;
+    return;
+  }
+  const r = result;
+  output = { mml: r.mml, file: `${base}.mml`, title: base };
+  $("name").textContent = output.file;
+  $("state").textContent = `Converted ${name} in ${secs}s`;
+  const stats = [
+    ["Format", FORMATS[r.format] ?? r.format],
+    ["Length", time(r.secs)],
+    ["Loop", r.loopSecs == null ? "None" : `Last ${time(r.loopSecs)}`],
+    ["Tracks", r.tracks],
+    ["Notes", r.notes.toLocaleString()],
+    ["Size", size(r.bytes)],
+  ];
+  $("stats").replaceChildren(...stats.map(([k, v]) => {
+    const d = document.createElement("div");
+    d.innerHTML = "<dt></dt><dd></dd>";
+    d.firstChild.textContent = k;
+    d.lastChild.textContent = v;
+    d.lastChild.title = v;
+    return d;
+  }));
+  // An NSF names the track converted and how many there are: the Track option picks another.
+  for (const w of r.warnings) {
+    const m = w.match(/^track (\d+) of (\d+)/);
+    if (m) { $("track").max = m[2]; $("track").placeholder = `1 to ${m[2]}` }
+    const li = document.createElement("li");
+    li.textContent = w.replace(/; choose another with --track N$/, " — choose another under Options");
+    $("warnings").append(li);
+  }
+  $("stats").hidden = $("actions").hidden = false;
+}
+
+$("file").onchange = () => { open($("file").files[0]); $("file").value = "" };
+$("drop").addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); $("file").click() } });
+
+// Dropping anywhere on the page works; the drop zone lights up while a file is dragged over.
+let depth = 0;
+const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes("Files");
+addEventListener("dragenter", (e) => { if (hasFiles(e)) { depth++; document.body.classList.add("dragging") } });
+addEventListener("dragleave", (e) => { if (hasFiles(e) && --depth <= 0) { depth = 0; document.body.classList.remove("dragging") } });
+addEventListener("dragover", (e) => { if (hasFiles(e)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy" } });
+addEventListener("drop", (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  depth = 0;
+  document.body.classList.remove("dragging");
+  open(e.dataTransfer.files[0]);
+});
+
+// ---- Download and play ----
+$("download").onclick = () => {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([output.mml], { type: "text/plain" }));
+  a.download = output.file;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+};
+const player = createPlayer({ idleText: "Converter", idle: () => output && play() });
+function play() { player.play(output.mml, { title: output.title, artist: "Converted", volume: 1, file: output.file }) }
+$("listen").onclick = play;
+</script>
+</body>
+</html>

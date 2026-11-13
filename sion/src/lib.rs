@@ -3,12 +3,20 @@
 //! PCM samples (`%7`, `%10`) come from `#PCMB` definitions in the MML or from `Song::set_sample`.
 
 #![no_std]
-#![forbid(unsafe_code)]
+// The wasm and C interfaces (`wasm` and `ffi` features) are the only unsafe code.
+#![cfg_attr(not(any(feature = "wasm", feature = "ffi")), forbid(unsafe_code))]
+#![cfg_attr(any(feature = "wasm", feature = "ffi"), deny(unsafe_code))]
 extern crate alloc;
 
 mod fx;
 mod m;
 mod synth;
+#[cfg(all(feature = "wasm", target_arch = "wasm32"))]
+#[allow(unsafe_code)]
+mod wasm;
+#[cfg(all(feature = "ffi", not(target_arch = "wasm32")))]
+#[allow(unsafe_code)]
+mod ffi;
 
 use alloc::{sync::Arc, vec, vec::Vec};
 use fx::Fx;
@@ -137,9 +145,9 @@ fn table(d: &[u8], pfx: &[u8]) -> Table {
                 let n = num(d, &mut i).unwrap_or(0);
                 for k in 0..n {
                     let t = if list.len() > 1 { k as f32 * (list.len() - 1) as f32 / n as f32 } else { 0.0 };
-                    let (a, tr) = (t as usize, t.fract());
+                    let (a, tr) = (t as usize, M::fract(t));
                     match (list.get(a), list.get(a + 1)) {
-                        (Some(x), Some(y)) => put(&mut out, (x * (1.0 - tr) + y * tr + 0.5).trunc()),
+                        (Some(x), Some(y)) => put(&mut out, M::trunc(x * (1.0 - tr) + y * tr + 0.5)),
                         (Some(x), None) => put(&mut out, *x),
                         _ => {}
                     }
@@ -197,7 +205,7 @@ fn voice(name: &[u8], d: &[f32], init: &[u8]) -> Option<Voice> {
     let mut v = Voice { n: 5, alg: 0, fb: 0, fbc: 0, fratio: if f == 1 || f == 5 { 1.33 } else { 1.0 }, ops: vec![], init: init.to_vec() };
     if f == 6 {
         if d.len() != 9 { return None }
-        let tl = |b: f32| if b <= 0.0 { 104 } else { (-8.0 * (b / 128.0).log2() + 0.5) as i32 };
+        let tl = |b: f32| if b <= 0.0 { 104 } else { (-8.0 * M::log2(b / 128.0) + 0.5) as i32 };
         let (bal, mut a, mut b) = (d[3].clamp(-64.0, 64.0), Op::new(false), Op::new(false));
         (a.pg, a.tl, a.ar, a.dr, a.sl, a.rr) = (d[1] as i32, tl(64.0 - bal), d[5] as i32 & 63, d[6] as i32 & 63, d[7] as i32 & 15, d[8] as i32 & 15);
         (b.pg, b.tl, b.det) = (d[2] as i32, tl(64.0 + bal), d[4] as i32);
@@ -444,7 +452,7 @@ impl Track {
         let mut k = pos - self.seen;
         (self.lag, self.seen) = (self.lag + k, pos);
         while replay {
-            let f = (-(-self.res).floor()).max(1.0);
+            let f = (-M::floor(-self.res)).max(1.0);
             if f > k as f32 { break }
             (self.res, k) = (self.res - f, k - f as u64);
             self.frame(sh);
@@ -577,7 +585,7 @@ impl Track {
                         let mut j = st + name.len();
                         let v = fnum(s, &mut j).unwrap_or(0.0);
                         *i = j.max(*i);
-                        (self.k, self.kf) = (v.floor() as i32, v - v.floor());
+                        (self.k, self.kf) = (M::floor(v) as i32, v - M::floor(v));
                     }
                     b"!@kr" => self.k += p(0, 0),
                     b"kt" => self.kt = p(0, 0),
@@ -621,7 +629,7 @@ impl Track {
                         let v = fnum(s, &mut j).unwrap_or(0.0);
                         let len = if s.get(j) == Some(&b',') { j += 1; fnum(s, &mut j).unwrap_or(0.0) } else { 0.0 };
                         *i = j.max(*i);
-                        (ch.ops[ch.act].phase, ch.sfrac0, ch.slen) = (v.floor() as i32, v - v.floor(), len.max(0.0));
+                        (ch.ops[ch.act].phase, ch.sfrac0, ch.slen) = (M::floor(v) as i32, v - M::floor(v), len.max(0.0));
                     }
                     b"@fx" => ch.ops[ch.act].fix = (p(0, 0) << 6) + p(1, 0),
                     b"@er" => for o in &mut ch.ops { o.erst = a[0] == 1 },

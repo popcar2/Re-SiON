@@ -1,6 +1,0 @@
-# Rebuild std without panic/backtrace machinery to keep the binary small (nightly only).
-[build]
-target = "host-tuple"
-
-[unstable]
-build-std = ["std"]

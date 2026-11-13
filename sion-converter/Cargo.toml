@@ -18,3 +18,11 @@ sion = { path = "../sion" }
 [profile.release]
 lto = true
 codegen-units = 1
+
+# The wasm build (`build-wasm.sh`): converting is heavy work (chip emulation, rendering to check the volume,
+# minifying), so optimise for speed; a panic aborts (the JS wrapper then starts a fresh instance).
+[profile.wasm]
+inherits = "release"
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"

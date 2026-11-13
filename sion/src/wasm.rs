@@ -1,14 +1,13 @@
-//! WebAssembly interface to the SiON MML player (`sion.wasm`). See `sion.js` for a JS wrapper.
+//! WebAssembly interface to the SiON MML player (`sion.wasm`, built by `build-wasm.sh` with the `wasm` feature).
+//! See `sion.js` for a JS wrapper. It brings the module's panic handler and allocator, so it's only compiled with
+//! the feature: as a dependency (the converter's wasm build, which has `std`) the crate is left without them.
 //!
-//! Same functions as the C interface (`sion-ffi`), plus `sion_alloc` / `sion_dealloc` so the host
+//! Same functions as the C interface (`ffi.rs`), plus `sion_alloc` / `sion_dealloc` so the host
 //! can place MML text and sample data in the module's memory.
-
-#![no_std]
-extern crate alloc;
 
 use alloc::boxed::Box;
 use core::{alloc::{GlobalAlloc, Layout}, cell::UnsafeCell, ptr::null_mut, slice};
-use sion_core::{Sample, Song, RATE};
+use crate::{Sample, Song, RATE};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! { core::arch::wasm32::unreachable() }

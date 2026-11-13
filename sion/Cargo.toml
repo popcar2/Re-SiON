@@ -10,3 +10,29 @@ description = "Minimal player for SiON MML music"
 small = []
 # Track which note in the source text each track is playing (`Song::notes`), e.g. to highlight it in an editor.
 spans = []
+# The WebAssembly interface (`src/wasm.rs`): `build-wasm.sh` builds `sion.wasm` with it. Not for use as a dependency.
+wasm = ["spans"]
+# The C interface (`src/ffi.rs`, `sion.h`): `build-ffi.sh` builds `libsion.so` / `sion.dll` with it. Not for use
+# as a dependency either (it brings a panic handler and allocator).
+ffi = []
+
+# The wasm build (`build-wasm.sh`; panic = "immediate-abort" is set there, as it needs nightly).
+[profile.wasm]
+inherits = "release"
+# Smallest size. (The `small` speed-optimised hot paths add ~6 KB and gain nothing measurable under a wasm JIT.)
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo" # keep the target_features section: wasm-opt reads it to know which features to allow
+
+# The C library build (`build-ffi.sh`; panic = "immediate-abort" is set there, as it needs nightly).
+[profile.ffi]
+inherits = "release"
+# Full speed: the size saving comes from leaving out std and the panic machinery (`build-ffi.sh`).
+# opt-level "z" would only save ~7% more and costs ~15% render speed.
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -1,7 +1,8 @@
 <!doctype html>
 <!-- SiON player for the browser. Serve this folder over HTTP (e.g. `python3 -m http.server`), then open it.
      Needs style.css, player.js, sion.js, sion.wasm, render.js, worklet.js, length.js, songs.json and songs/
-     next to it; playground.html is the MML editor. -->
+     next to it; playground.html is the MML editor, and convert.html the converter (convert.js, convert.wasm,
+     convert-worker.js). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -37,7 +38,7 @@
 <main>
   <header>
     <h1>SiON</h1><span id="count">MML player</span>
-    <nav><a href="./" aria-current="page">Songs</a><a href="playground.html">Playground</a></nav>
+    <nav><a href="./" aria-current="page">Songs</a><a href="playground.html">Playground</a><a href="convert.html">Convert</a></nav>
   </header>
   <ol id="list"></ol>
 </main>

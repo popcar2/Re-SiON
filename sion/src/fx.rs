@@ -11,9 +11,9 @@ pub struct Fx { k: usize, p: [f32; 8], s: Vec<f32>, i: usize, c: i32, t: [Option
 
 /// Biquad coefficients [b0, b1, b2, a1, a2] for filter kind 11..=18 (lf hf bf nf pf af lb hb).
 fn biquad(k: usize, freq: f32, band: f32, gain: f32) -> [f32; 5] {
-    let (omg, a) = (freq * TAU / RATE, 10f32.powf(gain * 0.025));
-    let (cos, sin) = (omg.cos(), omg.sin());
-    let alp = sin * (0.34657359 * band * omg / sin).sinh();
+    let (omg, a) = (freq * TAU / RATE, M::powf(10f32, gain * 0.025));
+    let (cos, sin) = (M::cos(omg), M::sin(omg));
+    let alp = sin * M::sinh(0.34657359 * band * omg / sin);
     let ia0 = 1.0 / (1.0 + alp);
     let (a1, a2) = (-2.0 * cos * ia0, (1.0 - alp) * ia0);
     match k {
@@ -24,7 +24,7 @@ fn biquad(k: usize, freq: f32, band: f32, gain: f32) -> [f32; 5] {
         15 => { let i = 1.0 / (1.0 + alp / a); [(1.0 + alp * a) * i, -2.0 * cos * i, (1.0 - alp * a) * i, -2.0 * cos * i, (1.0 - alp / a) * i] }
         16 => [a2, a1, 1.0, a1, a2],
         _ => {
-            let (c, sq) = (if k == 17 { cos } else { -cos }, sin * 0.5 * ((a + 1.0 / a) * (1.0 / band.max(1.0) - 1.0) + 2.0).sqrt() * a.sqrt() * 2.0);
+            let (c, sq) = (if k == 17 { cos } else { -cos }, sin * 0.5 * M::sqrt((a + 1.0 / a) * (1.0 / band.max(1.0) - 1.0) + 2.0) * M::sqrt(a) * 2.0);
             let (i, s) = (1.0 / ((a + 1.0) + (a - 1.0) * c + sq), if k == 17 { 1.0 } else { -1.0 });
             [((a + 1.0) - (a - 1.0) * c + sq) * a * i, s * 2.0 * ((a - 1.0) - (a + 1.0) * c) * a * i, ((a + 1.0) - (a - 1.0) * c - sq) * a * i,
              s * -2.0 * ((a - 1.0) + (a + 1.0) * c) * i, ((a + 1.0) + (a - 1.0) * c - sq) * i]
@@ -42,53 +42,53 @@ impl Fx {
             0 => { p = [(g(0, 250.0) * (RATE / 1000.0)).min(65535.0), (g(1, 25.0) / 100.0).clamp(-0.999, 0.999), (a[2] == 1.0) as i32 as f32, g(3, 100.0) / 100.0, 0., 0., 0., 0.]; s = vec![0.0; 131072] }
             1 => { p = [g(0, 70.0) / 100.0, g(1, 40.0) / 100.0, (g(2, 80.0) / 100.0).clamp(-0.99, 0.99), g(3, 100.0) / 100.0, 0., 0., 0., 0.]; s = vec![0.0; 16384] }
             2 => {
-                let off = (g(0, 20.0) * (RATE / 1000.0)).clamp(5.0, 4095.0).floor();
+                let off = M::floor((g(0, 20.0) * (RATE / 1000.0)).clamp(5.0, 4095.0));
                 let (freq, depth) = (g(2, 4.0).max(0.01), g(3, 20.0).min(off - 4.0));
-                let size = ((depth * TAU).floor()).min((RATE / 4.0 / freq).floor()).max(1.0);
-                p = [off, (g(1, 20.0) / 100.0).clamp(-0.999, 0.999), size, depth, g(4, 50.0) / 100.0, if g(5, 1.0) != 0.0 { -1.0 } else { 1.0 }, (RATE / (size * freq)).floor().max(4.0), 0.];
+                let size = M::floor(depth * TAU).min(M::floor(RATE / 4.0 / freq)).max(1.0);
+                p = [off, (g(1, 20.0) / 100.0).clamp(-0.999, 0.999), size, depth, g(4, 50.0) / 100.0, if g(5, 1.0) != 0.0 { -1.0 } else { 1.0 }, M::floor(RATE / (size * freq)).max(4.0), 0.];
                 s = vec![0.0; 8192];
             }
-            3 => p = [(RATE / 256.0 / (g(0, 1.0) * 0.5).max(1e-3)).floor().max(4.0), g(1, 100.0) / 100.0, 0., 0., 0., 0., 0., 0.],
+            3 => p = [M::floor(RATE / 256.0 / (g(0, 1.0) * 0.5).max(1e-3)).max(4.0), g(1, 100.0) / 100.0, 0., 0., 0., 0., 0., 0.],
             4 => { let d = (g(0, 50.0) / 100.0).min(0.99998); p[0] = 2.0 * d / (1.0 - d); p[1] = g(1, 100.0) / 100.0 }
             5 => {
-                let post = (-g(1, 18.0) / 6.0).exp2();
-                p[0] = (-g(0, -60.0) / 6.0).exp2() * post;
+                let post = M::exp2(-g(1, 18.0) / 6.0);
+                p[0] = M::exp2(-g(0, -60.0) / 6.0) * post;
                 p[1] = post;
                 p[2] = (g(2, 2400.0) > 0.0) as i32 as f32;
                 p[3..8].copy_from_slice(&biquad(11, g(2, 2400.0).max(1.0), g(3, 1.0), 0.0));
                 s = vec![0.0; 4];
             }
             6 => {
-                let w = (g(1, 50.0) * (RATE / 1000.0)).max(1.0).floor();
-                p = [(g(0, 70.0) / 100.0).powi(2), w, if g(2, 20.0) == 0.0 { 0.5 } else { (-1.0 / (g(2, 20.0) * (RATE / 1000.0))).exp2() }, if g(3, 20.0) == 0.0 { 2.0 } else { (1.0 / (g(3, 20.0) * (RATE / 1000.0))).exp2() }, (g(4, 6.0) / 6.0).exp2(), g(5, 50.0) / 100.0, 2.0, 0.0];
+                let w = M::floor((g(1, 50.0) * (RATE / 1000.0)).max(1.0));
+                p = [M::powi(g(0, 70.0) / 100.0, 2), w, if g(2, 20.0) == 0.0 { 0.5 } else { M::exp2(-1.0 / (g(2, 20.0) * (RATE / 1000.0))) }, if g(3, 20.0) == 0.0 { 2.0 } else { M::exp2(1.0 / (g(3, 20.0) * (RATE / 1000.0))) }, M::exp2(g(4, 6.0) / 6.0), g(5, 50.0) / 100.0, 2.0, 0.0];
                 s = vec![0.0; w as usize];
             }
-            7 => { p = [(1 << (g(0, 0.0) as u32).min(12)) as f32, (g(1, 16.0).clamp(1.0, 30.0)).exp2(), g(2, 2.0), 0., 0., 0., 0., 0.]; s = vec![0.0; 4] }
-            8 => { p[0] = (1.0 - (g(0, 20.0) / 100.0).powi(2)).max(0.1); s = vec![0.0; 4] }
+            7 => { p = [(1 << (g(0, 0.0) as u32).min(12)) as f32, M::exp2(g(1, 16.0).clamp(1.0, 30.0)), g(2, 2.0), 0., 0., 0., 0., 0.]; s = vec![0.0; 4] }
+            8 => { p[0] = (1.0 - M::powi(g(0, 20.0) / 100.0, 2)).max(0.1); s = vec![0.0; 4] }
             9 => {
                 let (w, c, inv) = (g(1, 140.0) / 100.0 * PI / 4.0, (g(2, 0.0) / 100.0 + 0.5) * PI / 2.0, if g(0, 0.0) != 0.0 { -1.0 } else { 1.0 });
-                let mut m = [(c - w).cos(), (c - w).sin(), (c + w).cos() * inv, (c + w).sin() * inv];
-                let l = ((m[0] + m[2]).powi(2) + (m[1] + m[3]).powi(2)).sqrt();
+                let mut m = [M::cos(c - w), M::sin(c - w), M::cos(c + w) * inv, M::sin(c + w) * inv];
+                let l = M::sqrt(M::powi(m[0] + m[2], 2) + M::powi(m[1] + m[3], 2));
                 if l > 0.01 { m = m.map(|v| v / l) }
                 p[..4].copy_from_slice(&m);
                 p[4] = (w == 0.0 && g(2, 0.0) == 0.0 && inv > 0.0) as i32 as f32;
             }
-            10 => { p = [g(0, 100.0) / 100.0, g(1, 100.0) / 100.0, g(2, 100.0) / 100.0, 2.0 * (g(3, 880.0) * PI / RATE).sin(), 2.0 * (g(4, 5000.0) * PI / RATE).sin(), 0., 0., 0.]; s = vec![0.0; 22] }
+            10 => { p = [g(0, 100.0) / 100.0, g(1, 100.0) / 100.0, g(2, 100.0) / 100.0, 2.0 * M::sin(g(3, 880.0) * PI / RATE), 2.0 * M::sin(g(4, 5000.0) * PI / RATE), 0., 0., 0.]; s = vec![0.0; 22] }
             11..=18 => { p[..5].copy_from_slice(&biquad(k, g(0, [800., 5500., 3000., 3000., 3000., 3000., 3000., 5500.][k - 11]), g(1, 1.0), g(2, 6.0))); s = vec![0.0; 8] }
             21 => {
                 // Six peaking formants (frequency snapped to 1/32 octave from 50 Hz), then output level.
                 const D: [f32; 12] = [800., 30., 1300., 24., 2200., 12., 3500., 9., 4500., 6., 5500., 6.];
                 p[0] = g(0, 100.0) / 100.0;
                 for j in 0..6 {
-                    let fi = ((g(1 + 2 * j, D[2 * j]).log2() - 5.643856) * 32.0).trunc().clamp(0.0, 1023.0);
-                    s.extend(biquad(15, 50.0 * (fi / 32.0).exp2(), 1.0, g(2 + 2 * j, D[2 * j + 1]).trunc().clamp(-32.0, 95.0)));
+                    let fi = M::trunc((M::log2(g(1 + 2 * j, D[2 * j])) - 5.643856) * 32.0).clamp(0.0, 1023.0);
+                    s.extend(biquad(15, 50.0 * M::exp2(fi / 32.0), 1.0, M::trunc(g(2 + 2 * j, D[2 * j + 1])).clamp(-32.0, 95.0)));
                 }
                 s.resize(54, 0.0);
             }
             _ => {
                 let tb = |i: usize| tables.get(g(i, 255.0) as usize).cloned().flatten().filter(|_| g(i, 255.0) < 255.0);
                 t = [tb(0), tb(1)];
-                p[0] = (RATE / g(2, 20.0).max(1.0)).floor().max(44.0);
+                p[0] = M::floor(RATE / g(2, 20.0).max(1.0)).max(44.0);
                 p[1] = t[0].as_ref().map_or(128.0, |t| t.0[0] as f32);
                 p[2] = t[1].as_ref().map_or(0.0, |t| t.0[0] as f32 / 129.0);
                 s = vec![0.0; 4];
@@ -125,7 +125,7 @@ impl Fx {
                     self.i = (r + 1) & 8191;
                 }
                 2 => {
-                    let d = (((self.c / p[6] as i32 % p[2] as i32) as f32) * TAU / p[2]).sin() * p[3];
+                    let d = M::sin(((self.c / p[6] as i32 % p[2] as i32) as f32) * TAU / p[2]) * p[3];
                     self.c = (self.c + 1) % (p[6] * p[2]) as i32;
                     let (r, w) = (self.i, (self.i + p[0] as usize) & 4095);
                     for c in 0..2 {
@@ -137,7 +137,7 @@ impl Fx {
                 }
                 3 => {
                     let w = if p[1] == 0.0 { 1.0 } else { p[1] } * PI / 256.0;
-                    let tab = |j: usize| (PI / 2.0 + ((j & 255) as f32 - 128.0) * w).sin();
+                    let tab = |j: usize| M::sin(PI / 2.0 + ((j & 255) as f32 - 128.0) * w);
                     let (c, sn) = (tab(self.i), tab(self.i + 128));
                     *f = if p[1] == 0.0 { [f[0] * c - f[1] * sn, f[0] * sn + f[1] * c] } else { [f[0] * c, f[0] * sn] };
                     self.c += 1;
@@ -164,7 +164,7 @@ impl Fx {
                     s[1] += f[1];
                     self.c += 1;
                     if self.c >= p[0] as i32 {
-                        for c in 0..2 { s[c + 2] = (s[c] / p[0] * p[1]).trunc() / p[1]; s[c] = 0.0 }
+                        for c in 0..2 { s[c + 2] = M::trunc(s[c] / p[0] * p[1]) / p[1]; s[c] = 0.0 }
                         self.c = 0;
                     }
                     *f = [s[2], s[3]];
@@ -201,7 +201,7 @@ impl Fx {
                     *f = [(x * p[0]).clamp(-1.0, 1.0); 2];
                 }
                 _ => {
-                    let cut = (self.p[1] / 128.0).powi(2).min(1.0);
+                    let cut = M::powi(self.p[1] / 128.0, 2).min(1.0);
                     let fb = if self.p[1] >= 128.0 { 0.0 } else { self.p[2] * (1.0 + 1.0 / (1.0 - cut)) };
                     for c in 0..2 {
                         s[c] += cut * (f[c] - s[c] + fb * (s[c] - s[c + 2]));

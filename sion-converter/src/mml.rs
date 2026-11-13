@@ -660,6 +660,10 @@ pub fn minify(header: &[String], tracks: &[Vec<Tok>], lens: &mut Lengths) -> Str
     let cands: Vec<Vec<u32>> = tracks.iter().map(|t| l_candidates(t)).collect();
     for &c in cands.iter().flatten() { lens.prepare(c) }
     let (lens, cands) = (&*lens, &cands);
+    // (WebAssembly has no threads: one after another there.)
+    #[cfg(target_family = "wasm")]
+    return [0, 3, 8, 1000].into_iter().map(|p| minify_with(header, tracks, cands, lens, p)).min_by_key(String::len).unwrap_or_default();
+    #[cfg(not(target_family = "wasm"))]
     std::thread::scope(|s| {
         let runs: Vec<_> = [0, 3, 8, 1000].map(|p| s.spawn(move || minify_with(header, tracks, cands, lens, p))).into_iter().collect();
         runs.into_iter().map(|r| r.join().unwrap()).min_by_key(String::len).unwrap_or_default()

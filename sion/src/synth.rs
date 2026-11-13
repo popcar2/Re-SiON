@@ -101,8 +101,8 @@ fn sine(sh: &Shared, p: f32) -> f32 { sh.sine[(p * 1024.0) as usize & 1023] }
 
 /// Build the shared sine, pan and attenuation tables.
 pub fn tables() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    ((0..1024).map(|i| (i as f32 * TAU / 1024.0).sin()).collect(), (0..=128).map(|i| (i as f32 * core::f32::consts::PI / 256.0).sin()).collect(),
-     (0..10240).map(|i| (-(i as f32 / 4.0 - 256.0) / 64.0).exp2()).collect())
+    ((0..1024).map(|i| M::sin(i as f32 * TAU / 1024.0)).collect(), (0..=128).map(|i| M::sin(i as f32 * core::f32::consts::PI / 256.0)).collect(),
+     (0..10240).map(|i| M::exp2(-(i as f32 / 4.0 - 256.0) / 64.0)).collect())
 }
 
 /// 2^(-x/64) by table lookup; silent past the end.
@@ -112,7 +112,7 @@ fn gain(sh: &Shared, x: f32) -> f32 { sh.att.get(((x + 256.0) * 4.0).max(0.0) as
 fn pow2(e: i32) -> f32 { f32::from_bits(((e.clamp(-126, 127) + 127) as u32) << 23) }
 
 /// Wrap a phase into 0..1 (fast path when it already is).
-fn wrap(x: f32) -> f32 { if (0.0..1.0).contains(&x) { x } else { x.rem_euclid(1.0) } }
+fn wrap(x: f32) -> f32 { if (0.0..1.0).contains(&x) { x } else { M::rem_euclid(x, 1.0) } }
 
 /// Move a sample cursor on by `d` frames: whole frames into `pos`, the rest kept in `frac`.
 fn advance(pos: &mut usize, frac: &mut f32, d: f32) {
@@ -146,7 +146,7 @@ pub fn wave(sh: &Shared, pg: i32, p: f32) -> f32 {
         7 => KNM[(p * 32.0) as usize & 31] as f32 / 128.0,
         8 => -p,
         9 => p,
-        11 => -0.96875 + (p * 32.0).floor() * 0.0625,
+        11 => -0.96875 + M::floor(p * 32.0) * 0.0625,
         24 => (p < 0.0625) as i32 as f32,
         25 => at(&sh.noise[2], p / 11.0),
         32..=63 => {
@@ -195,7 +195,7 @@ fn vtl(mode: i32, i: i32) -> f32 {
         (_, 2) => (256 - i) as f32 * 2.6667,
         (_, 3) => (256 - i) as f32 * 2.0,
         (_, 4) => (256 - i) as f32 * 1.3333,
-        _ => -64.0 * (i as f32 / 256.0).log2(),
+        _ => -64.0 * M::log2(i as f32 / 256.0),
     }
 }
 
@@ -239,12 +239,12 @@ impl Op {
         let (semi, k) = (((idx & 8191) as f32 + self.pf) / 768.0, (idx >> 6) as usize);
         let len = match self.pg { 6 | 16 | 17 | 19 | 20 | 26 => 32768.0, 21 => 128.0, 256.. => sh.waves[(self.pg - 256) as usize & 255].len().max(1) as f32, _ => 1024.0 };
         let hz = match self.pt {
-            1 => 0.018581361 * semi.exp2() * RATE / len,
+            1 => 0.018581361 * M::exp2(semi) * RATE / len,
             3 => 2.536 / (32 - (k & 31)) as f32 * RATE / len,
             4 => if k & 31 == 0 { 0.0 } else { 5.0737 / (k & 31) as f32 * RATE / len },
             5 => 40.584 / FC[k & 15] * RATE / len,
             6 => { let i = k & 63; 23.777 / (if i < 4 { [2, 4, 8, 12][i] } else { (4 + i % 4) << (i / 4 + 1) }) as f32 * RATE / len }
-            _ => 8.175799 * semi.exp2(),
+            _ => 8.175799 * M::exp2(semi),
         };
         let dt = if self.dt1 & 3 == 0 { 0.0 } else { DT1[(self.dt1 as usize & 3) * 32 - 32 + (self.kc as usize >> 2)] as f32 * 0.0533 };
         self.step = (hz + if self.dt1 > 3 { -dt } else { dt }) * self.fmul as f32 / 128.0 / RATE;
@@ -301,11 +301,11 @@ impl Op {
             let a = self.rate * fr;
             // Attack: lv + 16 shrinks by (1 - a/16) per sample, until lv reaches 0. Other stages: lv rises by a, to tgt.
             let c = 1.0 - a / 16.0;
-            let k = if a <= 0.0 { f32::INFINITY } else if self.st == 1 { if c > 0.0 && self.lv > 0.0 { (16.0 / (self.lv + 16.0)).log2() / c.log2() } else { 0.0 } }
+            let k = if a <= 0.0 { f32::INFINITY } else if self.st == 1 { if c > 0.0 && self.lv > 0.0 { M::log2(16.0 / (self.lv + 16.0)) / M::log2(c) } else { 0.0 } }
                 else { (self.tgt - self.lv) / a };
-            let k = (-(-k).floor()).max(1.0); // samples until the stage ends
+            let k = (-M::floor(-k)).max(1.0); // samples until the stage ends
             let m = k.min(n);
-            if self.st == 1 { self.lv = (self.lv + 16.0) * (m * c.log2()).exp2() - 16.0 } else { self.lv += a * m }
+            if self.st == 1 { self.lv = (self.lv + 16.0) * M::exp2(m * M::log2(c)) - 16.0 } else { self.lv += a * m }
             if k <= n { self.shift(if self.st == 1 { 2 } else if self.st == 3 && self.ssg > 0 { 1 } else { self.st + 1 }) }
             n -= m;
         }
@@ -486,7 +486,7 @@ impl Chan {
         let rate = |r: i32| match r & 63 { 0 => 0, r @ 1..=59 => (2.36514 * (1 << (14 - (r >> 2))) as f32 * ((r & 3) as f32 * 0.125 + 0.5) + 0.5) as i32, _ => 1 };
         self.f_cut = [a[0], a[6], a[7], a[8], 0, a[9]].map(|c| c.clamp(0, 128));
         self.f_time = [rate(a[2]), rate(a[3]), rate(a[4]), i32::MAX, rate(a[5]), i32::MAX];
-        self.f_res = (-(a[1].clamp(0, 9)) as f32).exp2();
+        self.f_res = M::exp2(-(a[1].clamp(0, 9)) as f32);
         self.f_on = a[0] < 128 || a[1] > 0 || a[2] > 0 || a[5] > 0;
     }
 
@@ -504,7 +504,7 @@ impl Chan {
 
     pub fn note_on(&mut self) {
         for o in &mut self.ops {
-            match o.phase { 255 => {} -1 => o.ph = (o.ph * 7919.0 + 0.137).fract(), p => o.ph = (p & 255) as f32 / 256.0 }
+            match o.phase { 255 => {} -1 => o.ph = M::fract(o.ph * 7919.0 + 0.137), p => o.ph = (p & 255) as f32 / 256.0 }
             o.ssg_st = usize::MAX;
             o.shift(1);
         }
@@ -541,7 +541,7 @@ impl Chan {
         if self.pmd != 0 || self.amd > 0 {
             self.lfo_t -= self.lfo_step * on;
             if self.lfo_t < 0.0 {
-                let k = (-self.lfo_t * fr).floor() + 1.0;
+                let k = M::floor(-self.lfo_t * fr) + 1.0;
                 self.lfo_t += k / fr;
                 self.lfo_ph = (self.lfo_ph + k as usize) & 255;
                 let (a, p) = (self.amd, self.pmd);
@@ -649,7 +649,7 @@ impl Chan {
             // `%10` picks the sample by note number and plays it at its own rate.
             self.sidx = if self.pcm == 10 { (pitch >> 6).max(0) as usize } else { self.smp };
             self.dm = sh.dpcm.get(self.sidx).copied().unwrap_or(false);
-            let semi = |s: &Sample| if self.pcm == 7 { (((pitch + self.ops[0].det + pm - s.key * 64) as f32 + fine) / 768.0).exp2() } else { 1.0 };
+            let semi = |s: &Sample| if self.pcm == 7 { M::exp2(((pitch + self.ops[0].det + pm - s.key * 64) as f32 + fine) / 768.0) } else { 1.0 };
             let step = sh.sample(self.sidx).map_or(0.0, |s| s.rate / RATE * semi(s));
             // The new speed applies from the event's exact time, partway into the frame just played.
             self.sfrac += (step - self.sstep) * late;
@@ -721,7 +721,7 @@ impl Chan {
         };
         if self.ring.0 > 0 { x *= pipes[self.ring.1] * self.ring.0 as f32 * 4.0 }
         if self.ks {
-            let wl = RATE / (8.175799 * ((pitch + self.ops[0].det + pm).clamp(0, 8191) as f32 / 768.0).exp2());
+            let wl = RATE / (8.175799 * M::exp2((pitch + self.ops[0].det + pm).clamp(0, 8191) as f32 / 768.0));
             self.kidx += 1.0;
             // `kidx %= wl`, exactly: subtract the largest power-of-two multiple of `wl` that fits, each step exact.
             while self.kidx >= wl { let mut m = wl; while m * 2.0 <= self.kidx { m *= 2.0 } self.kidx -= m }
@@ -731,7 +731,7 @@ impl Chan {
             x = self.kout * self.kx;
         }
         if self.f_on {
-            let c = ((self.cutoff + self.cut_off).clamp(0, 128) as f32 / 128.0).powi(2);
+            let c = M::powi((self.cutoff + self.cut_off).clamp(0, 128) as f32 / 128.0, 2);
             self.f_v[2] = x - self.f_v[0] - self.f_v[1] * self.f_res;
             self.f_v[1] += self.f_v[2] * c;
             self.f_v[0] += self.f_v[1] * c;
