@@ -5,7 +5,7 @@ use crate::m::M;
 use alloc::{vec, vec::Vec};
 use core::f32::consts::{PI, TAU};
 
-const NAMES: [&str; 22] = ["delay", "reverb", "chorus", "autopan", "ws", "dist", "comp", "ds", "speaker", "stereo", "eq", "lf", "hf", "bf", "nf", "pf", "af", "lb", "hb", "nlf", "nhf", "vowel"];
+const NAMES: [&[u8]; 22] = [b"delay", b"reverb", b"chorus", b"autopan", b"ws", b"dist", b"comp", b"ds", b"speaker", b"stereo", b"eq", b"lf", b"hf", b"bf", b"nf", b"pf", b"af", b"lb", b"hb", b"nlf", b"nhf", b"vowel"];
 
 pub struct Fx { k: usize, p: [f32; 8], s: Vec<f32>, i: usize, c: i32, t: [Option<Table>; 2] }
 
@@ -34,7 +34,7 @@ fn biquad(k: usize, freq: f32, band: f32, gain: f32) -> [f32; 5] {
 
 impl Fx {
     /// Build an effect from its MML name and arguments (NaN = default).
-    pub fn new(name: &str, a: &[f32; 16], tables: &[Option<Table>]) -> Option<Fx> {
+    pub fn new(name: &[u8], a: &[f32; 16], tables: &[Option<Table>]) -> Option<Fx> {
         let k = NAMES.iter().position(|n| *n == name)?;
         let g = |i: usize, d: f32| if a[i].is_nan() { d } else { a[i] };
         let (mut p, mut s, mut t) = ([0.0; 8], vec![], [None, None]);
@@ -125,7 +125,7 @@ impl Fx {
                     self.i = (r + 1) & 8191;
                 }
                 2 => {
-                    let d = (((self.c / p[6] as i32) as f32 % p[2]) * TAU / p[2]).sin() * p[3];
+                    let d = (((self.c / p[6] as i32 % p[2] as i32) as f32) * TAU / p[2]).sin() * p[3];
                     self.c = (self.c + 1) % (p[6] * p[2]) as i32;
                     let (r, w) = (self.i, (self.i + p[0] as usize) & 4095);
                     for c in 0..2 {

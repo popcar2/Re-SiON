@@ -121,6 +121,9 @@ fn advance(pos: &mut usize, frac: &mut f32, d: f32) {
     (*pos, *frac) = (*pos + k, *frac - k as f32);
 }
 
+/// `p % 0.5` for a phase in 0..1.
+fn half(p: f32) -> f32 { if p >= 0.5 { p - 0.5 } else { p } }
+
 fn tri(p: f32) -> f32 { if p < 0.25 { 4.0 * p } else if p < 0.75 { 2.0 - 4.0 * p } else { 4.0 * p - 4.0 } }
 fn saw(p: f32) -> f32 { if p < 0.5 { 2.0 * p } else { 2.0 * p - 2.0 } }
 
@@ -157,11 +160,11 @@ pub fn wave(sh: &Shared, pg: i32, p: f32) -> f32 {
             match v {
                 0 => base(p),
                 1 => if p < 0.5 { base(p) } else { 0.0 },
-                2 => base(p % 0.5),
-                3 => if p % 0.5 < 0.25 { base(p % 0.5) } else { 0.0 },
+                2 => base(half(p)),
+                3 => if half(p) < 0.25 { base(half(p)) } else { 0.0 },
                 4 => if p < 0.5 { base(2.0 * p) } else { 0.0 },
-                5 => if p < 0.5 { base(2.0 * p % 0.5) } else { 0.0 },
-                6 => match g { 0 => b(p < 0.5), 1 => (p < 0.5) as i32 as f32, 2 => (p % 0.5 < 0.25) as i32 as f32, _ => (p < 0.25) as i32 as f32 },
+                5 => if p < 0.5 { base(half(2.0 * p)) } else { 0.0 },
+                6 => match g { 0 => b(p < 0.5), 1 => (p < 0.5) as i32 as f32, 2 => (half(p) < 0.25) as i32 as f32, _ => (p < 0.25) as i32 as f32 },
                 _ if g > 0 => 0.0,
                 _ => if p < 0.25 { 1.0 - sine(sh, p) } else if p >= 0.75 { sine(sh, 1.0 - p) - 1.0 } else { 0.0 },
             }
@@ -720,7 +723,8 @@ impl Chan {
         if self.ks {
             let wl = RATE / (8.175799 * ((pitch + self.ops[0].det + pm).clamp(0, 8191) as f32 / 768.0).exp2());
             self.kidx += 1.0;
-            if self.kidx >= wl { self.kidx %= wl }
+            // `kidx %= wl`, exactly: subtract the largest power-of-two multiple of `wl` that fits, each step exact.
+            while self.kidx >= wl { let mut m = wl; while m * 2.0 <= self.kidx { m *= 2.0 } self.kidx -= m }
             let (t, (dec, lpf)) = (self.kidx as usize, if self.on { (0.98, self.k_lpf) } else { (0.75, 0.5) });
             self.kout = self.kout * dec + (self.kbuf[t] - self.kout * dec) * lpf + x;
             self.kbuf[t] = self.kout;

@@ -10,7 +10,7 @@ mod fx;
 mod m;
 mod synth;
 
-use alloc::{string::{String, ToString}, sync::Arc, vec, vec::Vec};
+use alloc::{sync::Arc, vec, vec::Vec};
 use fx::Fx;
 use m::M;
 pub use synth::{Sample, RATE};
@@ -23,6 +23,9 @@ fn find(s: &[u8], i: usize, pat: &[u8]) -> usize {
     let i = i.min(s.len());
     s[i..].windows(pat.len()).position(|w| w == pat).map_or(s.len(), |p| i + p + pat.len())
 }
+
+/// Whether `pat` occurs in `s`.
+fn has(s: &[u8], pat: &[u8]) -> bool { s.windows(pat.len()).any(|w| w == pat) }
 
 fn ws(s: &[u8], i: &mut usize) { while s.get(*i).is_some_and(u8::is_ascii_whitespace) { *i += 1 } }
 
@@ -163,14 +166,17 @@ fn tval(t: &Table, i: usize) -> i32 {
 }
 
 /// Key signature (`#SIGN`) as a semitone shift per note letter a..g.
-/// Named keys (`D`, `F#m`, `Bb`...) or a custom list such as `c+ f+ b-`.
-fn sign(raw: &str) -> [i32; 7] {
-    let s: String = raw.trim().char_indices().map(|(i, c)| match c { '#' => '+', 'b' if i > 0 => '-', c => c }).collect();
+/// Named keys (`D`, `F#m`, `Bb`...) or a custom list such as `c+ f+ b-`. (Non-ASCII, such as full-width
+/// spaces, counts as space.)
+fn sign(raw: &[u8]) -> [i32; 7] {
+    let sp = |c: &u8| c.is_ascii_whitespace() || *c >= 0x80;
+    let (a, b) = (raw.iter().position(|c| !sp(c)).unwrap_or(raw.len()), raw.iter().rposition(|c| !sp(c)).map_or(0, |e| e + 1));
+    let s: Vec<u8> = raw[a..b.max(a)].iter().enumerate().map(|(i, &c)| match c { b'#' => b'+', b'b' if i > 0 => b'-', c => c }).collect();
     let mut k = [0; 7];
-    for (d, names, order) in [(1, "G Em D Bm A F+m E C+m B G+m F+ D+m C+ A+m", "fcgdaeb"), (-1, "F Dm B- Gm E- Cm A- Fm D- B-m G- E-m C- A-m", "beadgcf")] {
-        if let Some(n) = names.split(' ').position(|x| x == s) { for c in order.bytes().take(n / 2 + 1) { k[(c - b'a') as usize] = d } return k }
+    for (d, names, order) in [(1, &b"G Em D Bm A F+m E C+m B G+m F+ D+m C+ A+m"[..], b"fcgdaeb"), (-1, b"F Dm B- Gm E- Cm A- Fm D- B-m G- E-m C- A-m", b"beadgcf")] {
+        if let Some(n) = names.split(|c| *c == b' ').position(|x| x == s) { for c in order.iter().take(n / 2 + 1) { k[(c - b'a') as usize] = d } return k }
     }
-    for t in raw.split(|c: char| c.is_whitespace() || c == ',').map(str::as_bytes) {
+    for t in raw.split(|c| sp(c) || *c == b',') {
         if let Some(n @ b'a'..=b'g') = t.first().map(u8::to_ascii_lowercase) {
             k[(n - b'a') as usize] = match t.get(1) { Some(b'+' | b'#') => 1, Some(b'-' | b'b') => -1, _ => 0 };
         }
@@ -832,9 +838,12 @@ impl Song {
         if let Some(slot) = self.sh.samples.get_mut(n) { *slot = Some(s); self.sh.dpcm[n] = false }
     }
 
-    pub fn new(mml: &str) -> Song {
+    pub fn new(mml: &str) -> Song { Song::from_bytes(mml.as_bytes()) }
+
+    /// `new` for MML as bytes (UTF-8, though only the ASCII in it matters), so no text conversion is needed.
+    pub fn from_bytes(src: &[u8]) -> Song {
         // Strip comments.
-        let (src, mut text, mut i) = (mml.as_bytes(), vec![], 0);
+        let (mut text, mut i) = (vec![], 0);
         while i < src.len() {
             if src[i..].starts_with(b"/*") { i = find(src, i + 2, b"*/") }
             else if src[i..].starts_with(b"//") { i = find(src, i, b"\n") }
@@ -879,31 +888,31 @@ impl Song {
             let k = num(body, &mut j).unwrap_or(0).max(0) as usize;
             ws(body, &mut j);
             let (dat, pfx) = if body.get(j) == Some(&b'{') { let e = find(body, j, b"}"); (&body[j + 1..(e - 1).max(j + 1)], &body[e..]) } else { (&body[j..], &body[j..]) };
-            let text = String::from_utf8_lossy(dat);
+            let text = dat;
             match name {
                 b"END" => break,
                 b"@" | b"OPM@" | b"OPN@" | b"OPL@" | b"OPX@" | b"MA@" | b"AL@" => sh.voices[k & 255] = voice(name, &nums(dat), pfx),
                 b"FPS" => sh.fps = if k > 0 { k as f32 } else { nums(dat).first().copied().unwrap_or(60.0).max(1.0) },
-                b"SIGN" => sh.sign = sign(&text),
-                b"MACRO" => dynamic = text.contains("dynamic"),
+                b"SIGN" => sh.sign = sign(text),
+                b"MACRO" => dynamic = has(text, b"dynamic"),
                 b"QUANT" => if k > 0 { sh.quant = k as i32 },
                 b"TMODE" => {
                     let v = nums(&dat[find(dat, 0, b"=")..]).first().copied().filter(|v| *v > 0.0);
-                    sh.tmode = if text.contains("timerb") { (1, v.unwrap_or(4000.0) as f64 * 1.220703125) } else if text.contains("fps") { (2, v.unwrap_or(60.0) as f64 * 60.0) } else { (0, 1.0 / v.unwrap_or(1.0) as f64) };
+                    sh.tmode = if has(text, b"timerb") { (1, v.unwrap_or(4000.0) as f64 * 1.220703125) } else if has(text, b"fps") { (2, v.unwrap_or(60.0) as f64 * 60.0) } else { (0, 1.0 / v.unwrap_or(1.0) as f64) };
                 }
                 b"VMODE" => {
-                    if text.contains("n88") || text.contains("mdx") { (sh.vmode.0, sh.vmode.1) = (4, 3) }
-                    if text.contains("psg") { (sh.vmode.0, sh.vmode.1) = (3, 3) }
-                    for (key, x) in [("%v", false), ("%x", true)] {
-                        if let Some(p) = text.find(key) {
-                            let (mut j, d) = (p + 2, text.as_bytes());
+                    if has(text, b"n88") || has(text, b"mdx") { (sh.vmode.0, sh.vmode.1) = (4, 3) }
+                    if has(text, b"psg") { (sh.vmode.0, sh.vmode.1) = (3, 3) }
+                    for (key, x) in [(b"%v", false), (b"%x", true)] {
+                        if let Some(p) = text.windows(2).position(|w| w == key) {
+                            let (mut j, d) = (p + 2, text);
                             let m = num(d, &mut j).unwrap_or(0).clamp(0, 4);
                             if x { sh.vmode.1 = m } else { sh.vmode.0 = m; ws(d, &mut j); if d.get(j) == Some(&b',') { j += 1; sh.vmode.2 = num(d, &mut j).unwrap_or(4).clamp(0, 7) } }
                         }
                     }
                 }
-                b"FBMODE" => sh.fb2 = text.contains("chip"),
-                b"REV" => sh.rev = (if text.contains("vol") { 1 } else { -1 }, if text.contains("oct") { 1 } else { -1 }),
+                b"FBMODE" => sh.fb2 = has(text, b"chip"),
+                b"REV" => sh.rev = (if has(text, b"vol") { 1 } else { -1 }, if has(text, b"oct") { 1 } else { -1 }),
                 b"TABLE" => if k < 255 { sh.tables[k] = Some(table(dat, pfx)).filter(|t| !t.0.is_empty()) },
                 b"WAV" => {
                     let t = table(dat, pfx).0;
@@ -941,18 +950,18 @@ impl Song {
                     let st = i;
                     while src.get(i).is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'_' | b'@')) { i += 1 }
                     if i == st { i += 1; continue }
-                    let (name, mut a, mut n) = (String::from_utf8_lossy(&src[st..i]).to_string(), [f32::NAN; 16], 0);
+                    let (name, mut a, mut n) = (&src[st..i], [f32::NAN; 16], 0);
                     loop {
                         a[n] = fnum(src, &mut i).unwrap_or(f32::NAN);
                         n += 1;
                         ws(src, &mut i);
                         if n < 16 && src.get(i) == Some(&b',') { i += 1 } else { break }
                     }
-                    match (post, name.as_str()) {
+                    match (post, name) {
                         (false, name) => slot.fx.extend(Fx::new(name, &a, &sh.tables)),
-                        (_, "p") => slot.pan = (a[0] as i32 * 16).clamp(0, 128),
-                        (_, "@p") => slot.pan = (a[0] as i32).clamp(-64, 64) + 64,
-                        (_, "@v") => slot.vol = (a[0] / 128.0).clamp(0.0, 1.0),
+                        (_, b"p") => slot.pan = (a[0] as i32 * 16).clamp(0, 128),
+                        (_, b"@p") => slot.pan = (a[0] as i32).clamp(-64, 64) + 64,
+                        (_, b"@v") => slot.vol = (a[0] / 128.0).clamp(0.0, 1.0),
                         _ => {}
                     }
                 }
@@ -972,20 +981,26 @@ impl Song {
 
     /// Length of one pass through the MML in frames, without rendering any audio: until every track has
     /// reached its end, or jumped back to its `$` loop point, at least once. Capped at one hour.
-    pub fn length(mml: &str) -> u64 { Song::pass(mml).0.pos }
+    pub fn length(mml: &str) -> u64 { Song::length_bytes(mml.as_bytes()) }
+
+    /// `length` for MML as bytes (see `from_bytes`).
+    pub fn length_bytes(mml: &[u8]) -> u64 { Song::pass(mml).0.pos }
 
     /// Where a song with a `$` loop carries on from once it has played `length` frames: the frame of the
     /// loop point of the track that finished its first pass last (the one `length` measures; if tracks put
     /// their `$` at different times, the others drift against it). None if the song ends instead.
-    pub fn loop_start(mml: &str) -> Option<u64> {
+    pub fn loop_start(mml: &str) -> Option<u64> { Song::loop_start_bytes(mml.as_bytes()) }
+
+    /// `loop_start` for MML as bytes (see `from_bytes`).
+    pub fn loop_start_bytes(mml: &[u8]) -> Option<u64> {
         let (s, marks) = Song::pass(mml);
         s.tracks.iter().zip(marks).filter(|(t, _)| !t.end).filter_map(|(_, m)| m).max().map(|(_, at)| at)
     }
 
     /// Sequence one pass through the MML (see `length`), without rendering. Also gives, per track that has
     /// a `$` loop point, (frame its first pass ended, frame it first reached `$`).
-    fn pass(mml: &str) -> (Song, Vec<Option<(u64, u64)>>) {
-        let mut s = Song::new(mml);
+    fn pass(mml: &[u8]) -> (Song, Vec<Option<(u64, u64)>>) {
+        let mut s = Song::from_bytes(mml);
         let (mut marks, mut loops) = (vec![None; s.tracks.len()], vec![None; s.tracks.len()]);
         while s.pos < 3600 * RATE as u64 && !s.tracks.iter().all(|t| t.once) {
             let at = s.pos;

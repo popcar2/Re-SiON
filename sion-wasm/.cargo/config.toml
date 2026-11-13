@@ -1,5 +1,7 @@
 [build]
 target = "wasm32-unknown-unknown"
+# SIMD (all current browsers) lets LLVM pack some code tighter.
+rustflags = ["-Ctarget-feature=+simd128"]
 
 [unstable]
 # Rebuild core/alloc size-optimised and without panic machinery (nightly only).

@@ -6,7 +6,7 @@
 #![no_std]
 extern crate alloc;
 
-use alloc::{boxed::Box, string::String};
+use alloc::boxed::Box;
 use core::{alloc::{GlobalAlloc, Layout}, cell::UnsafeCell, ptr::null_mut, slice};
 use sion_core::{Sample, Song, RATE};
 
@@ -98,8 +98,7 @@ pub extern "C" fn sion_rate() -> u32 { RATE as u32 }
 #[no_mangle]
 pub unsafe extern "C" fn sion_song_new(mml: *const u8, len: usize) -> *mut Song {
     if mml.is_null() { return null_mut() }
-    let text = String::from_utf8_lossy(slice::from_raw_parts(mml, len));
-    Box::into_raw(Box::new(Song::new(&text)))
+    Box::into_raw(Box::new(Song::from_bytes(slice::from_raw_parts(mml, len))))
 }
 
 /// Free a song from `sion_song_new`. 0 is ignored.
@@ -149,7 +148,7 @@ pub unsafe extern "C" fn sion_song_position(song: *const Song) -> f64 {
 #[no_mangle]
 pub unsafe extern "C" fn sion_length(mml: *const u8, len: usize) -> f64 {
     if mml.is_null() { return 0.0 }
-    Song::length(&String::from_utf8_lossy(slice::from_raw_parts(mml, len))) as f64
+    Song::length_bytes(slice::from_raw_parts(mml, len)) as f64
 }
 
 /// For MML with a `$` loop (`len` bytes): the frame playback carries on from after `sion_length` frames,
@@ -161,7 +160,7 @@ pub unsafe extern "C" fn sion_length(mml: *const u8, len: usize) -> f64 {
 #[no_mangle]
 pub unsafe extern "C" fn sion_loop_start(mml: *const u8, len: usize) -> f64 {
     if mml.is_null() { return -1.0 }
-    Song::loop_start(&String::from_utf8_lossy(slice::from_raw_parts(mml, len))).map_or(-1.0, |f| f as f64)
+    Song::loop_start_bytes(slice::from_raw_parts(mml, len)).map_or(-1.0, |f| f as f64)
 }
 
 /// Set PCM sample `n` (0..255) for `%7` / `%10`, replacing any `#PCMB` of that number.
