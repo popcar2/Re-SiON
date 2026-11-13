@@ -25,6 +25,7 @@ const BAR = `<footer>
     <button id="play" class="main" title="Play / pause (space)"><svg viewBox="0 0 16 16"><path id="icon" d="${PLAY}"/></svg></button>
     <button id="next" title="Next" disabled hidden><svg viewBox="0 0 16 16"><path d="M11 3h2v10h-2zM2 3v10l8-5z"/></svg></button>
     <div class="now"><div class="t" id="title">Nothing playing</div><div class="a" id="artist"></div></div>
+    <button id="save" title="Download MML" disabled><svg viewBox="0 0 16 16"><path d="M7 2h2v6.5l2.3-2.3 1.4 1.4L8 12.3 3.3 7.6l1.4-1.4L7 8.5zM3 13h10v1.5H3z"/></svg></button>
   </div>
   </div>
 </footer>`;
@@ -37,6 +38,7 @@ export function createPlayer(hooks = {}) {
   const idleText = $("artist").textContent = hooks.idleText ?? "";
 
   let ctx, node, ready, song = null, id = 0; // song: what's loaded ({title, artist}); id: bumped per song
+  let text = null; // the MML of the song loaded, once it has arrived (for the download button)
   // Songs are rendered ahead in a worker (render.js) and handed to the audio worklet, which only copies samples.
   const renderer = new Worker("render.js", { type: "module" });
   let pos = 0, dur = 0, loop = -1, dragging = false; // in frames; dur = 0 until measured, loop = -1 unless it loops
@@ -78,12 +80,14 @@ export function createPlayer(hooks = {}) {
   async function play(mml, meta = {}) {
     const me = ++id;
     song = meta;
+    text = null;
     pos = dur = 0;
     loop = -1;
     hooks.notes?.([]);
     show();
     [mml] = await Promise.all([mml, audio()]);
     if (me !== id) return; // another song was picked while this one loaded
+    text = mml;
     renderer.postMessage({ mml, volume: meta.volume ?? 1, notes: !!hooks.notes });
     lengths.postMessage({ id: me, mml });
     await ctx.resume();
@@ -93,7 +97,7 @@ export function createPlayer(hooks = {}) {
   function stop() {
     renderer.postMessage({ mml: null });
     id++;
-    song = null;
+    song = text = null;
     pos = dur = 0;
     loop = -1;
     hooks.notes?.([]);
@@ -123,6 +127,7 @@ export function createPlayer(hooks = {}) {
     $("icon").setAttribute("d", playing() ? PAUSE : PLAY);
     $("prev").disabled = !song || !hooks.canPrev?.();
     $("next").disabled = !song || !hooks.canNext?.();
+    $("save").disabled = text == null;
     showTime();
     hooks.show?.(song);
   }
@@ -154,6 +159,14 @@ export function createPlayer(hooks = {}) {
   $("play").onclick = toggle;
   $("prev").onclick = () => hooks.prev?.();
   $("next").onclick = () => hooks.next?.();
+  // Download the MML playing, under its file name (meta.file) or else its title.
+  $("save").onclick = () => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
+    a.download = song.file ?? `${(song.title || "song").replace(/[\\/:*?"<>|]/g, "_")}.mml`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  };
   addEventListener("keydown", (e) => {
     if (e.target === $("seek") && e.key.startsWith("Arrow")) return; // the slider handles its own arrows
     if (e.target.closest?.("textarea, input:not([type=range]), select, [contenteditable]")) return; // typing

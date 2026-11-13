@@ -38,23 +38,29 @@
   .menu button .a { margin-left: auto; flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
 
   /* The editor: a textarea with transparent text over a <pre> showing the same text, so the notes being
-     played can be highlighted in it. Both scroll together and never wrap, so their text lines up. */
+     played can be highlighted in it. Both wrap the same way (same width, with room for a scrollbar kept in both) and scroll together,
+     so their text lines up. */
   .editor {
     position: relative; height: calc(100vh - 230px); min-height: 240px;
     border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--bg);
   }
   .editor:focus-within { border-color: var(--muted); }
   .editor pre, .editor textarea {
-    position: absolute; inset: 0; margin: 0; padding: 12px 14px; border: 0; width: 100%; height: 100%;
+    position: absolute; inset: 0; margin: 0; padding: 12px 14px 12px 22px; border: 0; width: 100%; height: 100%;
     font: 13px/1.55 ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; tab-size: 4;
-    white-space: pre; overflow-wrap: normal; letter-spacing: 0;
+    white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; letter-spacing: 0;
+    scrollbar-gutter: stable;
   }
-  /* Extra room at the end, so the <pre> (no scrollbars) can scroll as far as the textarea (with them). */
-  .editor pre { overflow: hidden; color: var(--fg); padding-bottom: 40px; padding-right: 40px; pointer-events: none; }
+  /* Extra room at the end, so the <pre> can always scroll as far as the textarea. */
+  .editor pre { overflow: hidden; color: var(--fg); padding-bottom: 40px; pointer-events: none; }
+  /* Marks in the left margin on rows that continue a wrapped line. */
+  .editor .wraps { position: absolute; left: 0; top: 0; }
+  .editor .wraps span { position: absolute; left: 6px; color: var(--muted); }
   .editor textarea {
     color: transparent; caret-color: var(--fg); background: transparent; resize: none; outline: none; overflow: auto;
   }
-  .editor textarea::selection { color: transparent; background: var(--accent-soft); }
+  /* The selection is drawn over the <pre>'s text, so it has to be see-through. */
+  .editor textarea::selection { color: transparent; background: color-mix(in srgb, var(--accent) 28%, transparent); }
   .editor textarea::placeholder { color: var(--muted); }
   ::highlight(playing) {
     color: var(--accent); background-color: color-mix(in srgb, var(--accent) 16%, transparent);
@@ -80,7 +86,7 @@
   </div>
   <div class="editor">
     <pre id="view" aria-hidden="true"></pre>
-    <textarea id="mml" spellcheck="false" wrap="off" autocomplete="off" autocapitalize="off"
+    <textarea id="mml" spellcheck="false" autocomplete="off" autocapitalize="off"
       aria-label="MML" placeholder="Write or paste MML here, then press play."></textarea>
   </div>
 </main>
@@ -90,14 +96,14 @@ import { createPlayer } from "./player.js";
 const $ = (id) => document.getElementById(id);
 const text = $("mml"), view = $("view");
 
-// Short, simple songs from songs/ to read along with.
+// Songs from songs/ to read along with, mostly short and simple.
 const EXAMPLES = [
   "fukuicat - ZANAC(FDS) _ AREA1,3,6,9.mml",
   "keim_at_Si - Formant Singing _.mml",
   "keim_at_Si - In the wind (GRADIUSIII).mml",
-  "pisalod - ポケットモンスター金･銀 26ばんどうろ.mml",
   "yonatan - Tomaso Albinoni _ Adagio in G minor.mml",
   "LinearDrive - [FC] BALLOON FIGHT - BALLOON TRIP - (C)Nintendo 1984.mml",
+  "keim_at_Si - Twin Memories _ Pop'nツインビー (Stage1).mml",
 ].map((file) => {
   const name = file.replace(/\.(sion)?mml$/i, ""), cut = name.indexOf(" - ");
   return { file, title: name.slice(cut + 3), artist: name.slice(0, cut), volume: 1 };
@@ -128,9 +134,51 @@ text.value = STARTER;
 
 function render() {
   view.textContent = text.value + "\n "; // (a trailing newline only shows in the textarea with something after it)
+  view.append(wraps);
   sync();
+  markWraps();
 }
-function sync() { view.scrollTop = text.scrollTop; view.scrollLeft = text.scrollLeft }
+
+// Mark each row that continues a wrapped line, in the left margin. A line's text wraps over as many rows as its
+// range has boxes (counted by changes in top). Redone after the layout settles, whenever the text or width changes.
+// Only lines that might be too long for a row are measured: a line of n characters without tabs takes at most 2n
+// columns (wide characters take two), so one of up to cols / 2 can't wrap.
+const wraps = document.createElement("div");
+wraps.className = "wraps";
+let wrapFrame = 0, cols = 0;
+function measure() {
+  const style = getComputedStyle(view), probe = document.createElement("canvas").getContext("2d");
+  probe.font = style.font;
+  cols = (view.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight)) / probe.measureText("0").width;
+  markWraps();
+}
+function markWraps() {
+  cancelAnimationFrame(wrapFrame);
+  wrapFrame = requestAnimationFrame(() => {
+    const node = view.firstChild, str = text.value, top = view.getBoundingClientRect().top - view.scrollTop;
+    const range = new Range(), marks = [];
+    for (let a = 0, tab = str.indexOf("\t"); a < str.length;) {
+      let b = str.indexOf("\n", a);
+      if (b < 0) b = str.length;
+      if (tab >= 0 && tab < a) tab = str.indexOf("\t", a);
+      if (b - a > cols / 2 || (tab >= 0 && tab < b)) {
+        range.setStart(node, a);
+        range.setEnd(node, b);
+        let row;
+        for (const r of range.getClientRects()) {
+          const y = Math.round(r.top);
+          if (row !== undefined && y !== row) marks.push(`<span style="top:${y - top}px">↵</span>`);
+          row = y;
+        }
+      }
+      a = b + 1;
+    }
+    wraps.innerHTML = marks.join("");
+  });
+}
+new ResizeObserver(measure).observe(text);
+document.fonts?.ready.then(measure);
+function sync() { view.scrollTop = text.scrollTop }
 text.addEventListener("input", () => {
   if (!text.value) source = null;
   render();
@@ -186,8 +234,17 @@ const player = createPlayer({ idleText: "Playground", idle: run, notes });
 function run() {
   played = text.value;
   index = byteIndex(played);
+  // An example's artist, volume and file name stay with the text only while it keeps that example's #TITLE.
+  const title = titleOf(played);
+  if (source && title !== source.mmlTitle) source = null;
   const s = source ?? { title: "Untitled", artist: "Playground" };
-  player.play(played, { title: s.title, artist: s.artist, volume: s.volume ?? 1 });
+  player.play(played, { title: title ?? s.title, artist: s.artist, volume: s.volume ?? 1, file: s.file });
+}
+
+// The song's #TITLE{..}, if it has one (outside comments).
+function titleOf(mml) {
+  const m = mml.replace(/\/\*[\s\S]*?(\*\/|$)|\/\/.*/g, "").match(/#TITLE\s*\{([^}]*)\}/);
+  return m?.[1].trim() || null;
 }
 $("run").onclick = run;
 addEventListener("keydown", (e) => {
@@ -222,9 +279,9 @@ async function pick(e) {
   text.focus();
   text.select();
   if (!document.execCommand("insertText", false, mml)) text.value = mml;
-  source = e;
+  source = { ...e, mmlTitle: titleOf(mml) };
   text.setSelectionRange(0, 0);
-  text.scrollTop = text.scrollLeft = 0;
+  text.scrollTop = 0;
   text.blur();
   render();
   run();
