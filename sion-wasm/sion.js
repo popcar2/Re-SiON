@@ -8,6 +8,8 @@
 //
 //   Seeking: song.skip(frames) jumps ahead (song.position tells where it is); sion.length(mml) gives a song's
 //   length in frames. To go back, make a new song and skip from the start.
+//
+//   Following along: song.notes() gives, per track, the byte offset in the MML of the note it is playing.
 
 export class Sion {
   static async load(source) {
@@ -61,7 +63,7 @@ export class Sion {
 }
 
 export class Song {
-  #s; #h; #out = 0; #frames = 0;
+  #s; #h; #out = 0; #frames = 0; #notes = 0; #cap = 0;
   constructor(sion, handle) { this.#s = sion; this.#h = handle; }
 
   /** Fill `buf` (Float32Array, interleaved L/R) with audio. Returns false once the song has finished. */
@@ -81,6 +83,19 @@ export class Song {
    *  there would give. Returns false once the song has finished. */
   skip(frames) { return this.#s.x.sion_song_skip(this.#h, frames) !== 0; }
 
+  /** Per track, the byte offset in the MML text (as UTF-8) of the note it is playing now, -1 for none. */
+  notes() {
+    const x = this.#s.x;
+    for (;;) {
+      if (!this.#notes) { this.#cap ||= 16; this.#notes = x.sion_alloc(this.#cap * 4) }
+      const n = x.sion_song_notes(this.#h, this.#notes, this.#cap);
+      if (n <= this.#cap) return Array.from(new Int32Array(x.memory.buffer, this.#notes, n));
+      x.sion_dealloc(this.#notes, this.#cap * 4);
+      this.#notes = 0;
+      this.#cap = n;
+    }
+  }
+
   /** Frames played (rendered or skipped) so far. */
   get position() { return this.#s.x.sion_song_position(this.#h); }
 
@@ -97,7 +112,8 @@ export class Song {
   free() {
     const x = this.#s.x;
     if (this.#out) x.sion_dealloc(this.#out, this.#frames * 8);
+    if (this.#notes) x.sion_dealloc(this.#notes, this.#cap * 4);
     x.sion_song_free(this.#h);
-    this.#h = this.#out = this.#frames = 0;
+    this.#h = this.#out = this.#frames = this.#notes = this.#cap = 0;
   }
 }

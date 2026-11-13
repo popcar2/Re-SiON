@@ -1,0 +1,66 @@
+/* Shared by the song list (index.html) and the playground. */
+:root {
+  --bg: #fafaf9; --fg: #1c1b1a; --muted: #8a8780; --line: #e8e6e1; --hover: #f1f0ec;
+  --accent: #2a8fc4; --accent-soft: #e3f1f8;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151514; --fg: #ecebe8; --muted: #7d7a74; --line: #262624; --hover: #1d1d1b;
+          --accent: #7fd4f5; --accent-soft: #182a33; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--fg); }
+body { font: 14px/1.4 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 600px; margin: 0 auto; padding: 48px 16px 150px; }
+
+header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 24px; }
+h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.02em; margin: 0; }
+header span { color: var(--muted); font-size: 13px; }
+header nav { margin-left: auto; display: flex; gap: 2px; }
+header nav a {
+  color: var(--muted); font-size: 13px; text-decoration: none; padding: 4px 10px; border-radius: 6px;
+}
+header nav a:hover { background: var(--hover); color: var(--fg); }
+header nav a[aria-current] { color: var(--fg); background: var(--hover); font-weight: 550; }
+
+footer {
+  position: fixed; left: 0; right: 0; bottom: 0; background: var(--bg); border-top: 1px solid var(--line);
+}
+footer div.bar { max-width: 600px; margin: 0 auto; padding: 10px 16px 14px; }
+footer button[hidden] { display: none; }
+footer div.row { display: flex; align-items: center; gap: 12px; }
+footer div.seek { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+footer .now { flex: 1; min-width: 0; }
+footer .now .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 550; }
+footer .now .a { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+footer time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; min-width: 34px; }
+footer time#pos { text-align: right; }
+
+input[type=range] {
+  --p: 0%; flex: 1; height: 16px; margin: 0; background: transparent; cursor: pointer; -webkit-appearance: none; appearance: none;
+}
+input[type=range]:disabled { cursor: default; }
+input[type=range]::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 2px; background: linear-gradient(var(--accent) 0 0) 0 / var(--p) 100% no-repeat, var(--line);
+}
+input[type=range]::-moz-range-track { height: 4px; border-radius: 2px; background: var(--line); }
+input[type=range]::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--accent); }
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 12px; height: 12px; margin-top: -4px; border: 0; border-radius: 50%;
+  background: var(--accent); transform: scale(0); transition: transform 0.12s;
+}
+input[type=range]::-moz-range-thumb {
+  width: 12px; height: 12px; border: 0; border-radius: 50%; background: var(--accent); transform: scale(0); transition: transform 0.12s;
+}
+input[type=range]:not(:disabled):is(:hover, :active, :focus-visible)::-webkit-slider-thumb { transform: scale(1); }
+input[type=range]:not(:disabled):is(:hover, :active, :focus-visible)::-moz-range-thumb { transform: scale(1); }
+input[type=range]:focus { outline: none; }
+footer button {
+  width: 36px; height: 36px; flex: none; display: grid; place-items: center; padding: 0; cursor: pointer;
+  color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 50%;
+}
+footer button:hover:not(:disabled) { background: var(--hover); }
+footer button:disabled { opacity: 0.35; cursor: default; }
+footer button.main { background: var(--fg); color: var(--bg); border-color: var(--fg); width: 40px; height: 40px; }
+footer button.main:hover:not(:disabled) { background: var(--fg); opacity: 0.85; }
+svg { width: 14px; height: 14px; fill: currentColor; }

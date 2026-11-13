@@ -140,6 +140,20 @@ pub unsafe extern "C" fn sion_song_position(song: *const Song) -> f64 {
     song.as_ref().map_or(0.0, |s| s.position() as f64)
 }
 
+/// Write, for up to `max` tracks, the byte offset in the MML text of the note each is playing now (-1: none)
+/// to `out`, for following playback in the text. Returns the number of tracks (which may be more than `max`).
+///
+/// # Safety
+/// `song` must be a live song and `out` must point to `max` writable ints.
+#[no_mangle]
+pub unsafe extern "C" fn sion_song_notes(song: *const Song, out: *mut i32, max: usize) -> usize {
+    let (Some(song), false) = (song.as_ref(), out.is_null()) else { return 0 };
+    let out = slice::from_raw_parts_mut(out, max);
+    let mut n = 0;
+    for (k, src) in song.notes().enumerate() { if k < max { out[k] = src } n += 1 }
+    n
+}
+
 /// Length in frames of one pass through `len` bytes of MML (until every track ends or loops once), computed
 /// without rendering. 0 if `mml` is 0.
 ///

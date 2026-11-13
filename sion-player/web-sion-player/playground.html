@@ -1,0 +1,234 @@
+<!doctype html>
+<!-- MML playground: write or paste MML and play it, with the notes being played highlighted in the text.
+     Uses the same files as index.html (style.css, player.js, the workers, sion.wasm, songs/). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SiON Playground</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  main { max-width: 960px; padding-bottom: 0; }
+  header { margin-bottom: 16px; }
+
+  .tools { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .tools button {
+    height: 30px; padding: 0 12px; display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+    font: inherit; font-size: 13px; color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 6px;
+  }
+  .tools button:hover { background: var(--hover); }
+  .tools button.go { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+  .tools button.go:hover { opacity: 0.85; }
+  .tools svg { width: 10px; height: 10px; }
+  .tools kbd { color: var(--muted); font: 11px ui-monospace, monospace; }
+  .tools .go kbd { color: inherit; opacity: 0.6; }
+
+  .examples { position: relative; }
+  .menu {
+    position: absolute; z-index: 5; top: calc(100% + 4px); left: 0; width: min(420px, calc(100vw - 32px));
+    max-height: 60vh; overflow: auto; padding: 4px; margin: 0; list-style: none;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 6px 24px rgb(0 0 0 / 0.12);
+  }
+  .menu[hidden] { display: none; }
+  .menu button {
+    width: 100%; height: auto; display: flex; gap: 8px; align-items: baseline; padding: 7px 10px; border: 0; border-radius: 6px;
+    text-align: left; white-space: nowrap;
+  }
+  .menu button span:first-child { overflow: hidden; text-overflow: ellipsis; }
+  .menu button .a { margin-left: auto; flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
+
+  /* The editor: a textarea with transparent text over a <pre> showing the same text, so the notes being
+     played can be highlighted in it. Both scroll together and never wrap, so their text lines up. */
+  .editor {
+    position: relative; height: calc(100vh - 230px); min-height: 240px;
+    border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--bg);
+  }
+  .editor:focus-within { border-color: var(--muted); }
+  .editor pre, .editor textarea {
+    position: absolute; inset: 0; margin: 0; padding: 12px 14px; border: 0; width: 100%; height: 100%;
+    font: 13px/1.55 ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace; tab-size: 4;
+    white-space: pre; overflow-wrap: normal; letter-spacing: 0;
+  }
+  /* Extra room at the end, so the <pre> (no scrollbars) can scroll as far as the textarea (with them). */
+  .editor pre { overflow: hidden; color: var(--fg); padding-bottom: 40px; padding-right: 40px; pointer-events: none; }
+  .editor textarea {
+    color: transparent; caret-color: var(--fg); background: transparent; resize: none; outline: none; overflow: auto;
+  }
+  .editor textarea::selection { color: transparent; background: var(--accent-soft); }
+  .editor textarea::placeholder { color: var(--muted); }
+  ::highlight(playing) {
+    color: var(--accent); background-color: color-mix(in srgb, var(--accent) 16%, transparent);
+    text-shadow: 0.35px 0 0 var(--accent), -0.35px 0 0 var(--accent);
+  }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>SiON</h1><span>MML playground</span>
+    <nav><a href="./">Songs</a><a href="playground.html" aria-current="page">Playground</a></nav>
+  </header>
+  <div class="tools">
+    <button class="go" id="run" title="Play from the start (Ctrl+Enter)">
+      <svg viewBox="0 0 16 16"><path d="M4 2.5v11L13.5 8z" fill="currentColor"/></svg>Play <kbd>Ctrl+↵</kbd>
+    </button>
+    <div class="examples">
+      <button id="examples" aria-haspopup="menu" aria-expanded="false">Examples
+        <svg viewBox="0 0 16 16"><path d="M3 6l5 5 5-5z" fill="currentColor"/></svg></button>
+      <ul class="menu" id="menu" role="menu" hidden></ul>
+    </div>
+  </div>
+  <div class="editor">
+    <pre id="view" aria-hidden="true"></pre>
+    <textarea id="mml" spellcheck="false" wrap="off" autocomplete="off" autocapitalize="off"
+      aria-label="MML" placeholder="Write or paste MML here, then press play."></textarea>
+  </div>
+</main>
+
+<script type="module">
+import { createPlayer } from "./player.js";
+const $ = (id) => document.getElementById(id);
+const text = $("mml"), view = $("view");
+
+// Short, simple songs from songs/ to read along with.
+const EXAMPLES = [
+  "fukuicat - ZANAC(FDS) _ AREA1,3,6,9.mml",
+  "keim_at_Si - Formant Singing _.mml",
+  "keim_at_Si - In the wind (GRADIUSIII).mml",
+  "pisalod - ポケットモンスター金･銀 26ばんどうろ.mml",
+  "yonatan - Tomaso Albinoni _ Adagio in G minor.mml",
+  "LinearDrive - [FC] BALLOON FIGHT - BALLOON TRIP - (C)Nintendo 1984.mml",
+].map((file) => {
+  const name = file.replace(/\.(sion)?mml$/i, ""), cut = name.indexOf(" - ");
+  return { file, title: name.slice(cut + 3), artist: name.slice(0, cut), volume: 1 };
+});
+// The song list's per-song volumes (see index.html), so examples play as loud as they do there.
+fetch("songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
+  for (const e of EXAMPLES) e.volume = list.find((s) => s.file === e.file)?.volume ?? 1;
+}).catch(() => {});
+
+const STARTER = `// Paste some MML here to play it!
+// Writing it manually is very difficult, but programs like Bosca Ceoil Blue can export SiON-compatible MML.
+// Or, select an example above to see how SiON plays in real time.
+
+// Do Re Mi Fa Sol La Si Do on a pure sine wave (%5@0). $ marks where it loops from.
+
+t100;           // tempo: 100 beats per minute
+%5@0,40,0,0,40  // attack and release speeds (0-63): each note fades in and out quickly to avoid popping
+v10             // volume: 10 out of 16, so it's not too loud
+l4              // note length: quarter notes, unless a note gives its own (r2 is a half-note rest)
+$ o5 c d e f g a b <c r2 c >b a g f e d c r2;  // o5: starts at the 5th octave
+`;
+
+// ---- Editor ----
+// Every visit, reloads included, starts from STARTER.
+// What's in the textarea came from this example (its title and volume carry over until the text is replaced).
+let source = null;
+text.value = STARTER;
+
+function render() {
+  view.textContent = text.value + "\n "; // (a trailing newline only shows in the textarea with something after it)
+  sync();
+}
+function sync() { view.scrollTop = text.scrollTop; view.scrollLeft = text.scrollLeft }
+text.addEventListener("input", () => {
+  if (!text.value) source = null;
+  render();
+  hl?.clear(); // the playing song's offsets no longer match the text
+});
+text.addEventListener("scroll", sync);
+// Tab indents rather than leaving the editor.
+text.addEventListener("keydown", (e) => {
+  if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey) { e.preventDefault(); document.execCommand("insertText", false, "\t") }
+});
+render();
+
+// ---- Highlighting the notes being played ----
+// The player reports UTF-8 byte offsets of the notes playing; `index` turns them into string (UTF-16) indices.
+const hl = globalThis.Highlight && CSS.highlights ? new Highlight() : null;
+if (hl) CSS.highlights.set("playing", hl);
+let played = null, index = null; // the text being played, and its byte → string index map
+const NOTE = /[a-g][+#-]?\s*\d*\s*\.*/y;
+
+function byteIndex(s) {
+  const map = new Int32Array(new TextEncoder().encode(s).length + 1);
+  let b = 0;
+  for (let j = 0; j < s.length; j++) {
+    const c = s.codePointAt(j), n = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    map.fill(j, b, b + n);
+    b += n;
+    if (c >= 0x10000) j++;
+  }
+  map[b] = s.length;
+  return map;
+}
+
+function notes(offsets) {
+  if (!hl) return;
+  hl.clear();
+  if (!offsets.length || text.value !== played || !view.firstChild) return;
+  const node = view.firstChild;
+  for (const o of new Set(offsets)) {
+    const at = index[o];
+    if (at === undefined) continue;
+    NOTE.lastIndex = at;
+    if (!NOTE.exec(played)) continue;
+    const r = new Range();
+    r.setStart(node, at);
+    r.setEnd(node, NOTE.lastIndex);
+    hl.add(r);
+  }
+}
+
+// ---- Player ----
+const player = createPlayer({ idleText: "Playground", idle: run, notes });
+
+function run() {
+  played = text.value;
+  index = byteIndex(played);
+  const s = source ?? { title: "Untitled", artist: "Playground" };
+  player.play(played, { title: s.title, artist: s.artist, volume: s.volume ?? 1 });
+}
+$("run").onclick = run;
+addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); run() }
+});
+
+// ---- Examples ----
+const menu = $("menu"), open = (on) => { menu.hidden = !on; $("examples").setAttribute("aria-expanded", on) };
+for (const e of EXAMPLES) {
+  const li = document.createElement("li"), b = document.createElement("button");
+  b.setAttribute("role", "menuitem");
+  b.innerHTML = `<span></span><span class="a"></span>`;
+  b.firstChild.textContent = e.title;
+  b.lastChild.textContent = e.artist;
+  b.onclick = () => pick(e);
+  li.append(b);
+  menu.append(li);
+}
+$("examples").onclick = (ev) => { ev.stopPropagation(); open(menu.hidden); if (!menu.hidden) menu.querySelector("button").focus() };
+document.addEventListener("click", (ev) => { if (!menu.contains(ev.target)) open(false) });
+menu.addEventListener("keydown", (ev) => {
+  const items = [...menu.querySelectorAll("button")], k = items.indexOf(document.activeElement);
+  if (ev.key === "Escape") { ev.stopPropagation(); open(false); $("examples").focus() }
+  else if (ev.key === "ArrowDown") { ev.preventDefault(); items[(k + 1) % items.length].focus() }
+  else if (ev.key === "ArrowUp") { ev.preventDefault(); items[(k - 1 + items.length) % items.length].focus() }
+});
+
+async function pick(e) {
+  open(false);
+  const mml = await (await fetch("songs/" + encodeURIComponent(e.file), { cache: "no-cache" })).text();
+  // Through insertText, so picking an example can be undone (Ctrl+Z) like any edit.
+  text.focus();
+  text.select();
+  if (!document.execCommand("insertText", false, mml)) text.value = mml;
+  source = e;
+  text.setSelectionRange(0, 0);
+  text.scrollTop = text.scrollLeft = 0;
+  text.blur();
+  render();
+  run();
+}
+</script>
+</body>
+</html>

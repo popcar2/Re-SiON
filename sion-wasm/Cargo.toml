@@ -12,7 +12,7 @@ name = "sion"
 crate-type = ["cdylib"]
 
 [dependencies]
-sion_core = { package = "sion", path = "../sion" }
+sion_core = { package = "sion", path = "../sion", features = ["spans"] }
 
 [profile.release]
 # Smallest size. (The `small` speed-optimised hot paths add ~6 KB and gain nothing measurable under a wasm JIT.)

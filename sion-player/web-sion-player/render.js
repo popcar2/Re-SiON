@@ -1,9 +1,10 @@
 // Worker: owns the sion.wasm instance and renders the current song ahead of playback, so a CPU hiccup eats into
 // the buffer instead of the audio deadline. Chunks go straight to the worklet over a MessagePort.
 //
-// From the page: {port} once (the channel to the worklet), {mml, volume} to play (mml null stops), {seek: frame}.
-// To the worklet: {gen, volume} = drop everything queued and start over; {gen, buf, pos} = a chunk of interleaved
-//   stereo starting at frame pos; {gen, end} = no more chunks for this song.
+// From the page: {port} once (the channel to the worklet), {mml, volume, notes} to play (mml null stops; notes:
+//   send which notes are playing, see below), {seek: frame}.
+// To the worklet: {gen, volume} = drop everything queued and start over; {gen, buf, pos, notes} = a chunk of interleaved
+//   stereo starting at frame pos (notes: byte offsets in the MML of the notes playing at its end, if asked for); {gen, end} = no more chunks for this song.
 // From the worklet: {gen, buf} = that chunk has been played (the buffer comes back to be reused).
 import { Sion } from "./sion.js";
 
@@ -11,7 +12,7 @@ const CHUNK = 1024;   // frames per chunk (8 render quanta)
 const AHEAD = 16384;  // frames kept rendered ahead of playback (~370 ms at 44.1 kHz)
 
 const sion = Sion.load(fetch("sion.wasm"));
-let port, song = null, mml = null, volume = 1, gen = 0, ahead = 0, done = true;
+let port, song = null, mml = null, volume = 1, notes = false, gen = 0, ahead = 0, done = true;
 const spare = [];
 
 function start(text, seekTo = 0) {
@@ -42,7 +43,7 @@ function fill() {
     const buf = spare.pop() ?? new Float32Array(CHUNK * 2);
     const pos = song.position;
     const playing = song.render(buf);
-    port.postMessage({ gen, buf, pos }, [buf.buffer]);
+    port.postMessage({ gen, buf, pos, notes: notes ? song.notes().filter((o) => o >= 0) : undefined }, [buf.buffer]);
     ahead += CHUNK;
     if (!playing) finish();
   }
@@ -59,6 +60,7 @@ onmessage = ({ data }) => {
     };
   } else if ("mml" in data) {
     volume = data.volume ?? 1;
+    notes = !!data.notes;
     start(data.mml);
   } else if ("seek" in data && mml != null) {
     // Songs only play forwards: seeking means starting over (cheap) and skipping ahead from there, or from the

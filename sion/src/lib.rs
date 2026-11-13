@@ -285,6 +285,8 @@ struct Track {
     /// While skipping (see `Song::skip`): frames the channel has yet to be leapt along by, the frame up to
     /// which `res` has counted down, and the first frame the track may have something to do.
     lag: u64, seen: u64, next: u64,
+    /// Byte offset in the source MML of the note playing now (-1: none), from `\x03<offset>` markers (see `spans`).
+    src: i32,
     ch: Chan,
 }
 
@@ -295,7 +297,7 @@ impl Track {
             at: 0.0, koff: INF, kon: INF, q: (sh.quant * 3 / 4) as f64 / sh.quant as f64, qc: 0.0, kd: 0.0,
             oct: 5, len: 480, ns: 0, vel: 256, vsh: sh.vmode.2, x: 128, kt: 0, k: 0, kf: 0.0, note: 0, slur: false, md: 0, tone: 0,
             set: [[None; 5]; 2], xoff: [false; 2], sweep: [0; 2], swe0: 0.0, modt: [None, None], env: [None; 5], menv: None,
-            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 0.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0,
+            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 0.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0, src: -1,
             ch: Chan::new(),
         };
         t.ch.vm = (sh.vmode.0, sh.vmode.1);
@@ -427,7 +429,7 @@ impl Track {
             } else if let (Some(r), true) = (self.rep, self.moved) {
                 (self.i, self.moved, self.once, self.ch.rejoin) = (r, false, true, true);
             } else {
-                (self.end, self.once) = (true, true);
+                (self.end, self.once, self.src) = (true, true, -1);
             }
         }
         if due >= self.kon { self.late = late(self.kon, *bpm); self.kon = INF; self.key_on(sh); self.ch.stale = true }
@@ -501,6 +503,7 @@ impl Track {
                                 Some(b'o') => { j += 1; oct = num(s, &mut j).unwrap_or(5) }
                                 Some(n @ b'a'..=b'g') => break Some(key(*n, s.get(j + 1), oct, self.ns, &sh.sign)),
                                 Some(1) => { j += 1; break num(s, &mut j) }
+                                Some(3) => { j += 1; num(s, &mut j); }
                                 _ => break None,
                             }
                         };
@@ -517,7 +520,12 @@ impl Track {
                 }
                 (self.at, self.moved) = (self.at + d, true);
             }
-            b'r' | b'^' => { (self.at, self.moved) = (self.at + len(s, i, self.len) as f64, true); self.slur &= c != b'r' }
+            b'r' | b'^' => {
+                (self.at, self.moved) = (self.at + len(s, i, self.len) as f64, true);
+                self.slur &= c != b'r';
+                if c == b'r' { self.src = -1 }
+            }
+            3 => self.src = num(s, i).unwrap_or(-1),
             b'l' => self.len = len(s, i, self.len),
             b'{' => *i = find(s, *i, b"}"),
             b'$' if main => (self.rep, self.moved) = (Some(*i), false),
@@ -740,6 +748,23 @@ fn statics(s: &[u8], sh: &Shared) -> Vec<u8> {
     out
 }
 
+/// Put `\x03<offset>` before each note letter in `s`, `at[k]` being where `s[k]` is in the source text, so
+/// tracks can tell which note in the source is playing (`Song::notes`). Multi-character commands (`@f`, `ma`..)
+/// and `{..}` are passed over as `statics` would.
+fn spans(s: &[u8], at: &[usize]) -> Vec<u8> {
+    let (mut out, mut i) = (Vec::with_capacity(s.len() * 2), 0);
+    while i < s.len() {
+        let n = match s[i] {
+            b'{' => find(s, i, b"}") - i,
+            b'a'..=b'g' => { cmd(&mut out, b"\x03", &[at[i] as i32]); 1 }
+            _ => CMD.iter().find(|c| s[i..].starts_with(c.as_bytes())).map_or(1, |c| c.len()),
+        };
+        out.extend(&s[i..i + n]);
+        i += n;
+    }
+    out
+}
+
 /// Replace macro references (`A`, `A(3)` = transposed) with their bodies.
 fn expand(mac: &[Vec<u8>], s: &[u8], deep: u8) -> Vec<u8> {
     let (mut out, mut i) = (vec![], 0);
@@ -843,13 +868,20 @@ impl Song {
     /// `new` for MML as bytes (UTF-8, though only the ASCII in it matters), so no text conversion is needed.
     pub fn from_bytes(src: &[u8]) -> Song {
         // Strip comments.
-        let (mut text, mut i) = (vec![], 0);
+        // (`at`: where each byte of `text` was in `src`, for `spans`.)
+        let (mut text, mut i, mut at) = (vec![], 0, vec![]);
         while i < src.len() {
             if src[i..].starts_with(b"/*") { i = find(src, i + 2, b"*/") }
             else if src[i..].starts_with(b"//") { i = find(src, i, b"\n") }
-            else { text.push(src[i]); i += 1 }
+            else { text.push(src[i]); if cfg!(feature = "spans") { at.push(i) } i += 1 }
         }
         text.push(b';');
+        // Mark the notes in sequences and macro bodies with their place in `src` (with the `spans` feature).
+        let mark = |s: &[u8]| -> Vec<u8> {
+            if !cfg!(feature = "spans") { return s.to_vec() }
+            let base = s.as_ptr() as usize - text.as_ptr() as usize;
+            spans(s, &at[base..])
+        };
 
         let (sine, pan, att) = tables();
         let mut sh = Shared {
@@ -867,13 +899,14 @@ impl Song {
             if brace || text[e] != b';' { continue }
             let s = text[st..e].trim_ascii_start();
             st = e + 1;
-            if s.first() != Some(&b'#') { seqs.push(expand(&mac, s, dynamic as u8)); continue }
+            if s.first() != Some(&b'#') { seqs.push(expand(&mac, &mark(s), dynamic as u8)); continue }
             let n = 1 + s[1..].iter().take_while(|c| c.is_ascii_uppercase() || matches!(c, b'@' | b'-')).count();
             let (name, body) = (&s[1..n], &s[n..]);
             let add = body.starts_with(b"+=");
             if add || body.starts_with(b"=") {
                 // `#A=`, `#ABC=`, `#A-C=`: (re)define or append to macros. Static macros expand at definition.
-                let x = if dynamic { body[1 + add as usize..].to_vec() } else { expand(&mac, &body[1 + add as usize..], 0) };
+                let x = mark(&body[1 + add as usize..]);
+                let x = if dynamic { x } else { expand(&mac, &x, 0) };
                 let mut j = 0;
                 while j < name.len() {
                     let letter = |j: &mut usize| name.get(*j).filter(|c| c.is_ascii_uppercase()).map(|c| { *j += 1; (c - b'A') as usize });
@@ -975,6 +1008,10 @@ impl Song {
         let tracks = seqs.into_iter().map(|s| Track::new(statics(&inline(&s, &mut sh.tables, &mut next), &sh), &sh)).collect();
         Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, pos: 0, base: (0.0, 120.0, 0) }
     }
+
+    /// Per track, the byte offset in the source MML of the note it is playing now (-1: none, resting or ended),
+    /// for following playback in the text. Only with the `spans` feature; otherwise always -1.
+    pub fn notes(&self) -> impl Iterator<Item = i32> + '_ { self.tracks.iter().map(|t| t.src) }
 
     /// Frames played so far (rendered or skipped): the playback position, in `RATE`ths of a second.
     pub fn position(&self) -> u64 { self.pos }

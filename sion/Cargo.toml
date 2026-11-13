@@ -8,3 +8,5 @@ description = "Minimal player for SiON MML music"
 [features]
 # Nightly only: for size-optimised builds (opt-level "z"), keep the per-sample playback code optimised for speed.
 small = []
+# Track which note in the source text each track is playing (`Song::notes`), e.g. to highlight it in an editor.
+spans = []
