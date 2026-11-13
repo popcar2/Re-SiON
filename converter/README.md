@@ -41,7 +41,9 @@ rendered and the master volume (`x`) is lowered until it doesn't.
 Impulse Tracker files (including IT-compressed samples); `src/play.rs` performs the song tick by tick, the way a
 tracker does, and records what each channel sounds like on every tick:
 
-- Rows, speed, tempo (and tempo slides), pattern jumps, breaks, loops and delays; the song ends where it would loop.
+- Rows, speed, tempo (and tempo slides), pattern jumps, breaks, loops and delays. The song ends where it would loop, and the MML loops (`$`) back to there: a jump
+  back to a row already played, or the end of the order list going back to the restart position (XM and MOD; otherwise
+  the first order).
   A quarter note is four rows at the song's starting speed, so a tracker tick is one score tick and timing is exact.
 - Effects: arpeggio, portamento (coarse, fine, extra fine, tone portamento), vibrato, tremolo, tremor, volume,
   channel and global volume slides, panning and pan slides, sample offset, retrigger, note cut and note delay,

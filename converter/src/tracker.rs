@@ -12,6 +12,8 @@ pub struct Module {
     pub chans: usize,
     /// Pattern numbers; `SKIP` entries are passed over and `END` ends the song.
     pub orders: Vec<u16>,
+    /// The order the song goes back to after its last one (XM and MOD restart position; otherwise the first).
+    pub restart: usize,
     pub patterns: Vec<Pattern>,
     /// Indexed by a cell's instrument number - 1.
     pub instruments: Vec<Instrument>,
@@ -268,7 +270,7 @@ fn load_mod(d: &[u8]) -> Result<Module, String> {
     // Amiga hard panning (LRRL), narrowed so it isn't extreme on headphones.
     let pan = (0..chans).map(|c| if matches!(c % 4, 0 | 3) { -40 } else { 40 }).collect();
     Ok(Module {
-        kind: Kind::Mod, chans, orders, patterns, instruments: plain_instruments(31), samples: smp, speed: 6, tempo: 125, gvol: 128,
+        kind: Kind::Mod, chans, restart: (byte(d, 951) as usize).min(127), orders, patterns, instruments: plain_instruments(31), samples: smp, speed: 6, tempo: 125, gvol: 128,
         pan, chvol: vec![64; chans], linear: false, compat_g: false, note_ofs: 0, warnings: vec![],
     })
 }
@@ -389,7 +391,7 @@ fn load_s3m(d: &[u8]) -> Result<Module, String> {
         patterns.push(Pattern { rows: 64, cells });
     }
     Ok(Module {
-        kind: Kind::S3m, chans, orders, patterns, instruments: plain_instruments(insnum), samples, speed: speed.max(1) as u32, tempo: tempo.max(32) as u32,
+        kind: Kind::S3m, chans, restart: 0, orders, patterns, instruments: plain_instruments(insnum), samples, speed: speed.max(1) as u32, tempo: tempo.max(32) as u32,
         gvol: (gv.min(64) as u32) * 2, pan, chvol: vec![64; chans], linear: false, compat_g: false, note_ofs: 0,
         warnings: if adlib { vec!["AdLib (FM) instruments in S3M files are not converted".into()] } else { vec![] },
     })
@@ -407,7 +409,7 @@ fn xm_env(d: &[u8], pts: usize, n: u8, sus: u8, ls: u8, le: u8, flags: u8, pan: 
 fn load_xm(d: &[u8]) -> Result<Module, String> {
     let h = 60;
     let hsize = u32le(d, h) as usize;
-    let (songlen, _restart, chans, npat, nins, flags, speed, tempo) =
+    let (songlen, restart, chans, npat, nins, flags, speed, tempo) =
         (u16le(d, h + 4) as usize, u16le(d, h + 6), u16le(d, h + 8) as usize, u16le(d, h + 10) as usize, u16le(d, h + 12) as usize, u16le(d, h + 14), u16le(d, h + 16), u16le(d, h + 18));
     if chans == 0 || chans > 64 { return Err("bad XM channel count".into()) }
     let orders: Vec<u16> = (0..songlen.min(256)).map(|i| byte(d, h + 20 + i) as u16).collect();
@@ -503,7 +505,7 @@ fn load_xm(d: &[u8]) -> Result<Module, String> {
         instruments.push(ins);
     }
     Ok(Module {
-        kind: Kind::Xm, chans, orders, patterns, instruments, samples, speed: speed.max(1) as u32, tempo: tempo.max(32) as u32, gvol: 128,
+        kind: Kind::Xm, chans, restart: restart as usize, orders, patterns, instruments, samples, speed: speed.max(1) as u32, tempo: tempo.max(32) as u32, gvol: 128,
         pan: vec![0; chans], chvol: vec![64; chans], linear: flags & 1 != 0, compat_g: false, note_ofs: 0, warnings: vec![],
     })
 }
@@ -662,7 +664,7 @@ fn load_it(d: &[u8]) -> Result<Module, String> {
     // Disabled channels (pan + 128) are silent.
     let chvol = (0..chans).map(|c| if byte(d, 0x40 + c) >= 128 { 0 } else { byte(d, 0x80 + c).min(64) }).collect();
     Ok(Module {
-        kind: Kind::It, chans, orders, patterns, instruments, samples, speed: speed.max(1) as u32, tempo: tempo.max(31) as u32, gvol: gv.min(128) as u32,
+        kind: Kind::It, chans, restart: 0, orders, patterns, instruments, samples, speed: speed.max(1) as u32, tempo: tempo.max(31) as u32, gvol: gv.min(128) as u32,
         pan, chvol, linear: flags & 8 != 0, compat_g: flags & 32 != 0, note_ofs: -12, warnings: vec![],
     })
 }

@@ -215,6 +215,13 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
         if tm.last().is_some_and(|l| l.0 == t) { tm.pop(); }
         if tm.last().is_none_or(|l| l.1 != bpm) && t < song_end { tm.push((t, bpm)) }
     }
+    // A looping song goes back to the tempo it had at the loop point, not the one it ended with: restate it there.
+    let tm_lp = sc.lp.map(map).filter(|&l| l < song_end.max(map(sc.end)));
+    if let (Some(l), Some(&(_, last))) = (tm_lp, tm.last()) {
+        let i = tm.partition_point(|e| e.0 <= l);
+        let at = tm[i - 1].1;
+        if at != last && tm[i - 1].0 != l { tm.insert(i, (l, at)) }
+    }
     let unit = [1.0, 10.0, 100.0, 1000.0].into_iter()
         .find(|u| tm.iter().all(|&(_, b)| ((b * u).round() / u - b).abs() / b < 1e-5)).unwrap_or(1000.0);
     let mut header = vec![];
@@ -225,7 +232,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     if x < 128 { for t in &mut tracks { t.x = Some(x) } }
     for (t, bpm) in tm {
         let val = (bpm * unit).round() as i64;
-        if t == 0 && val as f64 == 120.0 * unit { continue }
+        if t == 0 && val as f64 == 120.0 * unit && tm_lp != Some(0) { continue }
         let spot = |tr: &Track| {
             let i = tr.notes.partition_point(|n| n.start <= t);
             match i.checked_sub(1).map(|j| &tr.notes[j]) {
@@ -297,7 +304,15 @@ pub fn tokens(tr: &Track, gate: bool, lens: &Lengths) -> Vec<Tok> {
     // Rest until `until`, putting the loop point on the way.
     macro_rules! advance { ($until:expr) => {{
         let until = $until;
-        if let Some(l) = tr.lp.filter(|&l| mark.is_none() && l >= t && l <= until) { rest_to(&mut out, &mut t, l, &mut tempo); loop_point!() }
+        if let Some(l) = tr.lp.filter(|&l| mark.is_none() && l >= t && l <= until) {
+            // (A tempo change at the loop point goes after the `$`, so going back plays it again.)
+            while let Some((tt, s)) = tempo.next_if(|x| x.0 < l) {
+                if *tt > t { out.push(Tok::Rest((*tt - t) as u32)); t = *tt }
+                out.push(Tok::Cmd(s.clone()));
+            }
+            if l > t { out.push(Tok::Rest((l - t) as u32)); t = l }
+            loop_point!()
+        }
         rest_to(&mut out, &mut t, until, &mut tempo);
     }} }
     for n in &tr.notes {

@@ -8,13 +8,13 @@
 <title>SiON Player</title>
 <style>
   :root {
-    --bg: #fafaf9; --fg: #1c1b1a; --muted: #8a8780; --line: #e8e6e1; --hover: #f1f0ec;
-    --accent: #e0562b; --accent-soft: #fbe9e2;
+    --bg: #f4f9fc; --fg: #142430; --muted: #7890a0; --line: #dbe7ef; --hover: #e8f2f8;
+    --accent: #2a8fc4; --accent-soft: #dcf0fa;
     color-scheme: light dark;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #151514; --fg: #ecebe8; --muted: #7d7a74; --line: #262624; --hover: #1d1d1b;
-            --accent: #ff7a4d; --accent-soft: #2b1d17; }
+    :root { --bg: #0d1620; --fg: #e4f1f8; --muted: #6f8798; --line: #1c2a36; --hover: #14212d;
+            --accent: #7fd4f5; --accent-soft: #15303f; }
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--fg); }
@@ -126,7 +126,8 @@ const $ = (id) => document.getElementById(id);
 
 // songs.json: [{file, volume}], written by the desktop player's build (build.rs), which measures each song
 // to find the volume that brings it to a common loudness.
-const files = await (await fetch("songs.json")).json();
+// (no-cache: revalidate with the server, so a song added or reconverted shows up without a hard refresh.)
+const files = await (await fetch("songs.json", { cache: "no-cache" })).json();
 const songs = files.map(({ file, volume = 1 }, i) => {
   const name = file.replace(/\.(sion)?mml$/i, "");
   const cut = name.indexOf(" - ");
@@ -134,7 +135,6 @@ const songs = files.map(({ file, volume = 1 }, i) => {
                  : { i, file, volume, artist: name.slice(0, cut), title: name.slice(cut + 3) };
 });
 $("count").textContent = `${songs.length} songs`;
-const wasm = fetch("sion.wasm").then((r) => r.arrayBuffer());
 
 // ---- Song list ----
 const rows = songs.map((s) => {
@@ -161,6 +161,8 @@ $("q").oninput = () => {
 // ---- Audio ----
 const RATE = 44100;
 let ctx, node, current = -1, ready;
+// Songs are rendered ahead in a worker (render.js) and handed to the audio worklet, which only copies samples.
+const renderer = new Worker("render.js", { type: "module" });
 let pos = 0, dur = 0, loop = -1, dragging = false; // in frames; dur = 0 until measured, loop = -1 unless it loops
 
 // Song lengths are measured in a worker, so neither the page nor the audio thread stalls.
@@ -174,15 +176,14 @@ lengths.onmessage = ({ data }) => {
 
 function audio() {
   return ready ??= (async () => {
-    ctx = new AudioContext({ sampleRate: RATE });
+    // "playback": nothing here is live, so let the browser use its larger, more glitch-proof output buffer.
+    ctx = new AudioContext({ sampleRate: RATE, latencyHint: "playback" });
     await ctx.audioWorklet.addModule("worklet.js");
     node = new AudioWorkletNode(ctx, "sion", { numberOfInputs: 0, outputChannelCount: [2] });
     node.connect(ctx.destination);
-    const bytes = await wasm;
-    await new Promise((ok) => {
-      node.port.onmessage = ({ data }) => data.ready && ok();
-      node.port.postMessage({ wasm: bytes }, [bytes]);
-    });
+    const { port1, port2 } = new MessageChannel();
+    node.port.postMessage({ port: port1 }, [port1]);
+    renderer.postMessage({ port: port2 }, [port2]);
     node.port.onmessage = ({ data }) => {
       if ("pos" in data) { pos = data.pos; showTime() }
       if (data.ended) current + 1 < songs.length ? play(current + 1) : stop();
@@ -196,9 +197,9 @@ async function play(i) {
   pos = dur = 0;
   loop = -1;
   show();
-  const [mml] = await Promise.all([fetch("songs/" + encodeURIComponent(s.file)).then((r) => r.text()), audio()]);
+  const [mml] = await Promise.all([fetch("songs/" + encodeURIComponent(s.file), { cache: "no-cache" }).then((r) => r.text()), audio()]);
   if (current !== i) return; // another song was picked while this one loaded
-  node.port.postMessage({ mml, volume: s.volume });
+  renderer.postMessage({ mml, volume: s.volume });
   lengths.postMessage({ id: i, mml });
   await ctx.resume();
   show();
@@ -206,7 +207,7 @@ async function play(i) {
 }
 
 function stop() {
-  node?.port.postMessage({ mml: null });
+  renderer.postMessage({ mml: null });
   current = -1;
   pos = dur = 0;
   loop = -1;
@@ -216,7 +217,7 @@ function stop() {
 function seek(frame) {
   if (current < 0 || !node) return;
   pos = Math.max(0, dur ? Math.min(frame, dur) : frame);
-  node.port.postMessage({ seek: pos });
+  renderer.postMessage({ seek: pos });
   showTime();
 }
 

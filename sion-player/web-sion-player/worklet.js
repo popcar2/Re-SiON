@@ -1,66 +1,47 @@
-// Audio thread: owns the sion.wasm instance and renders the current song into the output.
-// Messages in: {wasm} once, {mml, volume} to play (mml null stops), {seek: frame}. Out: {ready}, {pos: frame}, {ended}.
-import { Sion } from "./sion.js";
-
-// Some browsers (Chrome) have no TextEncoder in AudioWorkletGlobalScope; sion.js only needs encode().
-globalThis.TextEncoder ??= class {
-  encode(s) {
-    const out = [];
-    for (const ch of s) {
-      const c = ch.codePointAt(0);
-      if (c < 0x80) out.push(c);
-      else if (c < 0x800) out.push(0xc0 | c >> 6, 0x80 | c & 63);
-      else if (c < 0x10000) out.push(0xe0 | c >> 12, 0x80 | c >> 6 & 63, 0x80 | c & 63);
-      else out.push(0xf0 | c >> 18, 0x80 | c >> 12 & 63, 0x80 | c >> 6 & 63, 0x80 | c & 63);
-    }
-    return new Uint8Array(out);
-  }
-};
+// Audio thread: plays chunks that render.js has already rendered, so all it does per callback is copy samples.
+// Messages in (node.port): {port} once, the channel to render.js (see there for what travels on it).
+// Out (node.port): {pos: frame} now and then, {ended} once a song has played out.
 
 class SionProcessor extends AudioWorkletProcessor {
-  sion = null; song = null; mml = null; volume = 1; buf = new Float32Array(256); tick = 0;
+  gen = -1; volume = 1; queue = []; at = 0; end = false; tick = 0; pos = -1;
 
   constructor() {
     super();
-    this.port.onmessage = async ({ data }) => {
-      if (data.wasm) {
-        this.sion = await Sion.load(data.wasm);
-        this.port.postMessage({ ready: true });
-      } else if ("mml" in data) {
-        this.load(data.mml);
-        this.volume = data.volume ?? 1;
-      } else if ("seek" in data && this.song) {
-        // Songs only play forwards: going back means starting over and skipping ahead from the beginning.
-        if (data.seek < this.song.position) this.load(this.mml);
-        if (!this.song.skip(Math.max(0, Math.round(data.seek - this.song.position)))) this.end();
-        this.report();
-      }
+    this.port.onmessage = ({ data }) => {
+      this.feed = data.port;
+      this.feed.onmessage = ({ data: m }) => {
+        if (m.buf) { if (m.gen === this.gen) this.queue.push(m); else this.recycle(m); }
+        else if (m.end) { if (m.gen === this.gen) this.end = true; }
+        else {
+          for (const c of this.queue) this.recycle(c);
+          this.queue = []; this.at = 0; this.end = false;
+          this.gen = m.gen; this.volume = m.volume; this.pos = -1;
+        }
+      };
     };
   }
 
-  load(mml) {
-    this.song?.free();
-    this.mml = mml;
-    this.song = mml == null ? null : this.sion.song(mml);
-  }
-
-  end() {
-    this.load(null);
-    this.port.postMessage({ ended: true });
-  }
-
-  report() { if (this.song) this.port.postMessage({ pos: this.song.position }); }
+  recycle(c) { this.feed.postMessage({ gen: c.gen, buf: c.buf }, [c.buf.buffer]); }
 
   process(_inputs, [[l, r]]) {
-    if (!this.song) return true;
-    const n = l.length;
-    if (this.buf.length < n * 2) this.buf = new Float32Array(n * 2);
-    const b = this.buf.subarray(0, n * 2);
-    const playing = this.song.render(b);
-    const v = this.volume;
-    for (let i = 0; i < n; i++) { l[i] = b[2 * i] * v; r[i] = b[2 * i + 1] * v; }
-    if (++this.tick % 16 === 0) this.report();
-    if (!playing) this.end();
+    const n = l.length, v = this.volume;
+    let i = 0;
+    while (i < n && this.queue.length) {
+      const c = this.queue[0], b = c.buf, frames = b.length >> 1;
+      const take = Math.min(n - i, frames - this.at);
+      for (let k = 0, j = this.at * 2; k < take; k++, j += 2) { l[i + k] = b[j] * v; r[i + k] = b[j + 1] * v; }
+      i += take;
+      this.at += take;
+      this.pos = c.pos + this.at;
+      if (this.at === frames) { this.recycle(this.queue.shift()); this.at = 0; }
+    }
+    // Underrun (or nothing playing): the output buffers start zeroed, so the rest is silence.
+    if (this.pos >= 0 && ++this.tick % 16 === 0) this.port.postMessage({ pos: this.pos });
+    if (this.end && !this.queue.length) {
+      this.end = false;
+      this.pos = -1;
+      this.port.postMessage({ ended: true });
+    }
     return true;
   }
 }

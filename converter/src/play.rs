@@ -493,7 +493,9 @@ pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
     let ppq = 4 * if (2..=12).contains(&p.speed) { p.speed } else { 6 };
     let mut tempos: Vec<(u64, f64)> = vec![];
     let (mut ord, mut row, mut tick) = (0usize, 0usize, 0u64);
-    let mut seen = std::collections::HashSet::new();
+    // The tick each (order, row) was first played at: going back to one is the song looping, to there.
+    let mut seen = std::collections::HashMap::new();
+    let mut lp = None;
     let limit = 30 * 60 * 255 * 2 / 5;
     let mut warnings = vec![];
     if full > 0 { warnings.push(format!("{full} samples past SiON's 256 PCM slots are approximated with wavetables or noise")) }
@@ -503,10 +505,19 @@ pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
             if m.orders[ord] == END { break }
             ord += 1;
         }
-        if ord >= m.orders.len() || m.orders[ord] == END { break }
+        if ord >= m.orders.len() || m.orders[ord] == END {
+            // Past the last order the tracker goes back to the restart position.
+            let mut o = if m.restart < ord { m.restart } else { 0 };
+            while o < ord && (m.orders[o] == SKIP || m.orders[o] as usize >= m.patterns.len()) { o += 1 }
+            lp = seen.get(&(o, 0)).copied();
+            break
+        }
         let pat = &m.patterns[m.orders[ord] as usize];
         if row >= pat.rows { row = 0; ord += 1; continue }
-        if !p.ch.iter().any(|c| c.loop_n > 0) && !seen.insert((ord, row)) { break }
+        if !p.ch.iter().any(|c| c.loop_n > 0) {
+            if let Some(&t) = seen.get(&(ord, row)) { lp = Some(t); break }
+            seen.insert((ord, row), tick);
+        }
         let cells: Vec<Cell> = (0..m.chans).map(|c| pat.cells.get(row * m.chans + c).copied().unwrap_or_default()).collect();
         let (mut jump, mut delay, mut fine) = (None, 0u32, 0u32);
         for (c, cell) in cells.iter().enumerate() {
@@ -574,7 +585,7 @@ pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
             }
             Some((o, r)) => {
                 let next = o.unwrap_or(ord + 1);
-                if next <= ord && o.is_some() && seen.contains(&(next, r.unwrap_or(0))) { break }
+                if next <= ord && o.is_some() { if let Some(&t) = seen.get(&(next, r.unwrap_or(0))) { lp = Some(t); break } }
                 (ord, row) = (next, r.unwrap_or(0));
                 for c in &mut p.ch { c.loop_row = 0 }
             }
@@ -584,5 +595,5 @@ pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
     let mut notes = st.notes(0, if wavetables { 2 } else { 1 });
     notes.retain(|n| n.end > n.start);
     warnings.extend(m.warnings.iter().cloned());
-    (Score { ppq, tempos, header: defs.header(), notes, mix: vec![], end: tick, lp: None, fine: !wavetables, db: false, kmilli: !wavetables }, warnings, tr)
+    (Score { ppq, tempos, header: defs.header(), notes, mix: vec![], end: tick, lp, fine: !wavetables, db: false, kmilli: !wavetables }, warnings, tr)
 }

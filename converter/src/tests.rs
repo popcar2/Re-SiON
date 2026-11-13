@@ -37,7 +37,7 @@ fn noise8(n: usize, decay: f32) -> Vec<f32> {
 fn module(kind: Kind, linear: bool, samples: Vec<Sample>, instruments: Vec<Instrument>, chans: usize, rows: Vec<Vec<Cell>>) -> Module {
     let cells = rows.iter().flat_map(|r| (0..chans).map(|c| r.get(c).copied().unwrap_or_default())).collect();
     Module {
-        kind, chans, orders: vec![0], patterns: vec![Pattern { rows: rows.len(), cells }], instruments, samples, speed: 6, tempo: 125, gvol: 128,
+        kind, chans, orders: vec![0], restart: 0, patterns: vec![Pattern { rows: rows.len(), cells }], instruments, samples, speed: 6, tempo: 125, gvol: 128,
         pan: vec![-32, 32, 0, 16][..chans].to_vec(), chvol: vec![64; chans], linear, compat_g: false, note_ofs: 0, warnings: vec![],
     }
 }
