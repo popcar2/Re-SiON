@@ -25,6 +25,8 @@ pub enum Msg {
     Bend { ch: u8, val: i32 },
     /// Microseconds per quarter note.
     Tempo(u32),
+    /// Time signature: beats per bar, and the beat as a power of two (2: quarter notes).
+    TimeSig(u8, u8),
 }
 
 fn be(b: &[u8]) -> usize { b.iter().fold(0, |a, &x| a << 8 | x as usize) }
@@ -82,7 +84,11 @@ fn track(b: &[u8], trk: usize, out: &mut Vec<(u64, usize, usize, Msg)>) {
                 let Some(data) = b.get(i..i + len) else { break };
                 i += len;
                 if ty == 0x2F { break }
-                if ty == 0x51 && len == 3 { Some(Msg::Tempo(be(data) as u32)) } else { None }
+                match (ty, len) {
+                    (0x51, 3) => Some(Msg::Tempo(be(data) as u32)),
+                    (0x58, 4..) => Some(Msg::TimeSig(data[0], data[1])),
+                    _ => None,
+                }
             }
             0xF0 | 0xF7 => {
                 let Some(len) = var(&mut i) else { break };
@@ -181,7 +187,7 @@ pub fn to_score(smf: &Smf) -> Score {
     let mut chs: Vec<Ch> = (0..16).map(|_| Ch {
         prog: 0, vol: 100.0 / 127.0, expr: 1.0, pan: 64, pedal: false, range: 2.0, rpn: (127, 127), on: vec![None; 128], held: vec![false; 128],
     }).collect();
-    let (mut raw, mut bends, mut tempos) = (vec![], vec![vec![]; 16], vec![]);
+    let (mut raw, mut bends, mut tempos, mut bars) = (vec![], vec![vec![]; 16], vec![], vec![]);
     fn close(c: &mut Ch, ch: u8, key: u8, end: u64, raw: &mut Vec<Raw>) {
         if let Some((start, amp, prog, pan)) = c.on[key as usize].take() { raw.push(Raw { ch, key, start, end, amp, prog, pan }) }
         c.held[key as usize] = false;
@@ -227,6 +233,14 @@ pub fn to_score(smf: &Smf) -> Score {
                 bends[ch as usize].push((t, (val as f32 / 8192.0 * r * 64.0).round() as i32));
             }
             Msg::Tempo(us) => tempos.push((t, 6e7 / us.max(1) as f64)),
+            Msg::TimeSig(n, d) => {
+                // (A change takes effect at the next bar line, where a well-formed file puts it.)
+                let len = (smf.ppq as u64 * 4 * n.max(1) as u64) >> d.min(6);
+                if bars.last().is_none_or(|b: &(u64, u64)| b.1 != len) {
+                    if bars.last().is_some_and(|b: &(u64, u64)| b.0 == t) { bars.pop(); }
+                    bars.push((t, len));
+                }
+            }
         }
     }
     let last = smf.events.last().map_or(0, |e| e.tick);
@@ -257,5 +271,12 @@ pub fn to_score(smf: &Smf) -> Score {
     }
     let header = DRUM_TABLES.iter().enumerate().filter(|(i, _)| tables[*i]).map(|(i, t)| format!("#TABLE{i}{{{t}}}")).collect();
     let mix = raw.iter().map(|n| (n.start, n.end, n.amp)).collect();
-    Score { ppq: smf.ppq, tempos, header, notes, mix, end: 0, lp: None, fine: false, db: false, kmilli: false }
+    let mut names = vec![String::new(); 16 * 16];
+    for c in 0..16 { names[16 * c] = format!("channel {}", c + 1) }
+    for (g, n) in ["kick", "snare", "hi-hat", "cymbals", "toms", "percussion", "snare body"].iter().enumerate() {
+        names[16 * DRUMS as usize + g] = format!("drums: {n}");
+    }
+    let mut sc = Score { ppq: smf.ppq, tempos, header, notes, mix, end: 0, lp: None, fine: false, db: false, kmilli: false, names, ..Score::default() };
+    sc.set_bars(&bars);
+    sc
 }

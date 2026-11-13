@@ -1,5 +1,5 @@
 //! End-to-end checks of the non-MIDI readers on small files built here: the right notes come out, and the
-//! minified MML sounds identical to the plain one.
+//! written MML sounds identical to the plain one.
 
 use sion_converter::{convert, Options};
 
@@ -19,7 +19,7 @@ fn check(data: &[u8]) -> sion_converter::Converted { check_with(data, &Options::
 
 fn check_with(data: &[u8], opt: &Options) -> sion_converter::Converted {
     let out = convert(data, opt).unwrap();
-    assert_eq!(render(&out.plain, 60), render(&out.mml, 60), "minified MML must sound like the plain conversion");
+    assert_eq!(render(&out.plain, 60), render(&out.mml, 60), "written MML must sound like the plain conversion");
     out
 }
 
@@ -149,7 +149,7 @@ fn protracker() -> Vec<u8> {
 fn mod_square_wave() {
     let opt = Options { wavetables: true, ..Options::default() };
     let out = convert(&protracker(), &opt).unwrap();
-    assert_eq!(render(&out.plain, 60), render(&out.mml, 60), "minified MML must sound like the plain conversion");
+    assert_eq!(render(&out.plain, 60), render(&out.mml, 60), "written MML must sound like the plain conversion");
     // A 32-frame cycle played at 3546895 / 428 Hz is 259 Hz: just under middle C.
     assert!(out.plain.contains("#WAV0{"), "the looped sample becomes a wavetable");
     assert_eq!(notes(&out.plain, 0), ["5c", "5e", "5g", "6c"]);
@@ -157,13 +157,60 @@ fn mod_square_wave() {
 
 #[test]
 fn mod_sample_plays_as_pcm() {
-    let out = check(&protracker());
+    let out = check_with(&protracker(), &Options { exact: true, ..Options::default() });
     assert!(out.plain.contains("#PCMB0{") && out.plain.contains("%7@0"), "the sample is embedded and played with %7");
     let track = out.plain.split(";\n").find(|t| t.contains("%7")).unwrap();
     assert!(track.contains("o5c2o5e2o5g2o6c2&v0o6c92r"), "C-2 E-2 G-2 C-3, then off a tick after C00: {track}");
     let want = sion_converter::reference(&protracker()).unwrap();
     let db = sion_converter::snr(&want, &render(&out.mml, 60));
     assert!(db > 50.0, "conversion differs from the tracker mix: {db:.1} dB");
+}
+
+#[test]
+fn mod_written_as_by_hand() {
+    // By default a module is laid out by its patterns: a comment per track, a single-cycle loop as a wavetable,
+    // and the notes as written (C-2 E-2 G-2 C-3, half notes, then silence from the C00).
+    let out = check(&protracker());
+    println!("{}\n{}", out.mml, out.plain);
+    assert!(out.mml.contains("// Track 1, channel 1") && out.mml.contains("#WAV0{"), "{}", out.mml);
+    assert!(out.mml.contains("o5c e g <c"), "{}", out.mml);
+}
+
+/// A format 0 MIDI file at 96 ticks per quarter: (delta ticks, event bytes).
+fn smf(events: &[(u32, &[u8])]) -> Vec<u8> {
+    let mut trk = vec![];
+    for &(dt, ev) in events.iter().chain(&[(0, &[0xff, 0x2f, 0][..])]) {
+        let mut v = vec![(dt & 0x7f) as u8];
+        let mut d = dt >> 7;
+        while d > 0 { v.insert(0, (d & 0x7f) as u8 | 0x80); d >>= 7 }
+        trk.extend(v);
+        trk.extend_from_slice(ev);
+    }
+    let mut f = b"MThd\0\0\0\x06\0\0\0\x01\0\x60MTrk".to_vec();
+    f.extend((trk.len() as u32).to_be_bytes());
+    f.extend(trk);
+    f
+}
+
+#[test]
+fn midi_written_by_bars() {
+    // 3/4: a bar of three quarter notes, then a note held for two bars; a swept kick (pitch table) and a snare
+    // (keyed off at once) each held across bar lines until the next hit.
+    let q = 96;
+    let out = check(&smf(&[
+        (0, &[0xff, 0x58, 4, 3, 2, 24, 8]),
+        (0, &[0x90, 60, 100]), (0, &[0x99, 36, 100]), (q, &[0x80, 60, 0]),
+        (0, &[0x90, 62, 100]), (0, &[0x99, 38, 100]), (q, &[0x80, 62, 0]),
+        (0, &[0x90, 64, 100]), (q, &[0x80, 64, 0]),
+        (0, &[0x90, 65, 100]), (6 * q, &[0x80, 65, 0]),
+        (0, &[0x99, 36, 100]), (0, &[0x99, 38, 100]), (q, &[0x89, 36, 0]),
+    ]));
+    println!("{}\n{}", out.mml, out.plain);
+    // One line per 3/4 bar: the held note slurred across the bar lines.
+    assert!(out.mml.contains("// Track 1, channel 1\n") && out.mml.contains("// Track 2, drums: kick"), "{}", out.mml);
+    assert!(out.mml.contains("\no5c d e\no5f2.&\no5f2.;"), "{}", out.mml);
+    // The drum hits aren't cut at the bar lines: their lines run on to the next hit.
+    assert!(out.mml.contains("np0\no4a1^1^4\no4a;") && out.mml.contains("\nr o6c1^1\no6c;"), "{}", out.mml);
 }
 
 /// Signal-to-difference (dB) of SiON's left channel against `want` (mono, in VGM time), up to overall level.
@@ -199,7 +246,7 @@ fn block(ty: u8, body: &[u8]) -> Vec<u8> { let mut b = vec![0x67, 0x66, ty]; b.e
 
 fn wait(b: &mut Vec<u8>, n: u16) { b.extend([0x61, n as u8, (n >> 8) as u8]) }
 
-const EXACT: Options = Options { grid: None, gain: None, wavetables: false, exact_pcm: true, track: None };
+const EXACT: Options = Options { grid: None, gain: None, wavetables: false, exact: false, exact_pcm: true, track: None };
 
 /// Convert both ways: (default, `--exact-pcm`).
 fn both(data: &[u8]) -> (sion_converter::Converted, sion_converter::Converted) { (check(data), check_with(data, &EXACT)) }
@@ -464,7 +511,7 @@ fn vgm_loop_point() {
     let out = convert(&data, &Options::default()).unwrap();
     assert!((out.loop_secs.unwrap() - 0.4).abs() < 1e-6 && (out.secs - 0.6).abs() < 1e-6, "{} {:?}", out.secs, out.loop_secs);
     let (plain, mml) = (render(&out.plain, 2), render(&out.mml, 2));
-    assert_eq!(plain, mml, "minified MML must sound like the plain conversion, across the loop too");
+    assert_eq!(plain, mml, "written MML must sound like the plain conversion, across the loop too");
     assert!(plain.len() >= sion::RATE as usize * 2 * 2, "a looping song plays on");
     // The second time round sounds like the first, volumes included. (Except for the held E: the first time it
     // carries on slurred from before the loop point, the second time it starts afresh, so its waveform's phase
@@ -550,7 +597,7 @@ fn nsf_loops_where_its_state_repeats() {
     let lp = out.loop_secs.expect("a loop");
     assert!((lp - 60.0 * 16639e-6).abs() < 0.01, "the loop is the 60 frames: {lp}");
     let (plain, mml) = (render(&out.plain, 3), render(&out.mml, 3));
-    assert_eq!(plain, mml, "minified MML must sound like the plain conversion, across the loop too");
+    assert_eq!(plain, mml, "written MML must sound like the plain conversion, across the loop too");
 }
 
 #[test]
@@ -662,4 +709,75 @@ fn nsfe_chunks_and_tracks() {
     let second = convert(&f, &Options { track: Some(2), ..Options::default() }).unwrap();
     assert!(second.warnings.iter().any(|w| w.contains("track 2 of 2 (Second)")));
     assert!(convert(&f, &Options { track: Some(3), ..Options::default() }).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// SPC: a small sound driver, hand-assembled, that the converter runs on its SPC700.
+
+/// An SPC snapshot: `prog` at $0200 (where the CPU starts), with `data` placed at the given addresses.
+fn spc(prog: &[u8], data: &[(usize, &[u8])]) -> Vec<u8> {
+    let mut f = vec![0u8; 0x10200];
+    f[..33].copy_from_slice(b"SNES-SPC700 Sound File Data v0.30");
+    (f[0x21], f[0x22], f[0x23], f[0x24]) = (26, 26, 27, 30);
+    (f[0x25], f[0x26], f[0x2a], f[0x2b]) = (0x00, 0x02, 0x02, 0xef);
+    let ram = &mut f[0x100..0x10100];
+    ram[0x200..0x200 + prog.len()].copy_from_slice(prog);
+    for &(at, d) in data { ram[at..at + d.len()].copy_from_slice(d) }
+    f
+}
+
+/// A driver that keys on the C major scale on voice 0, a note every 25 ticks of timer 0 (100 Hz), and starts
+/// over after the fifth: its state comes round every 1.25 s. The sample is a looping 1 kHz square (32 frames at
+/// 32 kHz, two BRR blocks).
+fn spc_scale() -> Vec<u8> {
+    let dsp = |r: u8, v: u8| [0x8f, r, 0xf2, 0x8f, v, 0xf3]; // MOV $F2,#r; MOV $F3,#v
+    let mut p = vec![];
+    for (r, v) in [(0x5d, 0x03), (0x0c, 127), (0x1c, 127), (0x6c, 0x20), (0x00, 100), (0x01, 100), (0x04, 0), (0x05, 0x8f), (0x06, 0xe0)] { p.extend(dsp(r, v)) }
+    p.extend([0x8f, 0x50, 0xfa, 0x8f, 0x01, 0xf1, 0x8f, 0x00, 0x00, 0x8f, 0x00, 0x01]); // timer 0 at 100 Hz; $00 = $01 = 0
+    let lp = 0x200 + p.len() as u16;
+    p.extend([0xeb, 0xfd, 0xf0, 0xfc]); // loop: MOV Y,$FD; BEQ loop
+    p.extend([0xab, 0x01, 0xe4, 0x01, 0x68, 25]); // INC $01; MOV A,$01; CMP A,#25
+    let bne = p.len();
+    p.extend([0xd0, 0x00]); // BNE loop
+    p.extend([0x8f, 0x00, 0x01, 0xf8, 0x00]); // MOV $01,#0; MOV X,$00
+    p.extend([0xf5, 0x00, 0x04, 0x8f, 0x02, 0xf2, 0xc4, 0xf3]); // MOV A,$0400+X; MOV $F2,#2; MOV $F3,A
+    p.extend([0xf5, 0x08, 0x04, 0x8f, 0x03, 0xf2, 0xc4, 0xf3]); // MOV A,$0408+X; MOV $F2,#3; MOV $F3,A
+    p.extend(dsp(0x4c, 0x01)); // KON voice 0
+    p.extend([0x3d, 0xc8, 0x05, 0xd0, 0x02, 0xcd, 0x00, 0xd8, 0x00]); // INC X; CMP X,#5; BNE +2; MOV X,#0; MOV $00,X
+    let bra = p.len();
+    p.extend([0x2f, 0x00]); // BRA loop
+    let rel = |from: usize| (lp as i32 - (0x200 + from as i32 + 2)) as i8 as u8;
+    (p[bne + 1], p[bra + 1]) = (rel(bne), rel(bra));
+    let pitch: Vec<u16> = SCALE.iter().map(|f| (4096.0 * f / 1000.0f64).round() as u16).collect();
+    let (lo, hi): (Vec<u8>, Vec<u8>) = pitch.iter().map(|&p| (p as u8, (p >> 8) as u8)).unzip();
+    let mut brr = vec![0xa0];
+    brr.extend([0x77; 8]);
+    brr.push(0xa3);
+    brr.extend([0x99; 8]);
+    spc(&p, &[(0x300, &[0x00, 0x05, 0x00, 0x05]), (0x400, &lo), (0x408, &hi), (0x500, &brr)])
+}
+
+#[test]
+fn spc_loops_where_its_state_repeats() {
+    let out = check(&spc_scale());
+    assert_eq!(notes(&out.plain, 0), ["5c", "5e", "5g", "5a", "6c"]);
+    assert!(out.plain.contains("#PCMB") && out.plain.contains("%7@0"), "the BRR sample, embedded");
+    let lp = out.loop_secs.expect("a loop");
+    assert!((lp - 1.25).abs() < 0.02, "the loop is the five notes: {lp}");
+    assert_eq!(render(&out.plain, 4), render(&out.mml, 4), "written MML must sound like the plain conversion, across the loop too");
+}
+
+#[test]
+fn spc_sample_plays_at_its_pitch() {
+    // The first note (C4, 261.63 Hz) as SiON plays it: its period, from zero crossings.
+    let out = check(&spc_scale());
+    let audio = render(&out.plain, 1);
+    let left: Vec<f32> = audio.iter().step_by(2).copied().collect();
+    let seg = &left[1000..10000];
+    // (Rising crossings with hysteresis: the softened square ripples near zero.)
+    let thr = seg.iter().fold(0f32, |m, v| m.max(v.abs())) * 0.5;
+    let (mut ups, mut high) = (0, seg[0] > 0.0);
+    for &v in seg { if !high && v > thr { ups += 1; high = true } else if high && v < -thr { high = false } }
+    let hz = ups as f64 * sion::RATE as f64 / seg.len() as f64;
+    assert!((hz - 261.63).abs() < 3.0, "C4: {hz} Hz");
 }

@@ -2,7 +2,8 @@ cargo-features = ["panic-immediate-abort"]
 
 [package]
 name = "sion-ffi"
-version = "0.1.0"
+version = "0.2.0"
+authors = ["popcar2"]
 edition = "2021"
 description = "C ABI shared library (libsion.so / sion.dll) for the SiON MML player"
 

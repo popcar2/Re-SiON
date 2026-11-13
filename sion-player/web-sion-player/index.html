@@ -8,13 +8,13 @@
 <title>SiON Player</title>
 <style>
   :root {
-    --bg: #f4f9fc; --fg: #142430; --muted: #7890a0; --line: #dbe7ef; --hover: #e8f2f8;
-    --accent: #2a8fc4; --accent-soft: #dcf0fa;
+    --bg: #fafaf9; --fg: #1c1b1a; --muted: #8a8780; --line: #e8e6e1; --hover: #f1f0ec;
+    --accent: #2a8fc4; --accent-soft: #e3f1f8;
     color-scheme: light dark;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #0d1620; --fg: #e4f1f8; --muted: #6f8798; --line: #1c2a36; --hover: #14212d;
-            --accent: #7fd4f5; --accent-soft: #15303f; }
+    :root { --bg: #151514; --fg: #ecebe8; --muted: #7d7a74; --line: #262624; --hover: #1d1d1b;
+            --accent: #7fd4f5; --accent-soft: #182a33; }
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; background: var(--bg); color: var(--fg); }
@@ -25,18 +25,11 @@
   h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.02em; margin: 0; }
   header span { color: var(--muted); font-size: 13px; }
 
-  input[type=search] {
-    width: 100%; padding: 10px 12px; margin-bottom: 12px; font: inherit; color: inherit;
-    background: transparent; border: 1px solid var(--line); border-radius: 8px; outline: none;
-  }
-  input[type=search]:focus { border-color: var(--muted); }
-
   ol { list-style: none; margin: 0; padding: 0; }
   li {
     display: grid; grid-template-columns: 28px 1fr; gap: 8px; align-items: baseline;
     padding: 8px 10px; border-radius: 8px; cursor: pointer; user-select: none;
   }
-  li[hidden] { display: none; }
   li:hover { background: var(--hover); }
   li .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; text-align: right; }
   li .t { display: flex; gap: 8px; align-items: baseline; min-width: 0; white-space: nowrap; }
@@ -54,7 +47,6 @@
   }
   body.playing li.on .n::after { animation: eq 0.9s steps(3) infinite; }
   @keyframes eq { 50% { background-size: 2px 40%, 2px 100%, 2px 30%; } }
-  .empty { color: var(--muted); padding: 24px 10px; }
 
   footer {
     position: fixed; left: 0; right: 0; bottom: 0; background: var(--bg); border-top: 1px solid var(--line);
@@ -101,7 +93,6 @@
 <body>
 <main>
   <header><h1>SiON</h1><span id="count">MML player</span></header>
-  <input type="search" id="q" placeholder="Search songs" autocomplete="off" spellcheck="false">
   <ol id="list"></ol>
 </main>
 <footer>
@@ -146,17 +137,6 @@ const rows = songs.map((s) => {
   $("list").append(li);
   return li;
 });
-const empty = Object.assign(document.createElement("li"), { className: "empty", textContent: "No matches" });
-$("q").oninput = () => {
-  const q = $("q").value.trim().toLowerCase();
-  let shown = 0;
-  songs.forEach((s, i) => {
-    const hit = !q || `${s.artist} ${s.title}`.toLowerCase().includes(q);
-    rows[i].hidden = !hit;
-    shown += hit;
-  });
-  shown ? empty.remove() : $("list").append(empty);
-};
 
 // ---- Audio ----
 const RATE = 44100;
@@ -268,11 +248,9 @@ $("play").onclick = toggle;
 $("prev").onclick = () => current > 0 && play(current - 1);
 $("next").onclick = () => current >= 0 && current + 1 < songs.length && play(current + 1);
 addEventListener("keydown", (e) => {
-  if (e.target === $("q")) { if (e.key === "Escape") $("q").blur(); return; }
   if (e.target === $("seek") && e.key.startsWith("Arrow")) return; // the slider handles its own arrows
   if (e.key === " ") { e.preventDefault(); toggle(); }
   else if (e.key === "Escape") stop();
-  else if (e.key === "/") { e.preventDefault(); $("q").focus(); }
   else if (e.key === "ArrowLeft") seek(shown() - 5 * RATE);
   else if (e.key === "ArrowRight") seek(shown() + 5 * RATE);
 });

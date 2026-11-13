@@ -2,6 +2,7 @@
 //! channels. Tracker and VGM playback first record what each chip/tracker channel sounds like frame by frame
 //! (`Stream`); `Stream::notes` turns those frames into notes with slurred pitch and volume changes.
 
+#[derive(Default)]
 pub struct Score {
     /// Ticks per quarter note.
     pub ppq: u32,
@@ -27,6 +28,13 @@ pub struct Score {
     /// Pitch to 1/1000 of SiON's 1/64-semitone step (fractional `k`, the notes' detunes in those units), with
     /// every change kept (tracker samples, which should play exactly as the module).
     pub kmilli: bool,
+    /// Where the source's own sections start (a tracker's patterns, as the order list plays them): written one per
+    /// line, and repeated sections as loops and macros (other formats: bars, `set_bars`). Empty: the output is
+    /// minified instead.
+    pub sections: Vec<u64>,
+    /// Per channel: its comment after "Track n, " (e.g. `channel 2: Lead`), when it has one.
+    pub names: Vec<String>,
+    pub title: String,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +91,24 @@ impl Score {
             (at, bpm) = (tt, b);
         }
         s + (t - at) as f64 / self.ppq as f64 * 60.0 / bpm
+    }
+
+    /// The last tick anything sounds or the song ends.
+    pub fn last(&self) -> u64 { self.notes.iter().map(|n| n.end).fold(self.end, u64::max) }
+
+    /// Sections for a source without its own (MIDI, VGM, NSF): one per `bars` (ticks, each change starting a bar
+    /// from there; empty: 4/4), lined up with the loop point so the loop starts a line.
+    pub fn set_bars(&mut self, bars: &[(u64, u64)]) {
+        let end = self.last();
+        let mut sig = if bars.is_empty() { vec![(0, 4 * self.ppq as u64)] } else { bars.to_vec() };
+        if sig[0].0 > 0 { sig.insert(0, (0, 4 * self.ppq as u64)) }
+        if let (Some(l), [(0, len)]) = (self.lp, &sig[..]) { sig[0].0 = l % len }
+        let mut out = vec![];
+        for (i, &(at, len)) in sig.iter().enumerate() {
+            let to = sig.get(i + 1).map_or(end, |s| s.0);
+            out.extend((at..to).step_by(len.max(1) as usize).filter(|&t| t > 0));
+        }
+        self.sections = out;
     }
 }
 

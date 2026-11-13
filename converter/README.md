@@ -1,27 +1,32 @@
 # sion-converter
 
-Converts other music formats to minified SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT),
-VGM/VGZ chip music logs and NSF/NSFE NES music. The format is recognized from the file's contents.
+Converts other music formats to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT),
+VGM/VGZ chip music logs, NSF/NSFE NES music and SPC SNES music. The format is recognized from the file's contents.
 
 ```
 cargo run --release -- song.mid              # writes song.mml
 cargo run --release -- song.xm -o out.mml --verify
 cargo run --release -- song.vgz --wav out.wav
 cargo run --release -- game.nsfe --track 3
+cargo run --release -- song.spc
 ```
 
 Options: `-o FILE`, `--grid N` (snap timing to 1/N notes: smaller output, but no longer exact),
 `--wavetables` (tracker modules: approximate samples instead of embedding them; see below),
+`--exact` (tracker modules: tick-by-tick, minified, instead of written as by hand; see below),
 `--track N` (NSF/NSFE: which song of the file, from 1; default: the file's first song),
 `--exact-pcm` (VGM and NSF: capture chip samples exactly, frame by frame; much larger, see below),
-`--gain G` (volume; default is automatic, so the busiest chord doesn't clip), `--plain` (write the unminified MML),
-`--verify` (render the plain and minified MML with the `sion` crate and check that every sample is identical;
-for a tracker module, also compare the result with the module mixed straight from its samples),
+`--gain G` (volume; default is automatic, so the busiest chord doesn't clip), `--plain` (write the plain MML, one
+command per event, instead),
+`--verify` (render the plain and the written MML with the `sion` crate and check that every sample is identical;
+for a tracker module with `--exact`, also compare the result with the module mixed straight from its samples),
 `--wav FILE` (also render the result to a WAV file). `sion-convert song.mml --wav out.wav` renders any MML file.
 Anything a file uses that can't be converted is reported as a `note:` on stderr.
 
 Every reader produces the same format-neutral score (`src/score.rs`), which `src/arrange.rs` turns into tracks
-and `src/mml.rs` minifies, so all formats get the same timing, volume and minification handling. When the
+and `src/pretty.rs` lays out the way it would be written by hand (below), so all formats get the same timing,
+volume and layout handling. Each line is one section of the source: a tracker pattern, or a bar for the others
+(MIDI by its time signatures, 4/4 without one; VGM, NSF and SPC 16 rows, lined up with the loop point). When the
 automatic volume would still clip (FM voices and some waveforms come out louder than estimated), the result is
 rendered and the master volume (`x`) is lowered until it doesn't.
 
@@ -52,8 +57,44 @@ tracker does, and records what each channel sounds like on every tick:
   actions (notes that ring on after the next one starts get tracks of their own).
 - Pitch (`k`) and volume (`v`) changes during a note are written as `&` slurs.
 
-Samples are embedded in the MML as they are (`#PCMB`, see below) and played with `%7`, so the conversion sounds
-like the module itself:
+By default a module is written the way someone would write it by hand (`src/pretty.rs`), as every format is:
+
+```
+// Track 2, channel 2: Melody11
+#A=v7 o5g4 b-8<c8& v4c8v7d4>b-8&;
+#B=v7 o5b-4.^16&[v6b-&v7b-&]4v6b-;
+q8 x90 %4@0s63 l16
+[A B]
+v7 o5b-4.<c4. d4&
+...
+$
+[A B C D E F C D]
+[E F C D]4;
+```
+
+- One line per pattern, as the order list plays it. Each line starts with an absolute octave and restates the
+  volume, pan and detune, so it means the same wherever it plays; the tone (`%`, `@n`) is written where it changes.
+- Patterns that follow each other again are loops (`[A B]`, `[A B|C]3`); a pattern heard again elsewhere is a
+  macro, defined just before its track. Within a line: one default length per track, relative octaves, a space
+  per beat, short repeated figures as loops, black keys as flats in flat keys.
+- Volume and pan are taken once per row (slides and envelopes become steps per row), volume in 16 steps, and
+  detune in whole 1/64 semitones. Notes are whole rows: a one-shot sample that plays out lasts to the end of
+  its row. Pitch changes (arpeggio, slides, vibrato) are still followed tick by tick.
+- A sample that is one cycle of a waveform (all loop, at most 1024 frames) becomes that wavetable (`#WAV`, exact);
+  other samples are embedded (below). Wavetables and samples are written at the end of the file.
+- A note is cut at a line's end only where that sounds the same, as a slur (`c&` / `c`) into the next line: not
+  under a pitch table (`np`; a slurred note starts from its own pitch, not where the table has taken it) or a gate
+  other than `q8` (drum hits: each piece would be keyed off at its own gate). Those notes run on into the next line.
+- Data is written compactly, decoding to exactly the same values: runs of one value in `#WAV` and `#TABLE` as
+  `(v)n` (which SiON and GDSiON both read as `n` copies; GDSiON crashes on `[v]n`, and `(v,v)n` rounds negative
+  values differently), and `#PCMB` arguments at their defaults left off the end.
+
+`--exact` instead performs everything tick by tick and minifies the result, as described below. That is the
+version that sounds exactly like the module; the default trades small details (a slide's steps within a row, a
+volume's fine steps) for MML that can be read and edited.
+
+With `--exact`, samples are embedded in the MML as they are (`#PCMB`, see below) and played with `%7`, so the
+conversion sounds like the module itself:
 
 - 8-bit samples stay 8-bit and 16-bit ones 16-bit, so the data is exact; frames after the loop end are left out.
   Forward and ping-pong loops play as in the tracker.
@@ -260,7 +301,47 @@ two outputs, each at half the depth, as the Yamaha chips do: the same depth for 
 loop can't break into oscillation at the sample rate, so deep feedback stays tonal. SiON ignores the line and
 uses its own feedback (the last output at full depth).
 
-## Minification (audio-identical)
+## SPC
+
+An SPC is a snapshot of the SNES's sound unit: the SPC700's registers, its 64 KB of RAM (the game's sound
+driver, the song and the samples) and the S-DSP's registers. `src/spc.rs` runs the driver from there on an SPC700
+(`src/spc700.rs`: every instruction, with cycle counts) with the timers, I/O ports and IPL ROM, and a model of the
+DSP follows what it plays, sample by sample at 32 kHz: key-ons and key-offs, each voice's BRR blocks and loop,
+its pitch, and its envelope (ADSR and the GAIN modes, with the hardware's rate counter). It makes no sound itself:
+each key-on becomes a note on its voice's track.
+
+- Samples: each one played is decoded from BRR as it was in RAM at its key-on and embedded (`#PCMB`, 16-bit, with
+  its loop), played with `%7`. The DSP's Gaussian interpolation is softer than SiON's linear one; the samples get
+  a gentle low-pass to match (on test songs, within 1-2 dB of libgme up to 10 kHz).
+- Pitch: each sample's key is found from its loop's period (the octave kept so its usual note is within o3..o7)
+  and its tuning from the pitches the driver plays it at, so the notes come out as whole notes. Pitch changes
+  during a note (vibrato, slides) are `k` slurs.
+- Envelopes become SiON's own (`@n,ar,dr,sr,rr,sl`): attack matched at half level (the DSP's is linear),
+  decay and sustain rates (both exponential, like SiON's) to within SiON's rate steps, the sustain level to 3 dB.
+  SiON's rates rise with the key (`kc >> 5`), so each tone's are taken down by that at its usual key. A key-off
+  releases at the DSP's rate; a driver switching to a falling GAIN is a release at that rate. A note whose
+  envelope the driver changes otherwise as it plays is written with a flat envelope and volume steps.
+- Volume and pan from VOL × MVOL (in decibels, `#VMODE{%v1,1}`); echo as a delay on send 1 (`#EFFECT1{delay}`,
+  EDL × 16 ms, the feedback and level from EFB and EVOL against MVOL, through the FIR's gain at 1 kHz), with the
+  voices that have it on (EON) sending to it (`@v64,n`). The setting that holds longest is used.
+- Timing: rows are the key-ons' grid (the longest row from 40 to 400 ms they line up with about as well as with
+  any, by phase coherence, then fitted over the song), a 1/16 note each; key-ons are put on the nearest row, half
+  row, triplet or 1/64 note within a timer tick or two, and key-offs on whole rows.
+- A voice that switches samples all the time (a drum kit) gets one track per sample, so each keeps its tone.
+
+An SPC holds no song length either: the song loops where the driver's state (RAM, CPU and DSP registers, timer
+settings) comes round to one it was in at an earlier timer tick, or else where its DSP writes repeat, or else
+where its key-ons (voice, sample, pitch) repeat; a state loop that is several times round the music (its tempo
+counter coming back into phase only then) is shortened to the key-ons' loop. The loop starts on a whole row. A
+loop of silence is the song having ended. Otherwise it plays the ID666 tag's time, or the first 10 minutes.
+
+Not converted (reported as notes): pitch modulation (PMON). Noise voices play SiON's noise (`%2`) at the DSP's
+noise rate. The echo FIR's shape (only its gain is kept) and per-side echo settings are not.
+
+Sizes: Super Mario World's tracks become 30-110 KB of MML, Final Fantasy VI's and Chrono Trigger's 75-175 KB (the
+samples are most of it); each takes a few seconds to convert.
+
+## Minification (audio-identical, `--exact` modules)
 
 - Shortest length text for every duration (`n`, dots, `^` ties, empty = default length), with default length (`l`) changes chosen by Viterbi.
 - Gaps between notes absorbed by `q` gate ratios where shorter (`c8r8` → `q4c4`).
@@ -276,7 +357,8 @@ VRC6), and VGM files
 that play YM2612 DAC samples (from the data bank, written directly, and by DAC stream), NES DPCM and `$4011`
 levels, and YM2610 ADPCM-A and -B, converts them (by default and with `--exact-pcm`, each checked against the
 chip's output), checks the notes and the Mega Drive's mix (PSG against FM, one-sided pan, feedback level, fast
-noise), and checks that the minified MML renders identically to the plain conversion. `src/tests.rs`
+noise), and checks that the written MML renders identically to the plain conversion; an SPC with a hand-assembled
+SPC700 driver (a scale on a looping BRR square) checks the notes, the loop and the sample's pitch. `src/tests.rs`
 builds Amiga-period and linear (IT) modules with 8- and 16-bit, one-shot, looped and ping-pong samples and most
 effects (slides, arpeggio, vibrato, tremolo, offsets, retrigger, cuts, envelopes, background voices, tempo
 changes) and checks SiON's rendering against the reference mix.

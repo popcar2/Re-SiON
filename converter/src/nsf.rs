@@ -249,7 +249,7 @@ fn call(cpu: &mut Cpu, nes: &mut Nes, addr: u16, budget: u64) -> bool {
 
 /// The earliest point from which the per-frame write hashes repeat to the end, at least twice, with a period of
 /// at least `min` frames: (start, period).
-fn repeat(sig: &[u64], min: usize) -> Option<(usize, usize)> {
+pub(crate) fn repeat(sig: &[u64], min: usize) -> Option<(usize, usize)> {
     let n = sig.len();
     let mut best: Option<(usize, usize)> = None;
     for p in min.max(1)..=n / 2 {

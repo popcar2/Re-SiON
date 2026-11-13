@@ -476,11 +476,16 @@ fn step(e: &Env, t: u32, on: bool) -> u32 {
 }
 
 /// Perform the module. Samples are embedded as PCM unless `wavetables`.
-pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
+/// The module performed: its score, warnings, and the trace `render` mixes. `tidy` performs it the way it would
+/// be written by hand rather than exactly (see `Options::exact`): volume and pan per row, whole notes per row,
+/// single-cycle loops as wavetables, and the order list's patterns as the score's sections.
+pub fn to_score(m: &Module, wavetables: bool, tidy: bool) -> (Score, Vec<String>, Trace) {
     let mut defs = Defs::default();
     let mut full = 0;
+    // (A sample that is all loop, of at most 1024 frames, is one cycle of a waveform: the wavetable is exact.)
+    let cycle = |s: &Sample| s.lp.is_some_and(|(a, b, _)| a <= 16 && b - a <= 1024 && b + 16 >= s.data.len());
     let sounds: Vec<Sound> = m.samples.iter().map(|s| {
-        if wavetables { return analyze(s, &mut defs) }
+        if wavetables || (tidy && cycle(s)) { return analyze(s, &mut defs) }
         pcm(s, &mut defs).unwrap_or_else(|| { full += 1; analyze(s, &mut defs) })
     }).collect();
     let mut tr = Trace { chans: vec![vec![]; m.chans], ..Trace::default() };
@@ -489,7 +494,17 @@ pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
         clock: if m.kind == Kind::Mod { 3546895.0 } else { 8363.0 * 428.0 },
         ch: (0..m.chans).map(|c| Chan { vol: 64.0, chvol: m.chvol[c] as f32, pan: m.pan[c], ..Chan::default() }).collect(),
     };
-    let mut st = Stream { chans: vec![vec![]; m.chans], exact: !wavetables, ..Stream::default() };
+    let mut st = Stream { chans: vec![vec![]; m.chans], exact: !wavetables && !tidy, ..Stream::default() };
+    // Tidy: each channel's level and pan as set at the start of the row (or at its key-on), and its instrument names.
+    let mut held: Vec<Option<(f32, i32)>> = vec![];
+    let mut names: Vec<Vec<String>> = vec![];
+    let name = |names: &mut Vec<Vec<String>>, c: usize, ins: usize| {
+        if names.len() <= c { names.resize(c + 1, vec![]) }
+        let n = m.instruments.get(ins.wrapping_sub(1)).map_or(String::new(), |i| i.name.clone());
+        if !n.is_empty() && !names[c].contains(&n) { names[c].push(n) }
+    };
+    let mut sections: Vec<u64> = vec![];
+    let mut last_ord = usize::MAX;
     let ppq = 4 * if (2..=12).contains(&p.speed) { p.speed } else { 6 };
     let mut tempos: Vec<(u64, f64)> = vec![];
     let (mut ord, mut row, mut tick) = (0usize, 0usize, 0u64);
@@ -518,6 +533,7 @@ pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
             if let Some(&t) = seen.get(&(ord, row)) { lp = Some(t); break }
             seen.insert((ord, row), tick);
         }
+        if ord != last_ord || row == 0 { sections.push(tick); last_ord = ord }
         let cells: Vec<Cell> = (0..m.chans).map(|c| pat.cells.get(row * m.chans + c).copied().unwrap_or_default()).collect();
         let (mut jump, mut delay, mut fine) = (None, 0u32, 0u32);
         for (c, cell) in cells.iter().enumerate() {
@@ -548,12 +564,16 @@ pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
                 let amp = (ch.vol + ch.trem_now).clamp(0.0, 64.0) / 64.0 * ch.chvol / 64.0 * p.gvol / 128.0 * env * snd.gain * if ch.tremor_off { 0.0 } else { 1.0 };
                 let tone = st.tone(&snd.instr, &snd.env, snd.legato);
                 let (pos, pan) = (fold(s, v.pos), (ch.pan + pe).clamp(-64, 64));
-                let f = Frame { pitch: snd.pitch(rate).clamp(0.0, 119.0), amp, tone, pan, trig: std::mem::take(&mut v.trig), pos, lfo: (0, 0), rel: false };
+                let trig = std::mem::take(&mut v.trig);
+                let (amp, pan) = if tidy { hold(&mut held, c, rt == 0 || trig, amp, pan) } else { (amp, pan) };
+                if tidy { name(&mut names, c, v.ins) }
+                let f = Frame { pitch: snd.pitch(rate).clamp(0.0, 119.0), amp, tone, pan, trig, pos, lfo: (0, 0), rel: false };
                 st.chans[c].push(Some(f));
                 tr.chans[c].push(Some(Played { smp: v.smp, pos, rate, amp, pan }));
                 v.pos += rate * secs;
                 let ended = s.lp.is_none() && v.pos >= s.data.len() as f64;
-                if alive && !ended { ch.voice = Some(v) }
+                // (Tidy: a one-shot that has played out still lasts to the end of its row, so notes are whole rows.)
+                if alive && (!ended || (tidy && rt + 1 < p.speed.max(1))) { ch.voice = Some(v) }
             }
             // Background voices, each on a channel of its own.
             for k in 0..p.bg.len() {
@@ -567,10 +587,12 @@ pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
                 let s = &m.samples[v.smp];
                 let (pos, pan) = (fold(s, v.pos), (v.pan + pe).clamp(-64, 64));
                 let trig = std::mem::take(&mut v.trig);
+                let (amp, pan) = if tidy { hold(&mut held, m.chans + k, rt == 0 || trig, amp, pan) } else { (amp, pan) };
+                if tidy { name(&mut names, m.chans + k, v.ins) }
                 st.chans[m.chans + k].push(Some(Frame { pitch: snd.pitch(v.rate).clamp(0.0, 119.0), amp, tone, pan, trig, pos, lfo: (0, 0), rel: false }));
                 tr.chans[m.chans + k].push(Some(Played { smp: v.smp, pos, rate: v.rate, amp, pan }));
                 v.pos += v.rate * secs;
-                if alive && !(s.lp.is_none() && v.pos >= s.data.len() as f64) { p.bg[k] = Some(v) }
+                if alive && (!(s.lp.is_none() && v.pos >= s.data.len() as f64) || (tidy && rt + 1 < p.speed.max(1))) { p.bg[k] = Some(v) }
             }
             tick += 1;
             for ch in st.chans.iter_mut() { if ch.len() < tick as usize { ch.push(None) } }
@@ -592,8 +614,24 @@ pub fn to_score(m: &Module, wavetables: bool) -> (Score, Vec<String>, Trace) {
             None => row += 1,
         }
     }
-    let mut notes = st.notes(0, if wavetables { 2 } else { 1 });
+    let mut notes = st.notes(0, if wavetables || tidy { 2 } else { 1 });
     notes.retain(|n| n.end > n.start);
     warnings.extend(m.warnings.iter().cloned());
-    (Score { ppq, tempos, header: defs.header(), notes, mix: vec![], end: tick, lp, fine: !wavetables, db: false, kmilli: !wavetables }, warnings, tr)
+    let exact = !wavetables && !tidy;
+    let used = notes.iter().map(|n| n.ch as usize + 1).max().unwrap_or(0).max(names.len());
+    names.resize(used, vec![]);
+    let names = names.into_iter().enumerate().map(|(c, n)| if n.is_empty() { format!("channel {}", c + 1) } else { format!("channel {}: {}", c + 1, n.join(", ")) }).collect();
+    let mut score = Score { ppq, tempos, header: defs.header(), notes, mix: vec![], end: tick, lp, fine: exact, db: false, kmilli: exact, ..Score::default() };
+    if tidy { (score.sections, score.names, score.title) = (sections, names, m.title.clone()) }
+    (score, warnings, tr)
+}
+
+/// Tidy playback: the level and pan a channel had at the start of its row (`new`: this tick starts it), unless it
+/// has gone silent since (a note cut).
+fn hold(held: &mut Vec<Option<(f32, i32)>>, c: usize, new: bool, amp: f32, pan: i32) -> (f32, i32) {
+    if held.len() <= c { held.resize(c + 1, None) }
+    match held[c] {
+        Some((a, p)) if !new => if amp <= 0.0 { (0.0, p) } else { (a, p) },
+        _ => { held[c] = Some((amp, pan)); (amp, pan) }
+    }
 }

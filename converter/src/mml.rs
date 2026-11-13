@@ -611,6 +611,39 @@ fn assign_l(toks: &[Tok], lens: &mut Lengths, penalty: u32) -> (Vec<Tok>, Vec<u3
 }
 
 /// The shortest MML found for these tracks.
+/// A data definition written compactly, decoding to exactly the same values: in `#WAV`/`#TABLE` numbers, runs of
+/// one value as `(v)n` (which both SiON and GDSiON expand to `n` copies; `[v]n` crashes GDSiON and `(v,v)n` rounds
+/// negative values differently); in `#PCMB`, arguments at their defaults left off the end.
+pub fn compact(def: &str) -> String {
+    let Some(open) = def.find('{') else { return def.to_string() };
+    let close = def.rfind('}').unwrap_or(def.len());
+    let (name, body, post) = (&def[..open], &def[open + 1..close], def.get(close + 1..).unwrap_or(""));
+    if (name.starts_with("#WAV") && !name.starts_with("#WAVB")) || name.starts_with("#TABLE") {
+        if !body.bytes().all(|c| c.is_ascii_digit() || c == b'-' || c == b',') { return def.to_string() }
+        let vals: Vec<&str> = body.split(',').collect();
+        let (mut out, mut i) = (vec![], 0);
+        while i < vals.len() {
+            let n = vals[i..].iter().take_while(|v| **v == vals[i]).count();
+            let run = format!("({}){n}", vals[i]);
+            if run.len() < n * (vals[i].len() + 1) - 1 { out.push(run) } else { out.extend(std::iter::repeat_n(vals[i].to_string(), n)) }
+            i += n;
+        }
+        return format!("{name}{{{}}}{post}", out.join(","));
+    }
+    if name.starts_with("#PCMB") {
+        // rate, key (60), loop (none: negative), flags (0), level (0).
+        let mut args: Vec<&str> = post.split(',').collect();
+        while args.len() > 1 {
+            let (i, a) = (args.len() - 1, args[args.len() - 1].trim());
+            let default = match i { 1 => a == "60", 2 => a.starts_with('-'), _ => a == "0" };
+            if !default { break }
+            args.pop();
+        }
+        return format!("{name}{{{body}}}{}", args.join(","));
+    }
+    def.to_string()
+}
+
 pub fn minify(header: &[String], tracks: &[Vec<Tok>], lens: &mut Lengths) -> String {
     let mut best: Option<String> = None;
     for penalty in [0, 3, 8, 1000] {

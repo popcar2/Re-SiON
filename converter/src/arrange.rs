@@ -12,6 +12,9 @@ pub struct Options {
     pub gain: Option<f32>,
     /// Tracker modules: approximate each sample with a wavetable or noise instead of embedding it (`#PCMB`).
     pub wavetables: bool,
+    /// Tracker modules: convert exactly, tick by tick (every volume, pan and pitch change, sample positions), as
+    /// minified MML. Otherwise the song is written the way it would be by hand: per row, laid out by its patterns.
+    pub exact: bool,
     /// VGM: capture samples exactly as the chips output them, frame by frame, instead of storing each once at its
     /// own rate (much larger).
     pub exact_pcm: bool,
@@ -24,6 +27,9 @@ pub struct Arranged {
     pub header: Vec<String>,
     pub tracks: Vec<Track>,
     pub notes: usize,
+    /// The score's sections and loop point, in output ticks.
+    pub sections: Vec<u64>,
+    pub lp: Option<u64>,
 }
 
 impl Arranged {
@@ -33,6 +39,8 @@ impl Arranged {
 }
 
 pub struct Track {
+    /// The score channel it plays.
+    pub ch: u32,
     notes: Vec<Note>,
     /// Drum track: every hit lasts until the next one (see `score::Note::drum`).
     drum: Option<bool>,
@@ -203,7 +211,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
             let busy = if n.drum.is_some() { start } else { end };
             match slot { Some(v) => { v.0 = busy; v.1.push(note) } None => voices.push((busy, vec![note], n.drum)) }
         }
-        tracks.extend(voices.into_iter().map(|(_, notes, drum)| Track { notes, drum, x: None, tempo: vec![], end: 0, lp: None, vmax, kmilli: sc.kmilli }));
+        tracks.extend(voices.into_iter().map(|(_, notes, drum)| Track { ch, notes, drum, x: None, tempo: vec![], end: 0, lp: None, vmax, kmilli: sc.kmilli }));
     }
 
     // Tempo: one `t` command per change, carried by whichever track has a convenient spot for it.
@@ -250,9 +258,12 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     if end > song_end { if let Some(t) = tracks.iter_mut().find(|t| t.drum.is_none()) { t.end = end } }
     // A looping song: every track plays to the end, then goes back to the loop point together.
     let end = end.max(song_end);
-    if let Some(lp) = sc.lp.map(map).filter(|&l| l < end) { for t in &mut tracks { (t.end, t.lp) = (end, Some(lp)) } }
+    let lp = sc.lp.map(map).filter(|&l| l < end);
+    if let Some(lp) = lp { for t in &mut tracks { (t.end, t.lp) = (end, Some(lp)) } }
     let notes = tracks.iter().map(|t| t.notes.len()).sum();
-    Arranged { header, tracks, notes }
+    let mut sections: Vec<u64> = sc.sections.iter().map(|&t| map(t)).filter(|&t| t < end).collect();
+    sections.dedup();
+    Arranged { header, tracks, notes, sections, lp }
 }
 
 /// Detune at the note's start, then thinned changes (at least `step` ticks apart) while it sounds.

@@ -1,6 +1,6 @@
-//! sion-convert: MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ and NSF/NSFE → minified SiON MML.
+//! sion-convert: MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ, NSF/NSFE and SPC → SiON MML, written as by hand.
 //!
-//! Usage: sion-convert <input> [-o output.mml] [--grid N] [--gain G] [--wavetables] [--exact-pcm] [--track N] [--plain] [--verify] [--wav FILE]
+//! Usage: sion-convert <input> [-o output.mml] [--grid N] [--gain G] [--wavetables] [--exact] [--exact-pcm] [--track N] [--plain] [--verify] [--wav FILE]
 
 use std::process::exit;
 
@@ -8,7 +8,7 @@ const HELP: &str = "usage: sion-convert <input> [options]
        sion-convert <song.mml> --wav FILE   (render an MML file)
 
   input: Standard MIDI (.mid), tracker module (.mod .s3m .xm .it), chip log (.vgm .vgz) or NES music
-         (.nsf .nsfe);
+         (.nsf .nsfe) or SNES music (.spc);
          the format is recognized from the file's contents
 
   -o, --output FILE  where to write the MML (default: input name with .mml)
@@ -16,12 +16,15 @@ const HELP: &str = "usage: sion-convert <input> [options]
   --gain G           volume scale (default: automatic, avoids clipping chords)
   --wavetables       tracker modules: approximate samples with wavetables and noise instead of embedding them
                      (much smaller output, but only chiptune samples come out close)
+  --exact            tracker modules: convert tick by tick, exactly (every volume, pan and pitch step, sample
+                     positions), minified; by default the song is written as by hand: per row, laid out by
+                     its patterns, repeats as loops and macros
   --track N          NSF/NSFE: which song of the file to convert (from 1; default: the file's first song)
   --exact-pcm        VGM/NSF: capture samples exactly as the chips output them (timing jitter and all) instead of
                      storing each sound once (many times larger)
-  --plain            write the unminified MML instead
+  --plain            write the plain MML (one command per event) instead
   --verify           render both versions with the sion crate and check the audio is identical; for a
-                     tracker module, also compare with the module mixed straight from its samples
+                     tracker module with --exact, also compare with the module mixed straight from its samples
   --wav FILE         also render the MML to a WAV file (to listen to the conversion)
 ";
 
@@ -38,6 +41,7 @@ fn main() {
             "--gain" => opt.gain = Some(val("--gain").parse().unwrap_or_else(|_| fail("--gain takes a number, e.g. 1.5"))),
             "--wavetables" => opt.wavetables = true,
             "--exact-pcm" => opt.exact_pcm = true,
+            "--exact" => opt.exact = true,
             "--track" => opt.track = Some(val("--track").parse().unwrap_or_else(|_| fail("--track takes a number, e.g. 2"))),
             "--plain" => plain = true,
             "--verify" => verify = true,
@@ -66,7 +70,7 @@ fn main() {
     let secs = out.loop_secs.map_or(60.0 * 30.0, |l| out.secs + l);
     if let Some(w) = wav { write_wav(&w, &out.mml, secs).unwrap_or_else(|e| fail(&format!("cannot write {w}: {e}"))) }
     if verify && !check(&out.plain, &out.mml, secs) { exit(2) }
-    if verify && !opt.wavetables && sion_converter::detect(&data) == Some(sion_converter::Format::Module) {
+    if verify && opt.exact && !opt.wavetables && sion_converter::detect(&data) == Some(sion_converter::Format::Module) {
         let want = sion_converter::reference(&data).unwrap_or_else(|e| fail(&format!("{input}: {e}")));
         let got = render(&out.mml, want.len() / 2);
         let db = sion_converter::snr(&want, &got);
@@ -132,7 +136,7 @@ fn check(a: &str, b: &str, secs: f64) -> bool {
     let secs = frames as f64 / sion::RATE as f64;
     println!("verify: {:.1}s rendered, peak {:.3}{}", secs, peak, if clip > 0 { format!(", {clip} clipped samples") } else { String::new() });
     match first {
-        None => { println!("verify: minified audio is identical to the plain conversion"); true }
+        None => { println!("verify: audio is identical to the plain conversion"); true }
         Some(f) => { println!("verify: MISMATCH from {:.3}s (max difference {diff})", f as f64 / sion::RATE as f64); false }
     }
 }

@@ -33,6 +33,8 @@ pub struct Module {
     pub note_ofs: i32,
     /// What the loader had to leave out.
     pub warnings: Vec<String>,
+    /// Song title (may be empty).
+    pub title: String,
 }
 
 pub const SKIP: u16 = 0xfffe;
@@ -131,6 +133,8 @@ pub struct Instrument {
     pub pan: Option<i32>,
     /// New note action (IT): 0 cut, 1 continue, 2 note off, 3 fade.
     pub nna: u8,
+    /// Instrument (or MOD/S3M sample) name, trimmed (may be empty).
+    pub name: String,
 }
 
 #[derive(Clone, Default)]
@@ -145,6 +149,13 @@ pub struct Sample {
     pub pan: Option<i32>,
     /// Playback rate (Hz) at note 48.
     pub c4: f64,
+}
+
+/// Text field of `n` bytes at `o`: up to the first NUL, trimmed, printable ASCII only.
+fn text(d: &[u8], o: usize, n: usize) -> String {
+    let b = d.get(o..(o + n).min(d.len())).unwrap_or(&[]);
+    let b = &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())];
+    b.iter().map(|&c| if (32..127).contains(&c) { c as char } else { ' ' }).collect::<String>().trim().to_string()
 }
 
 fn u16le(d: &[u8], o: usize) -> u16 { d.get(o..o + 2).map_or(0, |b| u16::from_le_bytes([b[0], b[1]])) }
@@ -171,8 +182,8 @@ pub fn load(d: &[u8]) -> Result<Module, String> {
 }
 
 /// One instrument per sample, playing it on every note (MOD, S3M).
-fn plain_instruments(n: usize) -> Vec<Instrument> {
-    (0..n).map(|s| Instrument { map: (0..120).map(|k| (k as u8, s as u16 + 1)).collect(), venv: None, penv: None, fadeout: 0, gvol: 128, pan: None, nna: 0 }).collect()
+fn plain_instruments(names: Vec<String>) -> Vec<Instrument> {
+    names.into_iter().enumerate().map(|(s, name)| Instrument { map: (0..120).map(|k| (k as u8, s as u16 + 1)).collect(), venv: None, penv: None, fadeout: 0, gvol: 128, pan: None, nna: 0, name }).collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -270,8 +281,8 @@ fn load_mod(d: &[u8]) -> Result<Module, String> {
     // Amiga hard panning (LRRL), narrowed so it isn't extreme on headphones.
     let pan = (0..chans).map(|c| if matches!(c % 4, 0 | 3) { -40 } else { 40 }).collect();
     Ok(Module {
-        kind: Kind::Mod, chans, restart: (byte(d, 951) as usize).min(127), orders, patterns, instruments: plain_instruments(31), samples: smp, speed: 6, tempo: 125, gvol: 128,
-        pan, chvol: vec![64; chans], linear: false, compat_g: false, note_ofs: 0, warnings: vec![],
+        kind: Kind::Mod, chans, restart: (byte(d, 951) as usize).min(127), orders, patterns, instruments: plain_instruments((0..31).map(|i| text(d, 20 + 30 * i, 22)).collect()), samples: smp, speed: 6, tempo: 125, gvol: 128,
+        pan, chvol: vec![64; chans], linear: false, compat_g: false, note_ofs: 0, warnings: vec![], title: text(d, 0, 20),
     })
 }
 
@@ -391,9 +402,10 @@ fn load_s3m(d: &[u8]) -> Result<Module, String> {
         patterns.push(Pattern { rows: 64, cells });
     }
     Ok(Module {
-        kind: Kind::S3m, chans, restart: 0, orders, patterns, instruments: plain_instruments(insnum), samples, speed: speed.max(1) as u32, tempo: tempo.max(32) as u32,
+        kind: Kind::S3m, chans, restart: 0, orders, patterns, instruments: plain_instruments((0..insnum).map(|i| text(d, para(ip + i * 2) + 0x30, 28)).collect()), samples, speed: speed.max(1) as u32, tempo: tempo.max(32) as u32,
         gvol: (gv.min(64) as u32) * 2, pan, chvol: vec![64; chans], linear: false, compat_g: false, note_ofs: 0,
         warnings: if adlib { vec!["AdLib (FM) instruments in S3M files are not converted".into()] } else { vec![] },
+        title: text(d, 0, 28),
     })
 }
 
@@ -467,7 +479,7 @@ fn load_xm(d: &[u8]) -> Result<Module, String> {
     for _ in 0..nins {
         let isize = u32le(d, o) as usize;
         let ns = u16le(d, o + 27) as usize;
-        let mut ins = Instrument { map: vec![(0, 0); 120], venv: None, penv: None, fadeout: 0, gvol: 128, pan: None, nna: 0 };
+        let mut ins = Instrument { map: vec![(0, 0); 120], venv: None, penv: None, fadeout: 0, gvol: 128, pan: None, nna: 0, name: text(d, o + 4, 22) };
         let mut shdr = o + isize;
         if ns > 0 {
             let b = o + 29;
@@ -506,7 +518,7 @@ fn load_xm(d: &[u8]) -> Result<Module, String> {
     }
     Ok(Module {
         kind: Kind::Xm, chans, restart: restart as usize, orders, patterns, instruments, samples, speed: speed.max(1) as u32, tempo: tempo.max(32) as u32, gvol: 128,
-        pan: vec![0; chans], chvol: vec![64; chans], linear: flags & 1 != 0, compat_g: false, note_ofs: 0, warnings: vec![],
+        pan: vec![0; chans], chvol: vec![64; chans], linear: flags & 1 != 0, compat_g: false, note_ofs: 0, warnings: vec![], title: text(d, 17, 20),
     })
 }
 
@@ -608,9 +620,10 @@ fn load_it(d: &[u8]) -> Result<Module, String> {
             Instrument {
                 map, venv: it_env(d, o + 0x130, false), penv: it_env(d, o + 0x182, true), fadeout: u16le(d, o + 0x14) as u32 * 32,
                 gvol: byte(d, o + 0x18).min(128) as u32, pan: (dfp & 128 == 0).then(|| dfp.min(64) as i32 * 2 - 64), nna: byte(d, o + 0x11) & 3,
+                name: text(d, o + 0x20, 26),
             }
         }).collect()
-    } else { plain_instruments(smpnum) };
+    } else { plain_instruments((0..smpnum).map(|i| text(d, u32le(d, sp + i * 4) as usize + 0x14, 26)).collect()) };
     let chans_max = 64;
     let mut patterns = vec![];
     let mut chans = 1;
@@ -665,6 +678,6 @@ fn load_it(d: &[u8]) -> Result<Module, String> {
     let chvol = (0..chans).map(|c| if byte(d, 0x40 + c) >= 128 { 0 } else { byte(d, 0x80 + c).min(64) }).collect();
     Ok(Module {
         kind: Kind::It, chans, restart: 0, orders, patterns, instruments, samples, speed: speed.max(1) as u32, tempo: tempo.max(31) as u32, gvol: gv.min(128) as u32,
-        pan, chvol, linear: flags & 8 != 0, compat_g: flags & 32 != 0, note_ofs: -12, warnings: vec![],
+        pan, chvol, linear: flags & 8 != 0, compat_g: flags & 32 != 0, note_ofs: -12, warnings: vec![], title: text(d, 4, 26),
     })
 }

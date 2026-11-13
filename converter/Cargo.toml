@@ -1,8 +1,9 @@
 [package]
 name = "sion-converter"
-version = "0.1.0"
+version = "0.2.0"
+authors = ["popcar2"]
 edition = "2021"
-description = "Convert MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ chip music and NSF/NSFE to minified SiON MML"
+description = "Convert MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ chip music, NSF/NSFE and SPC to SiON MML"
 
 [[bin]]
 name = "sion-convert"

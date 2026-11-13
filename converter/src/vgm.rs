@@ -372,7 +372,7 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
     // Mega Drive chips: libvgm's output (resampled from the chips' own rates) is about 3 dB down above 9 kHz from
     // SiON's, which renders at 44.1 kHz; a high shelf on the master matches it (measured on two songs).
     if shelf { header.push("#EFFECT0{hb9000,1,-3}".into()) }
-    Ok((Score { ppq, tempos: vec![(0, bpm)], header, notes, mix: vec![], end, lp, fine, db: !fine, kmilli: false }, warnings))
+    Ok((Score { ppq, tempos: vec![(0, bpm)], header, notes, mix: vec![], end, lp, fine, db: !fine, kmilli: false, ..Score::default() }, warnings))
 }
 
 /// Chips pan by switching each side on or off: a channel on one side is as loud there as a centred one. SiON pans

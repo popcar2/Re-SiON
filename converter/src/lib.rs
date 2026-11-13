@@ -1,6 +1,7 @@
 //! Converters to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT), VGM/VGZ chip logs and
-//! NSF/NSFE NES music.
-//! Every reader produces a `score::Score`; `arrange` and `mml` turn that into minified MML.
+//! NSF/NSFE NES music and SPC SNES music.
+//! Every reader produces a `score::Score`; `arrange` turns that into tracks, which `pretty` lays out by the score's
+//! sections (a tracker's patterns, bars for the other formats), or which `mml` minifies (`--exact` modules).
 
 mod arrange;
 mod chips;
@@ -11,15 +12,18 @@ mod mml;
 mod nsf;
 mod pcm;
 mod play;
+mod pretty;
 mod sample;
 mod score;
+mod spc;
+mod spc700;
 mod tracker;
 mod vgm;
 
 pub use arrange::Options;
 
 pub struct Converted {
-    /// Minified MML.
+    /// The MML: minified, or laid out by the source's sections (see `pretty`).
     pub mml: String,
     /// The same song written plainly (one command per event): the audio reference for `mml`.
     pub plain: String,
@@ -35,12 +39,13 @@ pub struct Converted {
 
 /// Input formats, recognized from the file's contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format { Midi, Vgm, Nsf, Module }
+pub enum Format { Midi, Vgm, Nsf, Spc, Module }
 
 pub fn detect(data: &[u8]) -> Option<Format> {
     if data.starts_with(b"Vgm ") { return Some(Format::Vgm) }
     if data.starts_with(&[0x1f, 0x8b]) { return vgm::gunzip(data).ok().filter(|d| d.starts_with(b"Vgm ")).map(|_| Format::Vgm) }
     if nsf::detect(data) { return Some(Format::Nsf) }
+    if spc::detect(data) { return Some(Format::Spc) }
     if tracker::detect(data).is_some() { return Some(Format::Module) }
     if data.windows(4).any(|w| w == b"MThd") { return Some(Format::Midi) }
     None
@@ -50,15 +55,17 @@ pub fn detect(data: &[u8]) -> Option<Format> {
 pub fn convert(data: &[u8], opt: &Options) -> Result<Converted, String> {
     match detect(data) {
         Some(Format::Midi) => midi_to_mml(data, opt),
-        Some(Format::Vgm) => { let (score, w) = vgm::to_score(data, opt.exact_pcm)?; Ok(write(&score, opt, w)) }
-        Some(Format::Nsf) => { let (score, w) = nsf::to_score(data, opt.exact_pcm, opt.track)?; Ok(write(&score, opt, w)) }
+        // (Chip logs have no bars of their own: the tempo makes a row a 1/16 note, so a line is 16 rows.)
+        Some(Format::Vgm) => { let (mut score, w) = vgm::to_score(data, opt.exact_pcm)?; score.set_bars(&[]); Ok(write(&score, opt, w)) }
+        Some(Format::Nsf) => { let (mut score, w) = nsf::to_score(data, opt.exact_pcm, opt.track)?; score.set_bars(&[]); Ok(write(&score, opt, w)) }
+        Some(Format::Spc) => { let (mut score, w) = spc::to_score(data)?; score.set_bars(&[]); Ok(write(&score, opt, w)) }
         Some(Format::Module) => Ok(module_to_mml(&tracker::load(data)?, opt)),
-        None => Err("unrecognized file (supported: MIDI, MOD, S3M, XM, IT, VGM/VGZ, NSF/NSFE)".into()),
+        None => Err("unrecognized file (supported: MIDI, MOD, S3M, XM, IT, VGM/VGZ, NSF/NSFE, SPC)".into()),
     }
 }
 
 fn module_to_mml(m: &tracker::Module, opt: &Options) -> Converted {
-    let (score, w, _) = play::to_score(m, opt.wavetables);
+    let (score, w, _) = play::to_score(m, opt.wavetables, !opt.exact);
     write(&score, opt, w)
 }
 
@@ -67,7 +74,7 @@ fn module_to_mml(m: &tracker::Module, opt: &Options) -> Converted {
 pub fn reference(data: &[u8]) -> Result<Vec<f32>, String> {
     if detect(data) != Some(Format::Module) { return Err("not a tracker module".into()) }
     let m = tracker::load(data)?;
-    let (_, _, tr) = play::to_score(&m, false);
+    let (_, _, tr) = play::to_score(&m, false, false);
     Ok(play::render(&m, &tr))
 }
 
@@ -91,7 +98,7 @@ pub fn midi_to_mml(data: &[u8], opt: &Options) -> Result<Converted, String> {
 
 fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converted {
     let mut song = arrange::build(score, opt);
-    let secs = score.seconds(score.notes.iter().map(|n| n.end).fold(score.end, u64::max));
+    let secs = score.seconds(score.last());
     let loop_secs = score.lp.map(|l| secs - score.seconds(l));
     // (A looping song renders once through, plus a second of its loop.)
     let limit = loop_secs.map_or(60.0 * 30.0, |_| secs + 1.0);
@@ -108,10 +115,21 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
             plain = song.tracks.iter().map(|t| arrange::tokens(t, false, &lens)).collect();
         }
     }
-    let toks: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, true, &lens)).collect();
+    // (The plain MML keeps the data as it was made, so a check against it covers the compacted data too.)
+    let header: Vec<String> = song.header.iter().map(|h| mml::compact(h)).collect();
+    let mml = if score.sections.is_empty() {
+        let toks: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, true, &lens)).collect();
+        mml::minify(&header, &toks, &mut lens)
+    } else {
+        let tracks: Vec<(String, Vec<_>)> = song.tracks.iter().zip(&plain).enumerate().map(|(i, (t, toks))| {
+            let name = score.names.get(t.ch as usize).filter(|n| !n.is_empty()).map_or(String::new(), |n| format!(", {n}"));
+            (format!("Track {}{name}", i + 1), toks.clone())
+        }).collect();
+        pretty::write(&score.title, &header, &tracks, &song.sections, song.lp, if score.db { 128 } else if score.fine { 256 } else { 16 }, &mut lens)
+    };
     Converted {
         plain: mml::plain(&song.header, &plain, &lens),
-        mml: mml::minify(&song.header, &toks, &mut lens),
+        mml,
         tracks: song.tracks.len(),
         notes: song.notes,
         secs,

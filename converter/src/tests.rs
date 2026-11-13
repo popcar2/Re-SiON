@@ -16,8 +16,8 @@ fn render(mml: &str) -> Vec<f32> {
 
 /// Convert, render, and compare with the reference: (SNR in dB, MML).
 fn compare(m: &Module) -> (f64, String) {
-    let out = module_to_mml(m, &Options::default());
-    let (_, _, tr) = play::to_score(m, false);
+    let out = module_to_mml(m, &Options { exact: true, ..Options::default() });
+    let (_, _, tr) = play::to_score(m, false, false);
     let want = play::render(m, &tr);
     let got = render(&out.mml);
     assert_eq!(render(&out.plain), got, "minified MML must sound like the plain conversion");
@@ -38,12 +38,12 @@ fn module(kind: Kind, linear: bool, samples: Vec<Sample>, instruments: Vec<Instr
     let cells = rows.iter().flat_map(|r| (0..chans).map(|c| r.get(c).copied().unwrap_or_default())).collect();
     Module {
         kind, chans, orders: vec![0], restart: 0, patterns: vec![Pattern { rows: rows.len(), cells }], instruments, samples, speed: 6, tempo: 125, gvol: 128,
-        pan: vec![-32, 32, 0, 16][..chans].to_vec(), chvol: vec![64; chans], linear, compat_g: false, note_ofs: 0, warnings: vec![],
+        pan: vec![-32, 32, 0, 16][..chans].to_vec(), chvol: vec![64; chans], linear, compat_g: false, note_ofs: 0, warnings: vec![], title: String::new(),
     }
 }
 
 fn plain(n: usize) -> Vec<Instrument> {
-    (0..n).map(|s| Instrument { map: (0..120).map(|k| (k as u8, s as u16 + 1)).collect(), venv: None, penv: None, fadeout: 0, gvol: 128, pan: None, nna: 0 }).collect()
+    (0..n).map(|s| Instrument { map: (0..120).map(|k| (k as u8, s as u16 + 1)).collect(), venv: None, penv: None, fadeout: 0, gvol: 128, pan: None, nna: 0, name: String::new() }).collect()
 }
 
 fn samples() -> Vec<Sample> {
@@ -60,14 +60,14 @@ fn samples() -> Vec<Sample> {
 #[test]
 fn samples_are_embedded_losslessly() {
     let m = module(Kind::Xm, true, samples(), plain(3), 1, vec![vec![cell(48, 1, Fx::None)], vec![cell(50, 2, Fx::None)], vec![cell(52, 3, Fx::None)]]);
-    let out = module_to_mml(&m, &Options::default());
+    let out = module_to_mml(&m, &Options { exact: true, ..Options::default() });
     for (i, s) in m.samples.iter().enumerate() {
         let def = out.mml.split(';').find(|d| d.trim_start().starts_with(&format!("#PCMB{i}{{"))).unwrap_or_else(|| panic!("no #PCMB{i}"));
         // The definition decodes to exactly the source frames (up to the loop end).
         let want = crate::sample::as_sion(s);
         let flags: Vec<&str> = def.rsplit('}').next().unwrap().split(',').collect();
-        assert_eq!(flags.len(), 4, "{def:.40}");
-        assert_eq!(flags[3].trim(), match i { 0 => "1", 1 => "0", _ => "3" }, "bit depth and ping-pong flags");
+        // (Arguments at their defaults are left off the end: flags 0.)
+        assert_eq!(flags.get(3).map_or("0", |f| f.trim()), match i { 0 => "1", 1 => "0", _ => "3" }, "bit depth and ping-pong flags {def:.40}");
         assert_eq!(want.data.len(), if i == 2 { 300 } else { s.data.len() });
     }
 }
@@ -135,8 +135,8 @@ fn debug_file() {
             }
         }
     }
-    let out = module_to_mml(&m, &Options::default());
-    let (_, _, tr) = play::to_score(&m, false);
+    let out = module_to_mml(&m, &Options { exact: true, ..Options::default() });
+    let (_, _, tr) = play::to_score(&m, false, false);
     let want = play::render(&m, &tr);
     let got = render(&out.mml);
     println!("total {:.1} dB", snr(&want, &got));
@@ -155,4 +155,18 @@ fn debug_file() {
         }
     }
     std::fs::write(std::env::temp_dir().join("sion_debug.mml"), &out.plain).unwrap();
+}
+
+#[test]
+fn data_written_compactly() {
+    use crate::mml::compact;
+    // Runs of one value as `(v)n` where shorter; other commands and syntax as they are.
+    assert_eq!(compact("#WAV0{126,126,-18,-18,-18,-18,0,0,5}"), "#WAV0{(126)2,(-18)4,0,0,5}");
+    assert_eq!(compact("#TABLE3{1,1,1,1}"), "#TABLE3{(1)4}");
+    assert_eq!(compact("#TABLE2{(0,-768)4 -768}"), "#TABLE2{(0,-768)4 -768}");
+    assert_eq!(compact("#OPN@0{1,1,1,1}"), "#OPN@0{1,1,1,1}");
+    // `#PCMB` arguments at their defaults (key 60, no loop, flags 0, level 0) left off the end.
+    assert_eq!(compact("#PCMB0{AAAA}8400,60,-1,0"), "#PCMB0{AAAA}8400");
+    assert_eq!(compact("#PCMB1{AAAA}8400,60,10,0"), "#PCMB1{AAAA}8400,60,10");
+    assert_eq!(compact("#PCMB2{=1}8400,60,-1,4,30"), "#PCMB2{=1}8400,60,-1,4,30");
 }
