@@ -123,6 +123,21 @@ fn nums(s: &[u8]) -> Vec<f32> {
     v
 }
 
+/// `#WAVCOLOR`: a 1024-sample wave adding sine harmonics 1,2,3,4,5,6,8 at the levels of hex digits 0..6
+/// (lowest first, n/16 each), scaled so its peak is full scale. The top digit picks the base wave
+/// (`%5@0`..`%5@15`, sine by default), as in SiON (GDSiON always uses a sine). Sampled like SiON:
+/// sample `j` reads the base wave at phase `j + 63/64`; SiON's sine table is read at entry centers.
+fn wave_color(sh: &Shared, c: u32) -> Vec<f32> {
+    let pg = (c >> 28) as i32;
+    let base = |p: u32| if pg == 0 { M::sin(((p & 65535) >> 6) as f32 * (core::f32::consts::TAU / 1024.0) + core::f32::consts::PI / 1024.0) }
+        else { wave(sh, pg, (p & 65535) as f32 / 65536.0) };
+    let out: Vec<f32> = (0..1024u32).map(|j| [1, 2, 3, 4, 5, 6, 8].iter().enumerate()
+        .map(|(n, m)| base((j * 64 + 63) * m) * (c >> (n * 4) & 15) as f32 / 16.0).sum()).collect();
+    let peak = out.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    if peak == 0.0 { return out }
+    out.iter().map(|v| v / peak).collect()
+}
+
 /// Parse `#TABLE` / `#WAV` numbers: values, `(a,b)n` interpolation, `[..]n` loops, `|` repeat point,
 /// with a `n*scale+offset` postfix.
 fn table(d: &[u8], pfx: &[u8]) -> Table {
@@ -972,6 +987,11 @@ impl Song {
                 b"WAVB" => {
                     let hex: Vec<u32> = dat.iter().filter_map(|c| (*c as char).to_digit(16)).collect();
                     sh.waves[k & 255] = hex.chunks_exact(2).map(|p| (p[0] * 16 + p[1]) as u8 as i8 as f32 / 128.0).collect();
+                }
+                b"WAVCOLOR" | b"WAVC" => {
+                    let hex = dat.strip_prefix(b"0x").or_else(|| dat.strip_prefix(b"0X")).unwrap_or(dat);
+                    let c = hex.iter().filter_map(|c| (*c as char).to_digit(16)).fold(0u32, |a, d| a << 4 | d);
+                    sh.waves[k & 255] = wave_color(&sh, c);
                 }
                 b"PCMB" => {
                     let bytes = match dat.strip_prefix(b"=") {

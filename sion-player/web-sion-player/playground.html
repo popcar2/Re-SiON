@@ -1,6 +1,6 @@
 <!doctype html>
 <!-- MML playground: write or paste MML and play it, with the notes being played highlighted in the text.
-     Uses the same files as index.html (style.css, player.js, the workers, sion.wasm, songs/). -->
+     Uses the same files as songs.html (style.css, player.js, the workers, sion.wasm, songs/). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -71,8 +71,8 @@
 <body>
 <main>
   <header>
-    <h1>SiON</h1><span>MML playground</span>
-    <nav><a href="./">Songs</a><a href="playground.html" aria-current="page">Playground</a><a href="convert.html">Convert</a></nav>
+    <h1><a href="./">SiON</a></h1>
+    <nav><a href="songs.html">Songs</a><a href="playground.html" aria-current="page">Playground</a><a href="convert.html">Convert</a><a href="docs.html">Docs</a></nav>
   </header>
   <div class="tools">
     <button class="go" id="run" title="Play from the start (Ctrl+Enter)">
@@ -108,14 +108,16 @@ const EXAMPLES = [
   const name = file.replace(/\.(sion)?mml$/i, ""), cut = name.indexOf(" - ");
   return { file, title: name.slice(cut + 3), artist: name.slice(0, cut), volume: 1 };
 });
-// The song list's per-song volumes (see index.html), so examples play as loud as they do there.
+// The song list's per-song volumes (see songs.html), so examples play as loud as they do there.
 fetch("songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
   for (const e of EXAMPLES) e.volume = list.find((s) => s.file === e.file)?.volume ?? 1;
 }).catch(() => {});
 
 const STARTER = `// Paste some MML here to play it!
 // Writing it manually is very difficult, but programs like Bosca Ceoil Blue can export SiON-compatible MML.
-// Or, select an example above to see how SiON plays in real time.
+// Select an example above to see how SiON plays in real time, or try editing this basic example.
+
+// Original SiON reference manual: https://keim.github.io/SiON/mmlref/sion_mml_reference_e.html
 
 // Do Re Mi Fa Sol La Si Do on a pure sine wave (%5@0). $ marks where it loops from.
 

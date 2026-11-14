@@ -1,0 +1,68 @@
+<!doctype html>
+<!-- The song list of the SiON player (index.html is the home page). Serve this folder over HTTP (e.g. `python3 -m http.server`), then open it.
+     Needs style.css, player.js, sion.js, sion.wasm, render.js, worklet.js, length.js, songs.json and songs/
+     next to it; playground.html is the MML editor, convert.html the converter (convert.js, convert.wasm,
+     convert-worker.js), and docs.html the library docs. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SiON Player</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="./">SiON</a></h1>
+    <nav><a href="songs.html" aria-current="page">Songs</a><a href="playground.html">Playground</a><a href="convert.html">Convert</a><a href="docs.html">Docs</a></nav>
+  </header>
+  <ol class="songs" id="list"></ol>
+</main>
+
+<script type="module">
+import { createPlayer } from "./player.js";
+
+// songs.json: [{file, volume}], written by the desktop player's build (build.rs), which measures each song
+// to find the volume that brings it to a common loudness.
+// (no-cache: revalidate with the server, so a song added or reconverted shows up without a hard refresh.)
+const files = await (await fetch("songs.json", { cache: "no-cache" })).json();
+const songs = files.map(({ file, volume = 1 }, i) => {
+  const name = file.replace(/\.(sion)?mml$/i, "");
+  const cut = name.indexOf(" - ");
+  return cut < 0 ? { i, file, volume, title: name, artist: "" }
+                 : { i, file, volume, artist: name.slice(0, cut), title: name.slice(cut + 3) };
+});
+
+// ---- Song list ----
+const rows = songs.map((s) => {
+  const li = document.createElement("li");
+  li.innerHTML = `<span class="n">${s.i + 1}</span><div class="t"><span></span><span class="a"></span></div>`;
+  li.querySelector(".t span").textContent = s.title;
+  li.querySelector(".a").textContent = s.artist;
+  li.onclick = () => play(s.i);
+  document.getElementById("list").append(li);
+  return li;
+});
+
+// ---- Player ----
+const player = createPlayer({
+  idleText: "Pick a song",
+  idle: () => play(0),
+  prev: () => current() > 0 && play(current() - 1),
+  next: () => current() >= 0 && current() + 1 < songs.length && play(current() + 1),
+  canPrev: () => current() > 0,
+  canNext: () => current() < songs.length - 1,
+  ended: () => current() + 1 < songs.length ? play(current() + 1) : player.stop(),
+  show: (s) => rows.forEach((li, i) => li.classList.toggle("on", s === songs[i])),
+});
+
+function current() { return player.song?.i ?? -1 }
+
+function play(i) {
+  const s = songs[i];
+  player.play(fetch("songs/" + encodeURIComponent(s.file), { cache: "no-cache" }).then((r) => r.text()), s);
+  rows[i].scrollIntoView({ block: "nearest" });
+}
+</script>
+</body>
+</html>

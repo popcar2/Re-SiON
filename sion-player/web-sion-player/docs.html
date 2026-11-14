@@ -1,0 +1,150 @@
+<!doctype html>
+<!-- Documentation for the sion library: generated from sion/README.md (keep the two in step). -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SiON Docs</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  :root { --width: 760px; --code: #f1f0ec; }
+  @media (prefers-color-scheme: dark) { :root { --code: #1f1f1d; } }
+  main { padding-bottom: 96px; line-height: 1.6; }
+  article h2 { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; margin: 44px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); }
+  article h3 { font-size: 14px; font-weight: 650; margin: 26px 0 6px; }
+  article p, article ul { margin: 8px 0; }
+  article ul { padding-left: 20px; }
+  article li { margin: 3px 0; }
+  article a { color: var(--accent); text-decoration: none; }
+  article a:hover { text-decoration: underline; }
+  article strong { font-weight: 600; }
+  code { font: 12.5px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace; background: var(--code); padding: 1px 4px; border-radius: 4px; }
+  pre { background: var(--code); border-radius: 8px; padding: 12px 14px; overflow-x: auto; margin: 10px 0; }
+  pre code { background: none; padding: 0; font-size: 12.5px; }
+  .table { overflow-x: auto; margin: 10px 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; vertical-align: top; padding: 6px 10px 6px 0; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 550; font-size: 12px; }
+  td:first-child { min-width: 7em; max-width: 45%; }
+  td code { overflow-wrap: anywhere; }
+
+  .toc { margin: 20px 0 0; padding: 14px 16px; border: 1px solid var(--line); border-radius: 10px; font-size: 13px; }
+  .toc ol { list-style: none; margin: 0; padding: 0; }
+  .toc ol { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 4px 16px; }
+  .toc a { color: var(--fg); text-decoration: none; }
+  .toc a:hover { color: var(--accent); }
+  :target { scroll-margin-top: 16px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="./">SiON</a></h1>
+    <nav><a href="songs.html">Songs</a><a href="playground.html">Playground</a><a href="convert.html">Convert</a><a href="docs.html" aria-current="page">Docs</a></nav>
+  </header>
+  <article>
+<p>A small player for SiON MML music. Give it MML text and it renders stereo audio. It has no dependencies and is <code>no_std</code>, so the same code runs as a Rust crate, as WebAssembly in the browser, and as a C library.</p>
+<ul><li>Output: interleaved stereo <code>f32</code> (left, right, left, right…) at 44,100 Hz.</li><li>One <em>frame</em> is one left/right pair, so 44,100 frames are one second.</li><li>The MML language itself is described in the <a href="https://keim.github.io/SiON/mmlref/sion_mml_reference_e.html">SiON MML reference manual</a>. <a href="#mml-support">MML support</a> below lists what this player implements and where it differs.</li></ul>
+<nav class="toc" aria-label="Contents"><ol><li><a href="#quick-start">Quick start</a></li><li><a href="#how-playback-works">How playback works</a></li><li><a href="#rust-api">Rust API</a></li><li><a href="#javascript-api">JavaScript API</a></li><li><a href="#c-api">C API</a></li><li><a href="#building">Building</a></li><li><a href="#mml-support">MML support</a></li></ol></nav>
+<h2 id="quick-start">Quick start</h2>
+<p>Every interface works the same way: create a song from MML, then ask it for audio a block at a time until it says it has finished.</p>
+<h3 id="rust">Rust</h3>
+<pre class="lang-toml"><code>[dependencies]
+sion = { path = &quot;../sion&quot; }</code></pre>
+<pre class="lang-rust"><code>use sion::{Song, RATE};
+
+let mut song = Song::new(&quot;t120 %5@0 l8 cdefgab&lt;c;&quot;);
+let mut buf = vec![0f32; 2 * 1024]; // 1024 frames
+while song.render(&amp;mut buf) {
+    // buf holds 1024 stereo frames at RATE Hz: send them to your audio output.
+}</code></pre>
+<h3 id="javascript-browser-node-deno">JavaScript (browser, Node, Deno)</h3>
+<p>Copy <code>sion.wasm</code> and <code>sion.js</code> next to your page.</p>
+<pre class="lang-js"><code>import { Sion } from &quot;./sion.js&quot;;
+
+const sion = await Sion.load(fetch(&quot;sion.wasm&quot;));
+const song = sion.song(&quot;t120 %5@0 l8 cdefgab&lt;c;&quot;);
+const buf = new Float32Array(2 * 1024);
+while (song.render(buf)) {
+  // play buf (interleaved stereo, sion.rate Hz)
+}
+song.free(); // songs live in wasm memory: free them when done</code></pre>
+<h3 id="c-c">C / C++</h3>
+<p>Link against <code>libsion.so</code> (Linux) or <code>sion.dll</code> (Windows) and include <code>sion.h</code>.</p>
+<pre class="lang-c"><code>#include &lt;string.h&gt;
+#include &quot;sion.h&quot;
+
+const char *mml = &quot;t120 %5@0 l8 cdefgab&lt;c;&quot;;
+SionSong *song = sion_song_new(mml, strlen(mml));
+float buf[2 * 1024];
+while (sion_song_render(song, buf, 1024)) {
+    /* play buf (interleaved stereo, sion_rate() Hz) */
+}
+sion_song_free(song);</code></pre>
+<h2 id="how-playback-works">How playback works</h2>
+<p><strong>Rendering.</strong> Each <code>render</code> call fills the buffer and moves playback forward by that many frames. Any buffer size works. Samples are clamped to -1..1.</p>
+<p><strong>Ending.</strong> <code>render</code> returns <code>false</code> once every track has ended and the output has been silent for half a second, so release tails are not cut off. A song with a <code>$</code> loop point never ends: stop it yourself.</p>
+<p><strong>Length.</strong> <code>length</code> measures one pass through the MML, in frames, without rendering any audio. One pass ends when every track has either finished or jumped back to its <code>$</code> once. It is capped at one hour. Release tails are not included.</p>
+<p><strong>Looping.</strong> For a song with <code>$</code>, <code>loop_start</code> gives the frame playback returns to after <code>length</code> frames. Use both to show a loop region or to seek within a looping song.</p>
+<p><strong>Seeking.</strong> <code>skip(frames)</code> moves forward without producing output. It jumps from event to event instead of synthesizing every sample, so it is fast even for long songs. The result is close to, but not exactly, what continuous playback gives: echoes from before the last quarter second are missing, and vibrato phases drift. To seek backwards, create a new song and skip from the start.</p>
+<p><strong>Following along.</strong> <code>notes()</code> gives, per track, the byte offset in the MML text of the note playing now (-1 for a rest or an ended track). Use it to highlight the playing notes in an editor. It needs the <code>spans</code> feature (always on in the WebAssembly build).</p>
+<p><strong>PCM samples.</strong> Modules <code>%7</code> and <code>%10</code> play recorded samples. Embed them in the MML with <code>#PCMB</code>, or set them from code with <code>set_sample</code>, which replaces any <code>#PCMB</code> of the same number.</p>
+<h2 id="rust-api">Rust API</h2>
+<p>Everything is on <code>sion::Song</code>. The crate is not on crates.io, so add it as a path or git dependency.</p>
+<div class="table"><table><thead><tr><th>Item</th><th>Description</th></tr></thead><tbody><tr><td><code>RATE: f32</code></td><td>Output sample rate: <code>44100.0</code>.</td></tr><tr><td><code>Song::new(mml: &amp;str) -&gt; Song</code></td><td>Parse MML. Never fails: anything it does not understand is ignored.</td></tr><tr><td><code>Song::from_bytes(mml: &amp;[u8]) -&gt; Song</code></td><td>Same, from bytes. Only the ASCII in the MML matters.</td></tr><tr><td><code>song.render(out: &amp;mut [f32]) -&gt; bool</code></td><td>Fill <code>out</code> with interleaved stereo. <code>false</code> once the song has finished.</td></tr><tr><td><code>song.skip(frames: u64) -&gt; bool</code></td><td>Move ahead without output (see <a href="#how-playback-works">Seeking</a>). <code>false</code> once finished.</td></tr><tr><td><code>song.position() -&gt; u64</code></td><td>Frames rendered or skipped so far.</td></tr><tr><td><code>song.notes() -&gt; impl Iterator&lt;Item = i32&gt;</code></td><td>Per track, the byte offset of the playing note, or -1. Needs the <code>spans</code> feature.</td></tr><tr><td><code>song.set_sample(n: usize, s: Sample)</code></td><td>Set PCM sample <code>n</code> (0..255) for <code>%7</code> / <code>%10</code>.</td></tr><tr><td><code>Song::length(mml: &amp;str) -&gt; u64</code></td><td>Frames in one pass through the MML, without rendering.</td></tr><tr><td><code>Song::loop_start(mml: &amp;str) -&gt; Option&lt;u64&gt;</code></td><td>Frame a <code>$</code> loop returns to after <code>length</code>. <code>None</code> if the song ends.</td></tr><tr><td><code>Song::length_bytes</code>, <code>Song::loop_start_bytes</code></td><td><code>length</code> and <code>loop_start</code> for MML as bytes.</td></tr></tbody></table></div>
+<p><code>Sample</code> describes one PCM sample:</p>
+<div class="table"><table><thead><tr><th>Field</th><th>Description</th></tr></thead><tbody><tr><td><code>data: Vec&lt;f32&gt;</code></td><td>Mono samples in -1..1.</td></tr><tr><td><code>rate: f32</code></td><td>Sample rate it was recorded at, in Hz.</td></tr><tr><td><code>key: i32</code></td><td>MIDI note that plays it at its original pitch (60 = middle C).</td></tr><tr><td><code>lp: Option&lt;usize&gt;</code></td><td>Frame to loop back to after the end, or <code>None</code> to play once.</td></tr><tr><td><code>bidi: bool</code></td><td>Loop back and forth instead of jumping back.</td></tr></tbody></table></div>
+<pre class="lang-rust"><code>use sion::{Sample, Song};
+
+let mut song = Song::new(&quot;%7@0 o5 l4 c e g;&quot;);
+song.set_sample(0, Sample { data: my_wave, rate: 22050.0, key: 60, lp: None, bidi: false });</code></pre>
+<h2 id="javascript-api">JavaScript API</h2>
+<p><code>sion.js</code> wraps <code>sion.wasm</code>. It has no dependencies and works in browsers, Node and Deno.</p>
+<h3 id="sion"><code>Sion</code></h3>
+<div class="table"><table><thead><tr><th>Member</th><th>Description</th></tr></thead><tbody><tr><td><code>await Sion.load(source)</code></td><td>Load the module. <code>source</code>: a <code>fetch</code> response, bytes, or a <code>WebAssembly.Module</code>.</td></tr><tr><td><code>sion.rate</code></td><td>Output sample rate (44100).</td></tr><tr><td><code>sion.song(mml)</code></td><td>Parse MML text into a <code>Song</code>.</td></tr><tr><td><code>sion.length(mml)</code></td><td>Frames in one pass through the MML, without rendering.</td></tr><tr><td><code>sion.loopStart(mml)</code></td><td>Frame a <code>$</code> loop returns to after <code>length</code>. -1 if the song ends.</td></tr></tbody></table></div>
+<h3 id="song"><code>Song</code></h3>
+<div class="table"><table><thead><tr><th>Member</th><th>Description</th></tr></thead><tbody><tr><td><code>song.render(buf)</code></td><td>Fill a <code>Float32Array</code> with interleaved stereo. <code>false</code> once the song has finished.</td></tr><tr><td><code>song.skip(frames)</code></td><td>Move ahead without output. <code>false</code> once finished.</td></tr><tr><td><code>song.position</code></td><td>Frames rendered or skipped so far.</td></tr><tr><td><code>song.notes()</code></td><td>Array with, per track, the UTF-8 byte offset of the playing note, or -1.</td></tr><tr><td><code>song.setSample(n, data, rate, key, loopStart, bidi)</code></td><td>Set PCM sample <code>n</code> (0..255). <code>data</code>: mono floats in -1..1. Optional: <code>key</code> (60), <code>loopStart</code> (-1 = no loop), <code>bidi</code> (false).</td></tr><tr><td><code>song.free()</code></td><td>Release the song's memory. Do not use the song afterwards.</td></tr></tbody></table></div>
+<p><code>notes()</code> offsets count UTF-8 bytes, not JS string characters. They only differ if the MML contains non-ASCII text, such as comments in Japanese.</p>
+<p>To play in real time, render inside an <code>AudioWorklet</code>. The web player's <code>worklet.js</code> and <code>player.js</code> show one way to do it.</p>
+<h2 id="c-api">C API</h2>
+<p>Declared in <code>sion.h</code>. All functions are safe to call with a <code>NULL</code> song or MML pointer.</p>
+<div class="table"><table><thead><tr><th>Function</th><th>Description</th></tr></thead><tbody><tr><td><code>uint32_t sion_rate(void)</code></td><td>Output sample rate (44100).</td></tr><tr><td><code>SionSong *sion_song_new(const char *mml, size_t len)</code></td><td>Parse <code>len</code> bytes of MML. The text need not end in NUL.</td></tr><tr><td><code>void sion_song_free(SionSong *song)</code></td><td>Free a song.</td></tr><tr><td><code>int32_t sion_song_render(SionSong *song, float *out, size_t frames)</code></td><td>Fill <code>out</code> with <code>2 * frames</code> floats. 1 while playing, 0 once finished.</td></tr><tr><td><code>int32_t sion_song_skip(SionSong *song, uint64_t frames)</code></td><td>Move ahead without output. 1 while playing, 0 once finished.</td></tr><tr><td><code>uint64_t sion_song_position(const SionSong *song)</code></td><td>Frames rendered or skipped so far.</td></tr><tr><td><code>uint64_t sion_length(const char *mml, size_t len)</code></td><td>Frames in one pass through the MML.</td></tr><tr><td><code>int64_t sion_loop_start(const char *mml, size_t len)</code></td><td>Frame a <code>$</code> loop returns to after <code>sion_length</code>. -1 if the song ends.</td></tr><tr><td><code>void sion_song_set_sample(song, n, data, frames, rate, key, loop_start, bidi)</code></td><td>Set PCM sample <code>n</code> (0..255) from <code>frames</code> mono floats. Negative <code>loop_start</code> = no loop. Nonzero <code>bidi</code> = back-and-forth loop. See <code>sion.h</code> for the argument types.</td></tr></tbody></table></div>
+<p>A song is not thread-safe: use each <code>SionSong</code> from one thread at a time. Separate songs are independent.</p>
+<h2 id="building">Building</h2>
+<p>The crate builds on stable Rust. The release scripts need nightly with <code>rust-src</code>, which they use to make the outputs small.</p>
+<div class="table"><table><thead><tr><th>Command</th><th>Output</th></tr></thead><tbody><tr><td><code>cargo build --release</code></td><td>The Rust library.</td></tr><tr><td><code>cargo test</code></td><td>Runs the tests in <code>tests/</code>.</td></tr><tr><td><code>./build-wasm.sh</code></td><td><code>target/wasm32-unknown-unknown/wasm/sion.wasm</code>. Runs <code>wasm-opt</code> too if Binaryen is installed.</td></tr><tr><td><code>./build-ffi.sh [TARGET]</code></td><td><code>target/TARGET/ffi/libsion.so</code>, or <code>sion.dll</code> + <code>libsion.dll.a</code> for a Windows target.</td></tr></tbody></table></div>
+<p>Cargo features:</p>
+<div class="table"><table><thead><tr><th>Feature</th><th>Description</th></tr></thead><tbody><tr><td><code>spans</code></td><td>Track which note in the MML each track is playing (<code>Song::notes</code>). Slightly slower parsing.</td></tr><tr><td><code>small</code></td><td>Nightly only. For size-optimized builds: keeps the per-sample code optimized for speed.</td></tr><tr><td><code>wasm</code></td><td>The WebAssembly exports. Used by <code>build-wasm.sh</code>; not for use as a dependency.</td></tr><tr><td><code>ffi</code></td><td>The C exports. Used by <code>build-ffi.sh</code>; not for use as a dependency.</td></tr></tbody></table></div>
+<h2 id="mml-support">MML support</h2>
+<p>This section is a summary. For each command's full meaning and parameters, see the <a href="https://keim.github.io/SiON/mmlref/sion_mml_reference_e.html">SiON MML reference manual</a>.</p>
+<h3 id="structure">Structure</h3>
+<ul><li>Statements end with <code>;</code>. Each statement that does not start with <code>#</code> is one track. All tracks play at once.</li><li>Comments: <code>// to end of line</code> and <code>/* block */</code>.</li><li>Unknown commands are skipped, so MML written for full SiON still plays, minus the parts this player lacks.</li></ul>
+<h3 id="notes-and-timing">Notes and timing</h3>
+<div class="table"><table><thead><tr><th>Command</th><th>Meaning</th></tr></thead><tbody><tr><td><code>c d e f g a b</code></td><td>Notes. Add <code>+</code> or <code>#</code> for sharp and <code>-</code> for flat, then an optional length: <code>c+8</code>, <code>e-4.</code>.</td></tr><tr><td><code>r</code></td><td>Rest.</td></tr><tr><td><code>4</code>, <code>8.</code>, <code>16..</code> (after a note)</td><td>Length: a note value, with optional dots.</td></tr><tr><td><code>^</code></td><td>Tie: adds a length to the previous note (<code>c4^16</code>).</td></tr><tr><td><code>&amp;</code></td><td>Slur: the next note changes pitch without re-attacking.</td></tr><tr><td><code>&amp;&amp;</code></td><td>Hold the note into the next one, which re-attacks.</td></tr><tr><td><code>*</code></td><td>Glide: bend from this note to the next over this note's length.</td></tr><tr><td><code>l</code></td><td>Default note length (<code>l8</code>).</td></tr><tr><td><code>o</code>, <code>&lt;</code>, <code>&gt;</code></td><td>Octave (<code>o5</code> is the default), up one, down one.</td></tr><tr><td><code>t</code></td><td>Tempo in BPM (<code>t120</code>).</td></tr><tr><td><code>q</code></td><td>Gate: the share of each note that sounds, in eighths (<code>q6</code>, default 6).</td></tr><tr><td><code>@q</code></td><td>Gate in absolute time: shorten notes, delay key-on.</td></tr><tr><td><code>[ ... | ... ]n</code></td><td>Repeat <code>n</code> times (default 2). The part after <code>|</code> is skipped on the last time.</td></tr><tr><td><code>$</code></td><td>Loop point: when the track ends, it jumps back here forever.</td></tr><tr><td><code>kt</code>, <code>!@ns</code></td><td>Transpose in semitones.</td></tr><tr><td><code>k</code></td><td>Detune, in 1/64 semitones. Fractions are allowed (<code>k-12.375</code>).</td></tr><tr><td><code>!@kr</code></td><td>Detune relative to the current value.</td></tr><tr><td><code>po</code></td><td>Portamento: slide between slurred notes over <code>n</code> frames.</td></tr></tbody></table></div>
+<h3 id="volume-and-panning">Volume and panning</h3>
+<div class="table"><table><thead><tr><th>Command</th><th>Meaning</th></tr></thead><tbody><tr><td><code>v</code></td><td>Volume, 0..16 (default 16).</td></tr><tr><td><code>(</code>, <code>)</code></td><td>Volume up / down by one step.</td></tr><tr><td><code>x</code></td><td>Expression (a second volume), 0..128.</td></tr><tr><td><code>%v</code>, <code>%x</code></td><td>Volume curve used by <code>v</code> and <code>x</code>.</td></tr><tr><td><code>@v</code></td><td>Volume 0..128, then up to 7 effect send levels (<code>@v64,32</code> sends half to <code>#EFFECT1</code>).</td></tr><tr><td><code>p</code></td><td>Pan, 0 (left) to 8 (right); 4 is the center.</td></tr><tr><td><code>@p</code></td><td>Fine pan, -64 (left) to 64 (right).</td></tr><tr><td><code>@mask</code></td><td>Ignore later commands of some kinds (bits: 1 volume, 2 pan, 4 gate, 8 tone, 16 envelope, 32 modulation, 64 slur).</td></tr></tbody></table></div>
+<h3 id="sound-modules">Sound modules</h3>
+<p><code>%n</code> picks the sound source for the track, and <code>@n</code> picks a tone within it.</p>
+<div class="table"><table><thead><tr><th>Module</th><th>Sound</th></tr></thead><tbody><tr><td><code>%0</code></td><td>PSG: square wave and noise.</td></tr><tr><td><code>%1</code></td><td>NES APU: pulse waves, triangle, noise.</td></tr><tr><td><code>%2</code></td><td>Noise.</td></tr><tr><td><code>%3</code></td><td>Yamaha MA-3 waveforms.</td></tr><tr><td><code>%4</code></td><td>Custom wavetables from <code>#WAV</code>, <code>#WAVB</code> or <code>#WAVCOLOR</code>.</td></tr><tr><td><code>%5</code></td><td>All built-in waveforms (<code>%5@0</code> is a sine wave).</td></tr><tr><td><code>%6</code></td><td>FM voice defined with <code>#@</code>, <code>#OPM@</code>, <code>#OPN@</code>, <code>#OPL@</code>, <code>#OPX@</code>, <code>#MA@</code> or <code>#AL@</code>.</td></tr><tr><td><code>%7</code></td><td>PCM sample (<code>#PCMB</code> or <code>set_sample</code>).</td></tr><tr><td><code>%8</code></td><td>Pulse wave with adjustable duty.</td></tr><tr><td><code>%9</code></td><td>Ramp wave.</td></tr><tr><td><code>%10</code></td><td>Sampler: PCM samples, like <code>%7</code>.</td></tr><tr><td><code>%11</code></td><td>Plucked string (Karplus&ndash;Strong).</td></tr><tr><td><code>%12</code></td><td>Game Boy.</td></tr><tr><td><code>%13</code></td><td>Konami VRC6.</td></tr><tr><td><code>%14</code></td><td>Commodore SID.</td></tr></tbody></table></div>
+<h3 id="tone-shaping">Tone shaping</h3>
+<div class="table"><table><thead><tr><th>Command</th><th>Meaning</th></tr></thead><tbody><tr><td><code>@</code></td><td>Tone number, then optional envelope: <code>@tone,ar,dr,sr,rr,sl,tl,…</code>.</td></tr><tr><td><code>s</code></td><td>Release rate, then an optional pitch sweep during release.</td></tr><tr><td><code>@rr</code></td><td>Release rate of the carriers.</td></tr><tr><td><code>@al</code>, <code>@fb</code></td><td>FM algorithm (operator count, connection) and feedback.</td></tr><tr><td><code>i</code></td><td>Select which FM operator the next operator commands change.</td></tr><tr><td><code>@tl</code>, <code>@ml</code>, <code>@dt</code>, <code>@fx</code>, <code>@ph</code>, <code>@se</code>, <code>@er</code></td><td>Per-operator total level, multiple, detune, fixed pitch, start phase, SSG envelope, envelope reset.</td></tr><tr><td><code>@ph</code> on <code>%7</code> / <code>%10</code></td><td>Start frame (fractions and negative values allowed), then optionally how many frames to play.</td></tr><tr><td><code>@f</code>, <code>%f</code></td><td>Resonant filter with its own envelope; <code>%f</code> picks low-pass (0), band-pass (1) or high-pass (2).</td></tr><tr><td><code>@lfo</code></td><td>LFO speed and waveform for <code>mp</code> / <code>ma</code>.</td></tr><tr><td><code>mp</code>, <code>ma</code></td><td>Vibrato (pitch) and tremolo (amplitude) depth, optionally fading in.</td></tr><tr><td><code>@clock</code></td><td>Scale the FM operators' clock, in percent.</td></tr><tr><td><code>@fps</code></td><td>Envelope table speed for this track, in steps per second.</td></tr><tr><td><code>@i</code>, <code>@o</code>, <code>@r</code></td><td>Pipes: route one track's output into another as FM input or ring modulation.</td></tr></tbody></table></div>
+<h3 id="envelope-tables">Envelope tables</h3>
+<p>Define a table with <code>#TABLEn{...}</code>, then apply it per step to a note:</p>
+<div class="table"><table><thead><tr><th>Command</th><th>Applies the table to</th></tr></thead><tbody><tr><td><code>na</code></td><td>Amplitude.</td></tr><tr><td><code>nt</code></td><td>Note (in semitones).</td></tr><tr><td><code>np</code></td><td>Pitch (in 1/64 semitones).</td></tr><tr><td><code>nf</code></td><td>Filter cutoff.</td></tr><tr><td><code>@@</code></td><td>Tone number.</td></tr></tbody></table></div>
+<p>Prefix with <code>_</code> (<code>_na</code>) for the release part of the note. <code>!na</code> makes amplitude values absolute. A table can also be written inline: <code>na{0,8,16}</code>. Table syntax supports <code>(a,b)n</code> interpolation, <code>[...]n</code> repeats, a <code>|</code> loop point and a <code>*scale+offset</code> suffix.</p>
+<h3 id="definitions-statements">Definitions (<code>#</code> statements)</h3>
+<div class="table"><table><thead><tr><th>Statement</th><th>Meaning</th></tr></thead><tbody><tr><td><code>#A=...;</code></td><td>Macro: <code>A</code> in a track is replaced by the text. <code>A(3)</code> plays it transposed. Also <code>#A+=</code>, <code>#ABC=</code> and <code>#A-C=</code>.</td></tr><tr><td><code>#MACRO{dynamic};</code></td><td>Expand macros where they are used rather than where they are defined.</td></tr><tr><td><code>#@n{...}</code> and chip formats</td><td>FM voice <code>n</code>: <code>#@</code>, <code>#OPM@</code>, <code>#OPN@</code>, <code>#OPL@</code>, <code>#OPX@</code>, <code>#MA@</code>, <code>#AL@</code>. Text after <code>}</code> runs when the voice is selected.</td></tr><tr><td><code>#TABLEn{...}</code></td><td>Envelope table <code>n</code> (0..254).</td></tr><tr><td><code>#WAVn{...}</code></td><td>Wavetable <code>n</code> for <code>%4</code>, as values -128..127.</td></tr><tr><td><code>#WAVBn{...}</code></td><td>Wavetable <code>n</code> as hex bytes.</td></tr><tr><td><code>#WAVCOLORn{hex}</code></td><td>Wavetable <code>n</code> from a wave color: hex digits, lowest first, set the levels (0-f) of harmonics 1, 2, 3, 4, 5, 6 and 8; an 8th digit picks the base wave (<code>%5@n</code>, sine by default). Also <code>#WAVC</code>.</td></tr><tr><td><code>#PCMBn{data}rate,key,loop,flags,level</code></td><td>PCM sample <code>n</code>: see below.</td></tr><tr><td><code>#EFFECTn{...}</code></td><td>Effect chain: see below.</td></tr><tr><td><code>#FM{...}</code></td><td>Wire the following tracks into one FM sound (<code>#FM{B3(A)}</code>: A modulates B).</td></tr><tr><td><code>#SIGN{...}</code></td><td>Key signature: <code>D</code>, <code>F#m</code>, <code>Bb</code>… or a list like <code>c+ f+</code>.</td></tr><tr><td><code>#TMODE{unit=n | timerb=n | fps=n}</code></td><td>How <code>t</code> values are read.</td></tr><tr><td><code>#VMODE{n88 | mdx | psg | %v.. | %x..}</code></td><td>Volume curves, matching other MML dialects.</td></tr><tr><td><code>#QUANT{n}</code></td><td>Steps for <code>q</code> (default 8).</td></tr><tr><td><code>#FPS{n}</code></td><td>Envelope table speed for all tracks (default 60).</td></tr><tr><td><code>#REV</code></td><td>Swap the direction of <code>&lt;</code> <code>&gt;</code> and <code>(</code> <code>)</code>. <code>#REV{oct}</code> or <code>#REV{vol}</code> swaps only one.</td></tr><tr><td><code>#FBMODE{chip}</code></td><td>Chip-style FM feedback.</td></tr><tr><td><code>#END</code></td><td>Stop reading here.</td></tr></tbody></table></div>
+<h3 id="effects">Effects</h3>
+<p><code>#EFFECT0</code> is the master chain, which everything passes through. <code>#EFFECT1</code> to <code>#EFFECT7</code> are send effects, fed by <code>@v</code> send levels. Units run in order. After <code>}</code>, <code>@v</code>, <code>p</code> and <code>@p</code> set the effect's return level and pan.</p>
+<pre><code>#EFFECT0{ eq 100,100,120 };
+#EFFECT1{ reverb 70,40,80,100 } @v64;
+%5@0 @v100,40 l8 cdefgab&lt;c;</code></pre>
+<div class="table"><table><thead><tr><th>Unit</th><th>Parameters (defaults)</th></tr></thead><tbody><tr><td><code>delay</code></td><td>time ms (250), feedback % (25), cross 0/1 (0), wet % (100)</td></tr><tr><td><code>reverb</code></td><td>delay 1 % (70), delay 2 % (40), feedback % (80), wet % (100)</td></tr><tr><td><code>chorus</code></td><td>delay ms (20), feedback % (20), rate Hz (4), depth (20), wet % (50), invert (1)</td></tr><tr><td><code>autopan</code></td><td>rate Hz (1), width % (100)</td></tr><tr><td><code>dist</code></td><td>pre-gain dB (-60), post-gain dB (18), low-pass Hz (2400), slope (1)</td></tr><tr><td><code>ws</code></td><td>wave shaper: amount % (50), output % (100)</td></tr><tr><td><code>comp</code></td><td>threshold % (70), window ms (50), attack ms (20), release ms (20), max gain dB (6), mix % (50)</td></tr><tr><td><code>ds</code></td><td>down-sampler: rate shift (0), bits (16), channels (2)</td></tr><tr><td><code>speaker</code></td><td>hardness % (20)</td></tr><tr><td><code>stereo</code></td><td>invert (0), width % (140), rotation % (0)</td></tr><tr><td><code>eq</code></td><td>low %, mid %, high % (100 each), low/mid split Hz (880), mid/high split Hz (5000)</td></tr><tr><td><code>lf</code> <code>hf</code> <code>bf</code> <code>nf</code> <code>pf</code> <code>af</code> <code>lb</code> <code>hb</code></td><td>low-pass, high-pass, band-pass, notch, peak, all-pass, low shelf, high shelf: frequency Hz, bandwidth (1), gain dB (6)</td></tr><tr><td><code>nlf</code> <code>nhf</code></td><td>low/high-pass swept by tables: cutoff table, resonance table, steps per second (20)</td></tr><tr><td><code>vowel</code></td><td>output % (100), then six formant frequency/gain pairs</td></tr></tbody></table></div>
+<h3 id="differences-from-sion">Differences from SiON</h3>
+<p>Additions:</p>
+<ul><li><code>#PCMBn{data}rate,key,loop,flags,level</code> embeds a PCM sample in the MML text. <code>data</code> is base64url of signed little-endian samples: 8-bit, or 16-bit with flags 1. Flags 2 loops back and forth. Flags 4 decodes NES DPCM starting from <code>level</code>. <code>{=m}</code> reuses the data of earlier DPCM sample <code>m</code>. Defaults: rate 44100, key 60, no loop.</li><li><code>@ph</code> on PCM modules takes a fractional or negative start frame and a play length.</li><li><code>k</code> accepts fractions.</li></ul>
+<p>Not supported: <code>#SAMPLER</code>, <code>#PCMWAVE</code> and <code>#PCMVOICE</code> (use <code>#PCMB</code> or <code>set_sample</code> instead), and event triggers (<code>%t</code>, <code>%e</code>), which are skipped.</p>
+  </article>
+</main>
+</body>
+</html>

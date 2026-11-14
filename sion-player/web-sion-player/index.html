@@ -1,62 +1,57 @@
 <!doctype html>
-<!-- SiON player for the browser. Serve this folder over HTTP (e.g. `python3 -m http.server`), then open it.
-     Needs style.css, player.js, sion.js, sion.wasm, render.js, worklet.js, length.js, songs.json and songs/
-     next to it; playground.html is the MML editor, and convert.html the converter (convert.js, convert.wasm,
-     convert-worker.js). -->
+<!-- The home page of the SiON player for the browser. Serve this folder over HTTP (e.g. `python3 -m http.server`),
+     then open it. Uses the same files as songs.html (style.css, player.js, the workers, sion.wasm, songs.json, songs/). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SiON Player</title>
+<title>SiON</title>
 <link rel="stylesheet" href="style.css">
 <style>
-  ol { list-style: none; margin: 0; padding: 0; }
-  li {
-    display: grid; grid-template-columns: 22px 1fr; gap: 8px; align-items: baseline;
-    padding: 8px 10px; border-radius: 8px; cursor: pointer; user-select: none;
-  }
-  li:hover { background: var(--hover); }
-  li .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-  li .t { display: flex; gap: 8px; align-items: baseline; min-width: 0; white-space: nowrap; }
-  li .t span { overflow: hidden; text-overflow: ellipsis; }
-  li .t .a { flex: none; max-width: 40%; margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 400; }
-  li.on { background: var(--accent-soft); }
-  li.on .t { color: var(--accent); font-weight: 550; }
-  li.on .n { color: transparent; position: relative; }
-  li.on .n::after {
-    content: ""; position: absolute; left: 0; top: 50%; width: 10px; height: 10px; margin-top: -5px;
-    background: linear-gradient(var(--accent) 0 0) 0 100% / 2px 100%,
-                linear-gradient(var(--accent) 0 0) 4px 100% / 2px 60%,
-                linear-gradient(var(--accent) 0 0) 8px 100% / 2px 80%;
-    background-repeat: no-repeat;
-  }
-  body.playing li.on .n::after { animation: eq 0.9s steps(3) infinite; }
-  @keyframes eq { 50% { background-size: 2px 40%, 2px 100%, 2px 30%; } }
+  article p { margin: 0 0 14px; line-height: 1.6; }
+  article h2 { font-size: 15px; font-weight: 650; margin: 32px 0 10px; }
+  /* The player bar only appears once a song is picked. */
+  body:not(.picked) footer { display: none; }
 </style>
 </head>
 <body>
 <main>
   <header>
-    <h1>SiON</h1><span id="count">MML player</span>
-    <nav><a href="./" aria-current="page">Songs</a><a href="playground.html">Playground</a><a href="convert.html">Convert</a></nav>
+    <h1><a href="./" aria-current="page">SiON</a></h1>
+    <nav><a href="songs.html">Songs</a><a href="playground.html">Playground</a><a href="convert.html">Convert</a><a href="docs.html">Docs</a></nav>
   </header>
-  <ol id="list"></ol>
+  <article>
+    <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. SiON is a small player for MML music: give it
+       text, and it plays it back as audio, right here in your browser.</p>
+    <p>Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud
+       exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
+    <p>Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.
+       Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
+    <h2>Examples</h2>
+  </article>
+  <ol class="songs" id="list"></ol>
 </main>
 
 <script type="module">
 import { createPlayer } from "./player.js";
 
-// songs.json: [{file, volume}], written by the desktop player's build (build.rs), which measures each song
-// to find the volume that brings it to a common loudness.
-// (no-cache: revalidate with the server, so a song added or reconverted shows up without a hard refresh.)
-const files = await (await fetch("songs.json", { cache: "no-cache" })).json();
-const songs = files.map(({ file, volume = 1 }, i) => {
-  const name = file.replace(/\.(sion)?mml$/i, "");
+// The examples, by file name in songs/. Their volumes come from songs.json, as on the song list.
+const EXAMPLES = [
+  "rect - BOSCONIAN X68k _ Flash Flash Flash.mml",
+  "Sonic the Hedgehog 3 (prototype) - Carnival Night Zone Act 1.mml",
+  "Hautbois - [SFC]『クロノ・トリガー』よりChrono Trigger.mml",
+  "keim_at_Si - Twin Memories _ Pop'nツインビー (Stage1).mml",
+];
+const songs = EXAMPLES.map((file, i) => {
+  const name = file.replace(/\.(sion)?mml$/i, ""), volume = 1;
   const cut = name.indexOf(" - ");
   return cut < 0 ? { i, file, volume, title: name, artist: "" }
                  : { i, file, volume, artist: name.slice(0, cut), title: name.slice(cut + 3) };
 });
-document.getElementById("count").textContent = `${songs.length} songs`;
+// The volumes arrive in the background, so the list shows straight away; play() waits for them.
+const volumes = fetch("songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
+  for (const { file, volume = 1 } of list) for (const s of songs) if (s.file === file) s.volume = volume;
+}).catch(() => {});
 
 // ---- Song list ----
 const rows = songs.map((s) => {
@@ -85,7 +80,9 @@ function current() { return player.song?.i ?? -1 }
 
 function play(i) {
   const s = songs[i];
-  player.play(fetch("songs/" + encodeURIComponent(s.file), { cache: "no-cache" }).then((r) => r.text()), s);
+  document.body.classList.add("picked");
+  const mml = fetch("songs/" + encodeURIComponent(s.file), { cache: "no-cache" }).then((r) => r.text());
+  player.play(Promise.all([mml, volumes]).then(([text]) => text), s); // (the player reads s.volume once this resolves)
   rows[i].scrollIntoView({ block: "nearest" });
 }
 </script>
