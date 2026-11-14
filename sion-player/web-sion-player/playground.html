@@ -198,7 +198,8 @@ render();
 const hl = globalThis.Highlight && CSS.highlights ? new Highlight() : null;
 if (hl) CSS.highlights.set("playing", hl);
 let played = null, index = null; // the text being played, and its byte → string index map
-const NOTE = /[a-g][+#-]?\s*\d*\s*\.*/y;
+// (Whitespace only counts inside the note, before its length or dots: never the space after it.)
+const NOTE = /[a-g][+#-]?(?:\s*\d+)?(?:\s*\.+)?/y;
 
 function byteIndex(s) {
   const map = new Int32Array(new TextEncoder().encode(s).length + 1);

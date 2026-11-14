@@ -1,7 +1,7 @@
 //! One SiON sound channel: up to four FM operators, LFO, state-variable filter, plucked string, PCM sample.
 
 use crate::m::M;
-use alloc::{vec, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 use core::f32::consts::TAU;
 
 pub const RATE: f32 = 44100.0;
@@ -84,10 +84,10 @@ pub struct Shared {
     pub fb2: bool,
     pub sign: [i32; 7],
     /// 1024-step sine (as SiON's wave tables) and constant-power pan gains for pan 0..128.
-    pub sine: Vec<f32>,
-    pub pan: Vec<f32>,
+    pub sine: Box<[f32; 1024]>,
+    pub pan: Box<[f32; 129]>,
     /// Gain for attenuation -256..2304 in 1/64 octave units, at 1/256 octave steps (SiON's log table resolution is similar).
-    pub att: Vec<f32>,
+    pub att: Box<[f32; 10240]>,
 }
 
 impl Shared {
@@ -117,16 +117,18 @@ pub fn noise() -> [Vec<f32>; 6] {
     [w, p, short, hi, pink, gb]
 }
 
-fn sine(sh: &Shared, p: f32) -> f32 { sh.sine[(p * 1024.0) as usize & 1023] }
+/// (Phases here are never negative, and converting through i32 is the cheaper conversion.)
+fn sine(sh: &Shared, p: f32) -> f32 { sh.sine[(p * 1024.0) as i32 as usize & 1023] }
 
-/// Build the shared sine, pan and attenuation tables.
-pub fn tables() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    ((0..1024).map(|i| M::sin(i as f32 * TAU / 1024.0)).collect(), (0..=128).map(|i| M::sin(i as f32 * core::f32::consts::PI / 256.0)).collect(),
-     (0..10240).map(|i| M::exp2(-(i as f32 / 4.0 - 256.0) / 64.0)).collect())
+/// A table of `f(0..N)`, for the shared sine, pan and attenuation tables.
+pub fn lookup<const N: usize>(f: fn(f32) -> f32) -> Box<[f32; N]> {
+    let mut t = Box::new([0.0; N]);
+    for (i, v) in t.iter_mut().enumerate() { *v = f(i as f32) }
+    t
 }
 
 /// 2^(-x/64) by table lookup; silent past the end.
-fn gain(sh: &Shared, x: f32) -> f32 { sh.att.get(((x + 256.0) * 4.0).max(0.0) as usize).copied().unwrap_or(0.0) }
+fn gain(sh: &Shared, x: f32) -> f32 { sh.att.get(((x + 256.0) * 4.0).max(0.0) as i32 as usize).copied().unwrap_or(0.0) }
 
 /// 2^e for small integer e, built from the float's bits.
 fn pow2(e: i32) -> f32 { f32::from_bits(((e.clamp(-126, 127) + 127) as u32) << 23) }
@@ -155,7 +157,7 @@ pub const PIPE_DEPTH: f32 = 127.0 / 128.0;
 #[cfg_attr(feature = "small", optimize(speed))]
 pub fn wave(sh: &Shared, pg: i32, p: f32) -> f32 {
     const KNM: [i8; 32] = [-80, -112, -16, 96, 64, 16, 64, 96, 32, -16, 64, 112, 80, 0, 32, 48, -16, -96, 0, 80, 16, -64, -48, -16, -96, -128, -80, 0, -48, -112, -80, -32];
-    let at = |t: &[f32], p: f32| if t.is_empty() { 0.0 } else { t[((p * t.len() as f32) as usize).min(t.len() - 1)] };
+    let at = |t: &[f32], p: f32| if t.is_empty() { 0.0 } else { t[((p * t.len() as f32) as i32 as usize).min(t.len() - 1)] };
     let b = |v: bool| if v { 1.0 } else { -1.0 };
     match pg {
         0 => sine(sh, p),
@@ -167,7 +169,7 @@ pub fn wave(sh: &Shared, pg: i32, p: f32) -> f32 {
         6 | 16 => at(&sh.noise[0], p),
         17 | 26 => at(&sh.noise[1], p),
         18..=21 => at(&sh.noise[pg as usize - 16], p),
-        7 => KNM[(p * 32.0) as usize & 31] as f32 / 128.0,
+        7 => KNM[(p * 32.0) as i32 as usize & 31] as f32 / 128.0,
         8 => -p,
         9 => p,
         11 => -0.96875 + M::floor(p * 32.0) * 0.0625,
@@ -232,6 +234,9 @@ pub struct Op {
     pi: i32, pf: f32, kc: i32, ph: f32, step: f32, lv: f32, st: u8, rate: f32, tgt: f32, out: f32, fin: bool, tlo: f32,
     /// The output before `out` (for `#FBMODE{chip}`).
     pout: f32,
+    /// What `level` adds to the envelope: the total level (with key scaling and volume), and the LFO's depth.
+    /// Worked out by `pitch`, which `Chan::refresh` runs after any change to them (see `Chan::stale`).
+    att: f32, amd: f32,
 }
 
 impl Op {
@@ -240,7 +245,7 @@ impl Op {
         Op {
             pg: if chan { 5 } else { 0 }, pt: 0, ar: 63, dr: 0, sr: 0, rr: if chan { 28 } else { 63 }, sl: 0, tl: 0, ksr: !chan as i32, ksl: 0,
             fmul: 128, dt1: 0, det: 0, ams: chan as i32, phase: 0, fix: 0, erst: false, ssg: 0, ssg_st: 0, ltab: 0,
-            pi: 0, pf: 0.0, kc: 0, ph: 0.0, step: 0.0, lv: OFF, st: 0, rate: 0.0, tgt: 0.0, out: 0.0, fin: true, tlo: 0.0, pout: 0.0,
+            pi: 0, pf: 0.0, kc: 0, ph: 0.0, step: 0.0, lv: OFF, st: 0, rate: 0.0, tgt: 0.0, out: 0.0, fin: true, tlo: 0.0, pout: 0.0, att: 0.0, amd: 0.0,
         }
     }
 
@@ -277,6 +282,9 @@ impl Op {
         };
         let dt = if self.dt1 & 3 == 0 { 0.0 } else { DT1[(self.dt1 as usize & 3) * 32 - 32 + (self.kc as usize >> 2)] as f32 * 0.0533 };
         self.step = (hz + if self.dt1 > 3 { -dt } else { dt }) * self.fmul as f32 / 128.0 / RATE;
+        let ksl = if self.ksl == 0 { 0 } else { self.kc >> (5 - self.ksl) };
+        self.att = (((self.tl + ksl) * 8) as f32 + self.tlo).min(OFF);
+        self.amd = [0.0, 0.25, 0.5, 1.0][self.ams as usize & 3];
     }
 
     /// Enter envelope state `st` (1 attack, 2 decay, 3 sustain, 4 release, 0 off), skipping states as SiON does.
@@ -341,19 +349,19 @@ impl Op {
         n0 - n
     }
 
+    /// Gain at envelope level `lv` and LFO level `am` (as of the last `pitch`).
+    /// (Kept out of line in the size-optimised sion.wasm, which would otherwise inline it at every call.)
     #[cfg_attr(feature = "small", optimize(speed))]
-    fn level(&self, sh: &Shared, lv: f32, am: f32) -> f32 {
-        let ksl = if self.ksl == 0 { 0 } else { self.kc >> (5 - self.ksl) };
-        let am = if self.ams == 0 { 0.0 } else { am * pow2(self.ams - 3) };
-        gain(sh, lv + (((self.tl + ksl) * 8) as f32 + self.tlo).min(OFF) + am)
-    }
+    #[cfg_attr(feature = "wasm", inline(never))]
+    fn level(&self, sh: &Shared, lv: f32, am: f32) -> f32 { gain(sh, lv + self.att + am * self.amd) }
 
     #[cfg_attr(feature = "small", optimize(speed))]
     fn run(&mut self, sh: &Shared, md: f32, am: f32, fr: f32) -> f32 {
         self.ph = wrap(self.ph + self.step);
         self.pout = self.out;
         self.out = match self.eg(fr) {
-            Some(lv) => (wave(sh, self.pg, wrap(self.ph + md)) * self.level(sh, lv, am)).clamp(-1.0, 1.0),
+            // (A sine, the usual operator, without the call.)
+            Some(lv) => { let p = wrap(self.ph + md); (if self.pg == 0 { sine(sh, p) } else { wave(sh, self.pg, p) } * self.level(sh, lv, am)).clamp(-1.0, 1.0) }
             None => 0.0,
         };
         self.out
@@ -363,7 +371,7 @@ impl Op {
 pub struct Chan {
     pub ops: Vec<Op>, pub n: usize, pub alg: usize, pub act: usize, pub fb: i32, pub fbc: usize, pub fratio: f32,
     pub inp: (i32, usize), pub ring: (i32, usize), pub outp: (i32, usize),
-    /// Operator pitches need recomputing (set when pitch, LFO or operator settings change).
+    /// Operator pitches and levels need recomputing (set when pitch, LFO, volume or operator settings change).
     pub stale: bool,
     pub lfo: i32, pub lfo_tab: Vec<i32>, pub lfo_step: f32, lfo_ph: usize, lfo_t: f32, pub amd: i32, pub pmd: i32, am: f32, pm: i32,
     pub vol: [f32; 8], pub pan: i32, pub vm: (i32, i32), xv: (i32, i32),
@@ -422,13 +430,14 @@ impl Chan {
 
     /// Reset everything except volumes and pan (what a `%` module change does).
     pub fn init(&mut self, module: i32) {
+        let o = core::mem::replace(self, Chan { ops: vec![Op::new(true)], ks: module == 11, pcm: if module == 7 || module == 10 { module } else { -1 }, kbuf: vec![0.0; if module == 11 { 5400 } else { 0 }], ..Chan::new_raw() });
         // Pipe wiring survives module changes so `#FM` connections set before `%` stay in place.
-        let keep = (self.vol, self.pan, self.vm, self.xv, self.inp, self.outp);
+        (self.vol, self.pan, self.vm, self.xv, self.inp, self.outp) = (o.vol, o.pan, o.vm, o.xv, o.inp, o.outp);
         // (The DMC level stays where it is when the module is set again.)
-        let dmc = (self.rejoin, self.dm, self.dplay, self.dnew, self.dprev, self.dlv, self.doff, self.dg, self.dhp, self.sidx, self.spos, self.sfrac, self.sstep, self.slen, self.sleft);
-        *self = Chan { ops: vec![Op::new(true)], ks: module == 11, pcm: if module == 7 || module == 10 { module } else { -1 }, kbuf: vec![0.0; if module == 11 { 5400 } else { 0 }], ..Chan::new_raw() };
-        (self.vol, self.pan, self.vm, self.xv, self.inp, self.outp) = keep;
-        if self.pcm >= 0 && dmc.1 { (self.rejoin, self.dm, self.dplay, self.dnew, self.dprev, self.dlv, self.doff, self.dg, self.dhp, self.sidx, self.spos, self.sfrac, self.sstep, self.slen, self.sleft) = dmc }
+        if self.pcm >= 0 && o.dm {
+            (self.rejoin, self.dm, self.dplay, self.dnew, self.dprev, self.dlv, self.doff, self.dg, self.dhp) = (o.rejoin, o.dm, o.dplay, o.dnew, o.dprev, o.dlv, o.doff, o.dg, o.dhp);
+            (self.sidx, self.spos, self.sfrac, self.sstep, self.slen, self.sleft) = (o.sidx, o.spos, o.sfrac, o.sstep, o.slen, o.sleft);
+        }
         self.lfo_time(333.0);
         if self.ks {
             let o = &mut self.ops[0];
@@ -767,12 +776,10 @@ impl Chan {
             a.ph = wrap(a.ph + a.step + if self.alg == 2 { fbin } else { 0.0 });
             b.ph = if self.alg == 2 && wrap_a { 0.0 } else { wrap(b.ph + b.step) };
             let (wa, wb) = (wave(sh, a.pg, wrap(a.ph + if self.alg == 2 { 0.0 } else { fbin })), wave(sh, b.pg, b.ph));
-            a.out = match (lv, self.alg) {
-                (None, _) => 0.0,
-                (Some(lv), 1) => wa * wb * b.level(sh, lv, am),
-                (Some(lv), 2) => wb * b.level(sh, lv, am),
-                (Some(lv), _) => wa * a.level(sh, lv, am) + wb * b.level(sh, lv, am),
-            };
+            a.out = lv.map_or(0.0, |lv| {
+                let g = b.level(sh, lv, am);
+                match self.alg { 1 => wa * wb * g, 2 => wb * g, _ => wa * a.level(sh, lv, am) + wb * g }
+            });
             a.out
         } else {
             let mut p = [0f32; 2];
@@ -788,7 +795,7 @@ impl Chan {
             self.kidx += 1.0;
             // `kidx %= wl`, exactly: subtract the largest power-of-two multiple of `wl` that fits, each step exact.
             while self.kidx >= wl { let mut m = wl; while m * 2.0 <= self.kidx { m *= 2.0 } self.kidx -= m }
-            let (t, (dec, lpf)) = (self.kidx as usize, if self.on { (0.98, self.k_lpf) } else { (0.75, 0.5) });
+            let (t, (dec, lpf)) = (self.kidx as i32 as usize, if self.on { (0.98, self.k_lpf) } else { (0.75, 0.5) });
             self.kout = self.kout * dec + (self.kbuf[t] - self.kout * dec) * lpf + x;
             self.kbuf[t] = self.kout;
             x = self.kout * self.kx;

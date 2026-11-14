@@ -20,6 +20,7 @@ mod wasm;
 mod ffi;
 
 use alloc::{sync::Arc, vec, vec::Vec};
+use core::f32::consts::{PI, TAU};
 use fx::Fx;
 use m::M;
 pub use synth::{Sample, PIPE_DEPTH, RATE};
@@ -212,7 +213,7 @@ fn nums(s: &[u8]) -> Vec<f32> {
 /// sample `j` reads the base wave at phase `j + 63/64`; SiON's sine table is read at entry centers.
 fn wave_color(sh: &Shared, c: u32) -> Vec<f32> {
     let pg = (c >> 28) as i32;
-    let base = |p: u32| if pg == 0 { M::sin(((p & 65535) >> 6) as f32 * (core::f32::consts::TAU / 1024.0) + core::f32::consts::PI / 1024.0) }
+    let base = |p: u32| if pg == 0 { M::sin(((p & 65535) >> 6) as f32 * (TAU / 1024.0) + PI / 1024.0) }
         else { wave(sh, pg, (p & 65535) as f32 / 65536.0) };
     let out: Vec<f32> = (0..1024u32).map(|j| [1, 2, 3, 4, 5, 6, 8].iter().enumerate()
         .map(|(n, m)| base((j * 64 + 63) * m) * (c >> (n * 4) & 15) as f32 / 16.0).sum()).collect();
@@ -365,6 +366,9 @@ const CMD: [&str; 44] = [
     "@clock", "@mask", "!@kr", "!@ns", "@lfo", "@fps", "_@@", "_na", "_np", "_nt", "_nf", "!na", "@al", "@fb", "@rr", "@tl", "@ml", "@dt", "@ph", "@fx", "@se", "@er",
     "@@", "na", "np", "nt", "nf", "mp", "ma", "po", "kt", "%v", "%x", "%f", "%t", "%e", "@q", "@v", "@i", "@o", "@p", "@f", "@r", "&&",
 ];
+
+/// Length of the command name at the start of `s` (non-empty).
+fn name_len(s: &[u8]) -> usize { CMD.iter().find(|c| s.starts_with(c.as_bytes())).map_or(1, |c| c.len()) }
 
 /// Envelope commands (`_`: for key-off), longest first.
 const ENV: [&[u8]; 11] = [b"_@@", b"_na", b"_nt", b"_np", b"_nf", b"!na", b"@@", b"na", b"nt", b"np", b"nf"];
@@ -591,10 +595,18 @@ impl Track {
     fn done(&self) -> bool { self.end && self.koff == INF && self.kon == INF }
 
     /// Advance to tick `now`: run due commands, key on/off and envelope frames.
-    #[cfg_attr(feature = "small", optimize(speed))]
+    #[inline]
     fn run(&mut self, sh: &Shared, now: f64, bpm: &mut f64) {
-        // Events that fall exactly on this frame are due now, whichever way rounding in `now` went. How far into
-        // the previous frame an event fell lets a PCM note start, or change pitch, at its exact time.
+        // Events that fall exactly on this frame are due now, whichever way rounding in `now` went.
+        let due = now + 1e-6;
+        // (Most frames have nothing due but the countdown to the next envelope frame.)
+        if (self.end || due < self.at) && due < self.kon && due < self.koff && self.res > 1.0 { self.res -= 1.0 } else { self.events(sh, now, bpm) }
+    }
+
+    /// `run` for a frame with something to do. How far into the previous frame an event fell lets a PCM note
+    /// start, or change pitch, at its exact time.
+    #[cfg_attr(feature = "small", optimize(speed))]
+    fn events(&mut self, sh: &Shared, now: f64, bpm: &mut f64) {
         let due = now + 1e-6;
         let late = |at: f64, bpm: f64| ((now - at) * RATE as f64 / (bpm * 8.0)).clamp(0.0, 1.0) as f32;
         while !self.end && due >= self.at {
@@ -724,7 +736,7 @@ impl Track {
                 }
             }
             _ => {
-                let name = CMD.iter().map(|c| c.as_bytes()).find(|c| s[st..].starts_with(c)).unwrap_or(&s[st..st + 1]);
+                let name = &s[st..st + name_len(&s[st..])];
                 *i = st + name.len();
                 let (mut a, mut n) = ([MIN; 16], 0);
                 loop {
@@ -734,13 +746,13 @@ impl Track {
                     if n < 16 && s.get(*i) == Some(&b',') { *i += 1 } else { break }
                 }
                 let p = |k: usize, d: i32| if a[k] == MIN { d } else { a[k] };
-                let ch = &mut self.ch;
+                let (ch, env) = (&mut self.ch, ENV.contains(&name));
                 let class = match name {
                     b"v" | b"(" | b")" | b"x" | b"%v" | b"%x" | b"@v" => 1,
                     b"p" | b"@p" => 2,
                     b"q" | b"@q" => 4,
                     b"@" | b"@al" | b"@fb" | b"@dt" | b"@er" | b"@fx" | b"@ml" | b"@ph" | b"@rr" | b"@se" | b"@tl" | b"i" | b"s" => 8,
-                    _ if ENV.contains(&name) => 16,
+                    _ if env => 16,
                     b"mp" | b"ma" => 32,
                     _ => 0,
                 };
@@ -824,7 +836,7 @@ impl Track {
                             None
                         };
                     }
-                    _ if ENV.contains(&name) => {
+                    _ if env => {
                         let (on, kind) = ((name[0] != b'_') as usize, match name[name.len() - 1] { b'@' => 1, b't' => 2, b'p' => 3, b'f' => 4, _ => 0 });
                         self.set[on][kind] = Some((a[0].max(0) as usize, p(1, 1))).filter(|(_, s)| (0..512).contains(&a[0]) && *s != 0);
                         if kind == 0 { self.xoff[on] = name[0] == b'!' }
@@ -923,7 +935,7 @@ fn statics(s: &[u8], sh: &Shared) -> Vec<u8> {
             _ => {
                 // Any other command: copy its name and numeric arguments unchanged.
                 let st = i - 1;
-                i = st + CMD.iter().find(|n| s[st..].starts_with(n.as_bytes())).map_or(1, |n| n.len());
+                i = st + name_len(&s[st..]);
                 loop {
                     let a = i;
                     if num(s, &mut i).is_none() { i = a }
@@ -947,7 +959,7 @@ fn spans(s: &[u8], at: &[usize]) -> Vec<u8> {
         let n = match s[i] {
             b'{' => find(s, i, b"}") - i,
             b'a'..=b'g' => { cmd(&mut out, b"\x03", &[at[i] as i32]); 1 }
-            _ => CMD.iter().find(|c| s[i..].starts_with(c.as_bytes())).map_or(1, |c| c.len()),
+            _ => name_len(&s[i..]),
         };
         out.extend(&s[i..i + n]);
         i += n;
@@ -1080,10 +1092,10 @@ impl Song {
             spans(s, &at[base..])
         };
 
-        let (sine, pan, att) = tables();
         let mut sh = Shared {
             samples: vec![None; 256], cuts: vec![], pcmv: vec![None; 256], kit: vec![None; 4], dpcm: vec![false; 256], waves: vec![vec![]; 256], noise: noise(), tables: vec![None; 512], voices: vec![None; 256],
-            fps: 60.0, quant: 8, tmode: (0, 1.0), vmode: (0, 0, 4), rev: (1, 1), fb2: false, sign: [0; 7], sine, pan, att,
+            fps: 60.0, quant: 8, tmode: (0, 1.0), vmode: (0, 0, 4), rev: (1, 1), fb2: false, sign: [0; 7],
+            sine: lookup(|i| M::sin(i * TAU / 1024.0)), pan: lookup(|i| M::sin(i * PI / 256.0)), att: lookup(|i| M::exp2(-(i / 4.0 - 256.0) / 64.0)),
         };
 
         // Split into `;`-terminated statements: macro definitions, system commands, sequences.
