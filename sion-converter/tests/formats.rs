@@ -513,6 +513,39 @@ fn vgm_loop_point() {
     assert!(convert(&data, &Options::default()).unwrap().loop_secs.is_none());
 }
 
+#[test]
+fn vgm_driver_off_its_header_rate() {
+    // A driver run off a timer at 62.7 Hz (703 samples a frame) though the header says 60 Hz, as Lightening
+    // Force's: each frame starts with a burst of writes, and every 6th frame keys a note on partway through it,
+    // 0.2 or 0.55 of a frame in by turns. The notes must come out evenly spaced: a 60 Hz grid, or frames split at
+    // the wrong point, drags every other note into a neighbouring frame (16 ms off).
+    const P: u16 = 703;
+    let mut b = vec![];
+    let n = (3579545.0 / (32.0 * SCALE[0])).round() as u32;
+    for k in 0..96 {
+        b.extend([0x50, 0xff]);
+        if k % 6 == 0 {
+            let late = if k % 12 == 0 { P / 5 } else { P * 11 / 20 };
+            wait(&mut b, late);
+            b.extend([0x50, 0x80 | (n & 15) as u8, 0x50, (n >> 4) as u8 & 0x3f, 0x50, 0x90]);
+            wait(&mut b, P - late);
+        } else {
+            if k % 6 == 2 { b.extend([0x50, 0x9f]) }
+            wait(&mut b, P);
+        }
+    }
+    let mut data = vgm(&[(0x0c, 3579545)], &b);
+    data[0x24..0x28].copy_from_slice(&60u32.to_le_bytes());
+    let out = check(&data);
+    let audio = render(&out.mml, 2);
+    // Where each note starts: the first sound after 1000 samples of silence.
+    let loud = |i: usize| audio[i * 2].abs() > 0.01;
+    let starts: Vec<usize> = (0..audio.len() / 2).filter(|&i| loud(i) && (i.saturating_sub(1000)..i).all(|j| !loud(j))).collect();
+    assert_eq!(starts.len(), 16, "{starts:?}");
+    // The log's notes are 0.35 of a frame from evenly spaced; a note in the wrong frame is 0.65 off.
+    for w in starts.windows(2) { assert!((w[1] - w[0]).abs_diff(6 * P as usize) <= (0.4 * P as f64) as usize, "{starts:?}") }
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // NSF / NSFE: small sound drivers, hand-assembled, that the converter runs on its 6502.
 

@@ -262,16 +262,32 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
     let bursts: Vec<u64> = timing.iter().enumerate().filter(|(k, w)| *k == 0 || w.at > timing[k - 1].at + 32).map(|(_, w)| w.at).collect();
     let mut gaps = std::collections::HashMap::new();
     for p in bursts.windows(2) { if (147..=2205).contains(&(p[1] - p[0])) { *gaps.entry(p[1] - p[0]).or_insert(0usize) += 1 } }
-    let period = match gaps.iter().max_by_key(|(g, n)| (**n, std::cmp::Reverse(**g))) {
-        _ if period.is_some() => period.unwrap(),
-        Some((&g, _)) => g as f64,
-        None => 735.0,
+    let common = gaps.iter().max_by_key(|(g, n)| (**n, std::cmp::Reverse(**g))).map(|(&g, _)| g as f64);
+    let period = match (period, common) {
+        // Played from a file's own timer (NSF): exact.
+        (Some(p), _) if phase.is_some() => p,
+        // A VGM header's rate is only a hint: drivers run off a chip's timer (Lightening Force's at 62.7 Hz, its
+        // header says 60), and the most common gap is whole samples. Take the period the bursts line up with best
+        // near either, unless the header's is about as good (or there are too few bursts to tell).
+        (hint, Some(g)) if bursts.len() >= 64 => {
+            let refined = [hint, Some(g)].into_iter().flatten().map(|p| refine(&bursts, p)).max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+            match hint { Some(p) if coherence(&bursts, p) >= 0.8 * refined.1 => p, _ => refined.0 }
+        }
+        (hint, common) => hint.or(common).unwrap_or(735.0),
     };
-    // Frame phase: where in the period the bursts mostly fall.
+    // Frame phase: frames are sampled half a period after it, which is where one frame's writes end and the next's
+    // begin. A frame's writes start with a burst, but a driver may key notes on well after it: so that these don't
+    // land in one frame or the next by chance, sample in the middle of the longest quiet stretch (bins with under
+    // 2% of the busiest one's bursts) or, if there's none, where the fewest bursts fall.
     let mut hist = [0usize; 32];
     for &b in &bursts { hist[((b as f64 % period) / period * 32.0) as usize & 31] += 1 }
+    let busiest = hist.iter().copied().max().unwrap_or(0);
+    let quiet = |k: usize| hist[k % 32] * 50 < busiest;
+    let run = |k: usize| (0..32).take_while(|&j| quiet(k + j)).count();
+    let gap = (0..32).filter(|&k| quiet(k) && !quiet(k + 31)).max_by_key(|&k| (run(k), std::cmp::Reverse(k))).map(|k| (k + run(k) / 2) % 32)
+        .unwrap_or_else(|| (0..32).min_by_key(|&k| (0..4).map(|j| hist[(k + 30 + j) % 32]).sum::<usize>()).unwrap_or(0));
     // (Whole frames, so captured samples line up with SiON's output frames.)
-    let phase = phase.unwrap_or_else(|| ((0..32).max_by_key(|&k| hist[k]).unwrap_or(0) as f64 / 32.0 * period).round());
+    let phase = phase.unwrap_or_else(|| (((gap + 16) % 32) as f64 / 32.0 * period).round());
     for c in &mut chips { c.set_fps(44100.0 / period) }
 
     let mut st = Stream { chans: vec![vec![]; chips.iter().map(|c| c.chans()).sum()], ..Stream::default() };
@@ -357,6 +373,28 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
     // SiON's, which renders at 44.1 kHz; a high shelf on the master matches it (measured on two songs).
     if shelf { header.push("#EFFECT0{hb9000,1,-3}".into()) }
     Ok((Score { ppq, tempos: vec![(0, bpm)], header, notes, mix: vec![], end, lp, fine, db: !fine, kmilli: false, ..Score::default() }, warnings))
+}
+
+/// How well `times` line up with a grid of `period` (1: all at one phase, about 0: spread evenly).
+fn coherence(times: &[u64], period: f64) -> f64 {
+    let (mut c, mut s) = (0.0, 0.0);
+    for &t in times { let a = std::f64::consts::TAU * (t as f64 / period).fract(); (c, s) = (c + a.cos(), s + a.sin()) }
+    (c * c + s * s).sqrt() / times.len().max(1) as f64
+}
+
+/// The period within 3% of `guess` that `times` line up with best, and how well (`coherence`): a coarse search,
+/// then a finer one around the best.
+fn refine(times: &[u64], guess: f64) -> (f64, f64) {
+    let mut best = (guess, coherence(times, guess));
+    for step in [0.5, 0.02] {
+        let (lo, n) = if step == 0.5 { (guess * 0.97, (guess * 0.06 / step) as i32) } else { (best.0 - 0.5, 50) };
+        for k in 0..=n {
+            let p = lo + k as f64 * step;
+            let c = coherence(times, p);
+            if c > best.1 { best = (p, c) }
+        }
+    }
+    best
 }
 
 /// Chips pan by switching each side on or off: a channel on one side is as loud there as a centred one. SiON pans
