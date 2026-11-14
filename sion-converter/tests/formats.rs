@@ -934,3 +934,118 @@ fn spc_slow_pitch_modulation_is_a_vibrato() {
     assert!((hi / lo / ((1.0 + a) / (1.0 - a)) - 1.0).abs() < 0.08, "{lo:.0}..{hi:.0} Hz");
     assert!((hi / 500.0 / (1.0 + a) - 1.0).abs() < 0.05, "top {hi:.0} Hz");
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// GYM and S98: register logs, read through the VGM path.
+
+/// SN76489 tone `f` on channel 0 at full volume, as (register-less) data bytes.
+fn sn_tone(f: f64) -> [u8; 3] {
+    let n = (3579545.0 / (32.0 * f)).round() as u32;
+    [0x80 | (n & 15) as u8, (n >> 4) as u8 & 0x3f, 0x90]
+}
+
+/// A GYM stream: the scale on the PSG, 12 frames a note and 12 of rest.
+fn gym_scale() -> Vec<u8> {
+    let mut b = vec![];
+    for f in SCALE {
+        for x in sn_tone(f) { b.extend([3, x]) }
+        b.extend([0; 12]);
+        b.extend([3, 0x9f]);
+        b.extend([0; 12]);
+    }
+    b
+}
+
+fn gymx(loop_start: u32, body: &[u8]) -> Vec<u8> {
+    let mut d = b"GYMX".to_vec();
+    d.resize(0x1a4, 0);
+    d.extend(loop_start.to_le_bytes());
+    d.extend(0u32.to_le_bytes());
+    d.extend_from_slice(body);
+    d
+}
+
+#[test]
+fn gym_psg() {
+    // Loop from the third note (frame 48, counted from 1 as libgme does).
+    let out = check(&gymx(49, &gym_scale()));
+    assert_eq!(notes(&out.plain, 0), ["5c", "5e", "5g", "5a", "6c"]);
+    assert!((out.secs - 2.0).abs() < 1e-6 && (out.loop_secs.unwrap() - 1.2).abs() < 1e-6, "{} {:?}", out.secs, out.loop_secs);
+    // Without the header: recognized from its commands, the same song without a loop.
+    let bare = check(&gym_scale());
+    assert_eq!(notes(&bare.plain, 0), notes(&out.plain, 0));
+    assert!(bare.loop_secs.is_none());
+}
+
+#[test]
+fn gym_dac_samples_repeat() {
+    // The same 400-byte DAC sound three times (one frame of it each time), and a different one: the repeats share
+    // one sample.
+    let sound = |seed: u32| {
+        let mut x = seed;
+        (0..400).map(|_| { x = x.wrapping_mul(1103515245).wrapping_add(12345); (x >> 24) as u8 | 1 }).collect::<Vec<u8>>()
+    };
+    let mut b = vec![1, 0x2b, 0x80, 1, 0xb6, 0xc0];
+    for seed in [3, 3, 3, 5] {
+        for x in sound(seed) { b.extend([1, 0x2a, x]) }
+        b.extend([0; 20]);
+    }
+    let out = check(&gymx(0, &b));
+    // (Each sound is 400 bytes, about 535 characters of base64: stored once each, not four times.)
+    let stored: usize = out.plain.lines().filter(|l| l.starts_with("#PCMB")).map(|l| l.len()).sum();
+    assert!(stored > 1000 && stored < 1300, "the repeats share their sample: {stored} characters of samples");
+    let t = out.plain.split(";\n").find(|t| t.contains("%7")).unwrap();
+    assert_eq!(t.matches("o5c").count(), 4, "four hits: {t}");
+    assert_eq!(t.matches("@ph400").count(), 1, "only the new sound reads past the first: {t}");
+}
+
+/// An S98 v3 file: the devices (type, clock), the commands (ended with 0xfd), and the loop point's offset in them.
+fn s98(devs: &[(u32, u32)], body: &[u8], lp: Option<usize>) -> Vec<u8> {
+    let data = 0x20 + 16 * devs.len();
+    let mut d = b"S983".to_vec();
+    for v in [1, 60, 0, 0, data as u32, lp.map_or(0, |l| (data + l) as u32), devs.len() as u32] { d.extend((v as u32).to_le_bytes()) }
+    for &(t, c) in devs { for v in [t, c, 0, 0] { d.extend(v.to_le_bytes()) } }
+    d.extend_from_slice(body);
+    d.push(0xfd);
+    d
+}
+
+#[test]
+fn s98_psg() {
+    // Device 1 is the SN76489 (device 0 an OPLL, which isn't converted). Ticks are 1/60 s; 0xfe waits n + 2.
+    let mut b = vec![];
+    let mut lp = None;
+    for (k, f) in SCALE.into_iter().enumerate() {
+        if k == 2 { lp = Some(b.len()) }
+        for x in sn_tone(f) { b.extend([2, 0, x]) }
+        b.extend([0xfe, 10]);
+        b.extend([2, 0, 0x9f, 0xfe, 9, 0xff]);
+    }
+    let out = convert(&s98(&[(6, 3579545), (16, 3579545)], &b, lp), &Options::default()).unwrap();
+    assert_eq!(render(&out.plain, 60), render(&out.mml, 60));
+    assert_eq!(notes(&out.plain, 0), ["5c", "5e", "5g", "5a", "6c"]);
+    assert!((out.secs - 2.0).abs() < 1e-6 && (out.loop_secs.unwrap() - 1.2).abs() < 1e-6, "{} {:?}", out.secs, out.loop_secs);
+    assert!(out.warnings.iter().any(|w| w.contains("YM2413")), "{:?}", out.warnings);
+}
+
+#[test]
+fn s98_opna_adpcm_from_memory_writes() {
+    // An S98 v1 file (one YM2608, the default) that writes 64 bytes of ADPCM-B data to the chip's RAM, then plays
+    // them; and an SSG tone.
+    let mut d = b"S981".to_vec();
+    for v in [10u32, 0, 0, 0, 0x20, 0, 0] { d.extend(v.to_le_bytes()) }
+    let w = |d: &mut Vec<u8>, port: u8, reg: u8, val: u8| d.extend([port, reg, val]);
+    for (r, v) in [(0x00, 0x01), (0x00, 0x60), (0x01, 0x02), (0x02, 0), (0x03, 0), (0x04, 1), (0x05, 0)] { w(&mut d, 1, r, v) }
+    for i in 0..64u8 { w(&mut d, 1, 0x08, if i % 4 < 2 { 0x77 } else { 0xff }) }
+    w(&mut d, 1, 0x00, 0x00);
+    for (r, v) in [(0x01, 0xc2), (0x09, 0x00), (0x0a, 0x40), (0x0b, 0xff), (0x00, 0xa0)] { w(&mut d, 1, r, v) }
+    // SSG channel A: A4 (tone period clock / 4 / 16 / 440... at 7987200 / 4 = 1996800 Hz: 284).
+    for (r, v) in [(0x00, 284u32 as u8), (0x01, (284 >> 8) as u8), (0x07, 0x3e), (0x08, 0x0f)] { w(&mut d, 0, r, v) }
+    d.extend([0xfe, 28]);
+    w(&mut d, 0, 0x08, 0);
+    d.extend([0xff, 0xfd]);
+    let out = check(&d);
+    assert!(out.plain.contains("#PCMB"), "the ADPCM written to RAM is played as a sample");
+    assert!(out.plain.contains("%7"));
+    assert!((out.secs - 0.31).abs() < 0.02, "{}", out.secs);
+}

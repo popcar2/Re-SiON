@@ -1,5 +1,5 @@
-//! Converters to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT), VGM/VGZ chip logs and
-//! NSF/NSFE NES music and SPC SNES music.
+//! Converters to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT), VGM/VGZ, GYM and S98 chip
+//! logs, NSF/NSFE NES music and SPC SNES music.
 //! Every reader produces a `score::Score`; `arrange` turns that into tracks, which `pretty` lays out by the score's
 //! sections (a tracker's patterns, bars for the other formats), or which `mml` minifies (`--exact` modules).
 
@@ -8,6 +8,7 @@ mod bytes;
 mod chips;
 mod cpu;
 mod fm;
+mod logs;
 pub mod midi;
 mod mml;
 mod nsf;
@@ -42,15 +43,19 @@ pub struct Converted {
 
 /// Input formats, recognized from the file's contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format { Midi, Vgm, Nsf, Spc, Module }
+pub enum Format { Midi, Vgm, Gym, S98, Nsf, Spc, Module }
 
 pub fn detect(data: &[u8]) -> Option<Format> {
     if data.starts_with(b"Vgm ") { return Some(Format::Vgm) }
     if data.starts_with(&[0x1f, 0x8b]) { return vgm::gunzip(data).ok().filter(|d| d.starts_with(b"Vgm ")).map(|_| Format::Vgm) }
+    if logs::detect_s98(data) { return Some(Format::S98) }
+    if data.starts_with(b"GYMX") { return Some(Format::Gym) }
     if nsf::detect(data) { return Some(Format::Nsf) }
     if spc::detect(data) { return Some(Format::Spc) }
     if tracker::detect(data).is_some() { return Some(Format::Module) }
     if data.windows(4).any(|w| w == b"MThd") { return Some(Format::Midi) }
+    // (A GYM without its header is only commands: recognized last, by being well formed.)
+    if logs::detect_gym(data) { return Some(Format::Gym) }
     None
 }
 
@@ -62,6 +67,12 @@ pub fn convert(data: &[u8], opt: &Options) -> Result<Converted, String> {
         Some(f) => {
             let (mut score, w) = match f {
                 Format::Vgm => vgm::to_score(data, opt.exact_pcm)?,
+                Format::Gym | Format::S98 => {
+                    let (v, mut w) = if f == Format::Gym { logs::gym_to_vgm(data)? } else { logs::s98_to_vgm(data)? };
+                    let (score, more) = vgm::to_score(&v, opt.exact_pcm)?;
+                    w.extend(more);
+                    (score, w)
+                }
                 Format::Nsf => nsf::to_score(data, opt.exact_pcm, opt.track)?,
                 _ => spc::to_score(data)?,
             };
@@ -69,7 +80,7 @@ pub fn convert(data: &[u8], opt: &Options) -> Result<Converted, String> {
             score.set_bars(&[]);
             Ok(write(&score, opt, w))
         }
-        None => Err("unrecognized file (supported: MIDI, MOD, S3M, XM, IT, VGM/VGZ, NSF/NSFE, SPC)".into()),
+        None => Err("unrecognized file (supported: MIDI, MOD, S3M, XM, IT, VGM/VGZ, GYM, S98, NSF/NSFE, SPC)".into()),
     }
 }
 

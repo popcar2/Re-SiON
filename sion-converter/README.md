@@ -1,7 +1,7 @@
 # sion-converter
 
 Converts other music formats to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT),
-VGM/VGZ chip music logs, NSF/NSFE NES music and SPC SNES music. The format is recognized from the file's contents.
+VGM/VGZ, GYM and S98 chip music logs, NSF/NSFE NES music and SPC SNES music. The format is recognized from the file's contents.
 
 ```
 cargo run --release -- song.mid              # writes song.mml
@@ -9,6 +9,7 @@ cargo run --release -- song.xm -o out.mml --verify
 cargo run --release -- song.vgz --wav out.wav
 cargo run --release -- game.nsfe --track 3
 cargo run --release -- song.spc
+cargo run --release -- song.gym              # or .s98
 ```
 
 Options: `-o FILE`, `--grid N` (snap timing to 1/N notes: smaller output, but no longer exact),
@@ -250,6 +251,26 @@ don't carry), ADPCM fed by the CPU instead of from memory, compressed data block
 special mode, SSG-EG, the second chip of dual-chip files, and other chips (OPL/OPLL family, PCM chips such as
 SegaPCM, RF5C68 and the OKI ADPCM chips, SCC, HuC6280...).
 
+## GYM and S98
+
+Two more register-log formats, read by rewriting them as VGM (`src/logs.rs`), so everything above applies:
+
+- **GYM** (Mega Drive): YM2612 and PSG writes in 1/60 s frames, with or without the `GYMX` header (its loop start
+  is honoured, and packed files are unpacked). Files without the header are recognized by being a well-formed
+  command stream throughout. The DAC bytes a frame writes are spread over it the way libgme plays them (a frame
+  with fewer than its neighbour starts or ends its sample with them).
+- **S98** (PC-88/PC-98, MSX, X68000 logs), versions 0-3: YM2203, YM2608, YM2612, YM2151, YM2149/AY-3-8910 and
+  SN76489 devices (one of each; the default device is a YM2608 at 7987200 Hz), the file's tick length and loop
+  point. PSG clocks are halved, as libvgm plays them. YM2608 ADPCM data, which S98 writes through the chip's
+  memory port, becomes the chip's RAM as a VGM data block would. Not converted: the OPL/OPLL family and
+  compressed files. S98 has no frame-rate field, so the driver's frame is detected from the writes (as for a VGM
+  without its rate).
+
+Neither format points DAC bytes at a sample bank the way VGM's `0x8n` commands do: the converter makes one,
+storing each stretch of DAC values (32 or more) heard before only once, so a drum played again shares its
+sample. Aquatic Ruin Zone as a GYM becomes 49 KB of MML (55 KB from its VGZ), Streets of Rage 2's Go Straight as
+S98 38 KB.
+
 ## NSF / NSFE
 
 An NSF is the game's own sound driver, not a log, so `src/nsf.rs` plays it the way an NSF player does: it runs
@@ -418,7 +439,7 @@ convert.
 
 ## Tests
 
-`cargo test --release` builds small NES, SN76489, Game Boy, YM2151 and ProTracker files in code, NSF and NSFE
+`cargo test --release` builds small NES, SN76489, Game Boy, YM2151, GYM, S98 and ProTracker files in code, NSF and NSFE
 files (hand-assembled drivers: a bankswitched one that loops and plays DPCM, one that stops, one playing the
 VRC6), and VGM files
 that play YM2612 DAC samples (from the data bank, written directly, and by DAC stream), NES DPCM and `$4011`

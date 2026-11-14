@@ -1,4 +1,4 @@
-//! sion-convert: MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ, NSF/NSFE and SPC → SiON MML, written as by hand.
+//! sion-convert: MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ, GYM, S98, NSF/NSFE and SPC → SiON MML, written as by hand.
 //!
 //! Usage: sion-convert <input> [-o output.mml] [--grid N] [--gain G] [--wavetables] [--exact] [--exact-pcm] [--track N] [--plain] [--verify] [--wav FILE]
 
@@ -7,7 +7,7 @@ use std::process::exit;
 const HELP: &str = "usage: sion-convert <input> [options]
        sion-convert <song.mml> --wav FILE   (render an MML file)
 
-  input: Standard MIDI (.mid), tracker module (.mod .s3m .xm .it), chip log (.vgm .vgz) or NES music
+  input: Standard MIDI (.mid), tracker module (.mod .s3m .xm .it), chip log (.vgm .vgz .gym .s98) or NES music
          (.nsf .nsfe) or SNES music (.spc);
          the format is recognized from the file's contents
 
