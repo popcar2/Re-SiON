@@ -152,7 +152,7 @@ fn mod_sample_plays_as_pcm() {
     let track = out.plain.split(";\n").find(|t| t.contains("%7")).unwrap();
     assert!(track.contains("o5c2o5e2o5g2o6c2&v0o6c92r"), "C-2 E-2 G-2 C-3, then off a tick after C00: {track}");
     let want = sion_converter::reference(&protracker()).unwrap();
-    let db = sion_converter::snr(&want, &render(&out.mml, 60));
+    let db = sion_converter::snr(&want, &sion_converter::render_raw(&out.mml, 60.0));
     assert!(db > 50.0, "conversion differs from the tracker mix: {db:.1} dB");
 }
 
@@ -209,7 +209,7 @@ fn midi_written_by_bars() {
 fn match_db(mml: &str, want: &[f64]) -> f64 {
     // (Against the chips' own output: without the Mega Drive's master shelf, which matches a player's.)
     let mml = &mml.replace("#EFFECT0{hb9000,1,-3};", "");
-    let got: Vec<f32> = render(mml, 60).iter().step_by(2).copied().collect();
+    let got: Vec<f32> = sion_converter::render_raw(mml, 60.0).iter().step_by(2).copied().collect();
     let want: Vec<f32> = want.iter().map(|v| *v as f32).collect();
     let first = |x: &[f32]| x.iter().position(|v| v.abs() > 1e-6).unwrap_or(0) as i64;
     let lag = first(&got) - first(&want);

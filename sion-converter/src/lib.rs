@@ -157,8 +157,11 @@ const GATE_STEADY: u32 = 6;
 
 /// Render MML in chunks of interleaved stereo samples, passing each to `f`, until the song ends or `secs`
 /// seconds are rendered (the last chunk may reach past that).
-pub fn render_chunks(mml: &str, secs: f64, mut f: impl FnMut(&[f32])) {
-    let (mut song, mut buf, mut frames) = (sion::Song::new(mml), vec![0f32; 8192], 0usize);
+pub fn render_chunks(mml: &str, secs: f64, f: impl FnMut(&[f32])) { render_song(sion::Song::new(mml), secs, f) }
+
+/// `render_chunks`, for a song already made.
+pub fn render_song(mut song: sion::Song, secs: f64, mut f: impl FnMut(&[f32])) {
+    let (mut buf, mut frames) = (vec![0f32; 8192], 0usize);
     loop {
         buf.fill(0.0);
         let more = song.render(&mut buf);
@@ -172,6 +175,15 @@ pub fn render_chunks(mml: &str, secs: f64, mut f: impl FnMut(&[f32])) {
 pub fn render(mml: &str, secs: f64) -> Vec<f32> {
     let mut out = vec![];
     render_chunks(mml, secs, |b| out.extend_from_slice(b));
+    out
+}
+
+/// `render` without declicking: SiON's output exactly, to compare with a mix that doesn't ramp either (the
+/// tracker or chip reference).
+pub fn render_raw(mml: &str, secs: f64) -> Vec<f32> {
+    let (mut song, mut out) = (sion::Song::new(mml), vec![]);
+    song.set_declick(false);
+    render_song(song, secs, |b| out.extend_from_slice(b));
     out
 }
 

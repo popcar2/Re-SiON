@@ -72,7 +72,7 @@ fn main() {
     if verify && !check(&out.plain, &out.mml, secs) { exit(2) }
     if verify && opt.exact && !opt.wavetables && sion_converter::detect(&data) == Some(sion_converter::Format::Module) {
         let want = sion_converter::reference(&data).unwrap_or_else(|e| fail(&format!("{input}: {e}")));
-        let mut got = sion_converter::render(&out.mml, 60.0 * 30.0);
+        let mut got = sion_converter::render_raw(&out.mml, 60.0 * 30.0);
         if got.len() < want.len() { got.resize(want.len(), 0.0) }
         let db = sion_converter::snr(&want, &got);
         println!("verify: {db:.1} dB signal-to-difference against the module mixed from its samples{}",

@@ -79,6 +79,13 @@ sion_song_free(song);
 **Rendering.** Each `render` call fills the buffer and moves playback forward by that many frames. Any buffer
 size works. Samples are clamped to -1..1.
 
+**Declicking.** A key-on, volume change or pan change can make a track's output jump in the middle of a
+wave: a waveform restarting from its first frame, or a hard pan flip. As in trackers, such a jump is
+smoothed over: the output picks up where it would have been without the change, and the difference fades
+out over about a millisecond. On a key-on, or when the volume comes up from silence, only the old
+level fades out, so attacks stay sharp. Everything else is exactly SiON's output, and so is any track
+that no such change touches. `set_declick(false)` turns it off.
+
 **Ending.** `render` returns `false` once every track has ended and the output has been silent for half a
 second, so release tails are not cut off. A song with a `$` loop point never ends: stop it yourself.
 
@@ -99,7 +106,9 @@ To seek backwards, create a new song and skip from the start.
 feature (always on in the WebAssembly build).
 
 **PCM samples.** Modules `%7` and `%10` play recorded samples. Embed them in the MML with `#PCMB`, or set them
-from code with `set_sample`, which replaces any `#PCMB` of the same number.
+from code with `set_sample`, which replaces any `#PCMB` of the same number. `#PCMWAVE`, `#PCMVOICE` and
+`#SAMPLER` build instruments and drum kits out of them (see [Sample instruments and drum
+kits](#sample-instruments-and-drum-kits)).
 
 ## Rust API
 
@@ -115,6 +124,7 @@ Everything is on `sion::Song`. The crate is not on crates.io, so add it as a pat
 | `song.position() -> u64` | Frames rendered or skipped so far. |
 | `song.notes() -> impl Iterator<Item = i32>` | Per track, the byte offset of the playing note, or -1. Needs the `spans` feature. |
 | `song.set_sample(n: usize, s: Sample)` | Set PCM sample `n` (0..255) for `%7` / `%10`. |
+| `song.set_declick(on: bool)` | Turn [declicking](#how-playback-works) on (the default) or off. Off, the output is exactly SiON's. |
 | `Song::length(mml: &str) -> u64` | Frames in one pass through the MML, without rendering. |
 | `Song::loop_start(mml: &str) -> Option<u64>` | Frame a `$` loop returns to after `length`. `None` if the song ends. |
 | `Song::length_bytes`, `Song::loop_start_bytes` | `length` and `loop_start` for MML as bytes. |
@@ -266,10 +276,10 @@ This section is a summary. For each command's full meaning and parameters, see t
 | `%4` | Custom wavetables from `#WAV`, `#WAVB` or `#WAVCOLOR`. |
 | `%5` | All built-in waveforms (`%5@0` is a sine wave). |
 | `%6` | FM voice defined with `#@`, `#OPM@`, `#OPN@`, `#OPL@`, `#OPX@`, `#MA@` or `#AL@`. |
-| `%7` | PCM sample (`#PCMB` or `set_sample`). |
+| `%7` | PCM sample: `%7@n` plays `#PCMB` n, or instrument n if `#PCMWAVE` / `#PCMVOICE` define one. |
 | `%8` | Pulse wave with adjustable duty. |
 | `%9` | Ramp wave. |
-| `%10` | Sampler: PCM samples, like `%7`. |
+| `%10` | Sampler: each key plays its own sample at its own rate (a drum kit). `%10@n` picks bank n (0..3) of `#SAMPLER` keys; without any, key n plays `#PCMB` n. |
 | `%11` | Plucked string (Karplus–Strong). |
 | `%12` | Game Boy. |
 | `%13` | Konami VRC6. |
@@ -321,6 +331,9 @@ loop point and a `*scale+offset` suffix.
 | `#WAVBn{...}` | Wavetable `n` as hex bytes. |
 | `#WAVCOLORn{hex}` | Wavetable `n` from a wave color: hex digits, lowest first, set the levels (0-f) of harmonics 1, 2, 3, 4, 5, 6 and 8; an 8th digit picks the base wave (`%5@n`, sine by default). Also `#WAVC`. |
 | `#PCMBn{data}rate,key,loop,flags,level` | PCM sample `n`: see below. |
+| `#PCMWAVEn{sample,note,from,to,,start,end,loop}` | Instrument `n` for `%7`: keys `from`..`to` play `#PCMB` `sample`. See below. |
+| `#PCMVOICEn{...}commands` | Envelope, key scaling and commands for instrument `n`. See below. |
+| `#SAMPLERn{sample,hold,pan,,start,end,loop}` | `%10` drum kit key: see below. |
 | `#EFFECTn{...}` | Effect chain: see below. |
 | `#FM{...}` | Wire the following tracks into one FM sound (`#FM{B3(A)}`: A modulates B). |
 | `#SIGN{...}` | Key signature: `D`, `F#m`, `Bb`… or a list like `c+ f+`. |
@@ -331,6 +344,53 @@ loop point and a `*scale+offset` suffix.
 | `#REV` | Swap the direction of `<` `>` and `(` `)`. `#REV{oct}` or `#REV{vol}` swaps only one. |
 | `#FBMODE{chip}` | Chip-style FM feedback. |
 | `#END` | Stop reading here. |
+
+### Sample instruments and drum kits
+
+`#PCMB` holds the audio. These three statements say how to play it, and refer to a `#PCMB` by its number, so
+one sample can be used by several instruments without being stored again. They can come before or after the
+`#PCMB`s they use. Arguments can be left out (`#PCMWAVE0{3,,0,59}`): each one has a default.
+
+`#PCMWAVEn{sample,note,from,to,channels,start,end,loop}` gives `%7` instrument `n` (0..255) a sample for a
+range of keys. Several of them with different ranges make one instrument play different samples on different
+keys (a multisample), and switching between them needs no `@n`:
+
+| Argument | Meaning (default) |
+| --- | --- |
+| `sample` | The `#PCMB` number. |
+| `note` | The note at which the sample plays at its `#PCMB` rate (the `#PCMB`'s key). Fractions are allowed. |
+| `from`, `to` | The keys that play it (0, 127). `to` -1 means just `from`. Keys outside every range are silent. |
+| `channels` | Ignored: samples are mono. |
+| `start`, `end` | The first frame, and the frame to stop before, counted in the `#PCMB` (all of it). |
+| `loop` | The frame to loop from, counted in the `#PCMB` (the `#PCMB`'s own loop). -1: no loop. Below -1, such as -500: loop the last 500 frames. |
+
+`#PCMVOICEn{volume note,volume range,volume amount,pan note,pan range,pan width,ar,dr,sr,rr,sl}commands`
+sets how instrument `n` plays:
+
+- Volume key scaling (64, 0, 0): over `range` keys centered on `note`, the level rises by `amount` / 128.
+  Keys below the range are that much quieter, keys above are at full level. A negative amount turns this
+  around.
+- Pan key scaling (64, 0, 0): over the same kind of range, pan moves from `-width / 2` to `+width / 2`,
+  added to the track's pan. A width of 128 spreads the keys from left to right.
+- `ar`, `dr`, `sr`, `rr`, `sl` (63, 0, 0, 63, 0): the envelope, as in `@n,ar,dr,sr,rr,sl`.
+- Commands after `}` run each time the instrument is chosen, as they do for FM voices.
+
+A `#PCMVOICE` without a `#PCMWAVE` plays `#PCMB` n on every key.
+
+`#SAMPLERn{sample,hold,pan,channels,start,end,loop}` makes key `n % 128` of `%10` bank `n / 128` play a
+sample, at its own rate, whatever the pitch. `hold` 1 plays the sample to its end after key-off (0). `pan`
+(-64..64) is added to the track's pan (0). `channels`, `start`, `end` and `loop` are as for `#PCMWAVE`. In a
+bank that has any `#SAMPLER`, keys without one are silent.
+
+```
+#PCMB0{...}22050,48;  #PCMB1{...}22050,72;   // a low and a high recording of the same instrument
+#PCMWAVE0{0,,0,59};   #PCMWAVE0{1,,60,127};  // instrument 0: sample 0 below o5c, sample 1 from there
+#PCMVOICE0{,,,,,,63,0,0,40,0};               // with a slower release
+#PCMB2{...}; #PCMB3{...};
+#SAMPLER36{2}; #SAMPLER38{3,1};              // kit: kick on o3c, snare on o3d (playing on through key-off)
+%7@0 l8 o4 cegb<ceg;
+%10 l8 o3 cdcd;
+```
 
 ### Effects
 
@@ -370,5 +430,22 @@ Additions:
 - `@ph` on PCM modules takes a fractional or negative start frame and a play length.
 - `k` accepts fractions.
 
-Not supported: `#SAMPLER`, `#PCMWAVE` and `#PCMVOICE` (use `#PCMB` or `set_sample` instead), and
-event triggers (`%t`, `%e`), which are skipped.
+`#SAMPLER`, `#PCMWAVE` and `#PCMVOICE` use SiON's names and arguments, with one difference: where SiON
+expects the name of a sound, they take a `#PCMB` number. In SiON these statements hold no audio. The braces
+name a sound that the program running SiON loaded and registered under that name. An MML file can't carry
+the sound, so a song that uses them only plays inside that program. Here the audio is in the file, in
+`#PCMB`, and these statements point at it, so the whole song is one MML file. (In SiON, registering sounds
+under the names `0`, `1`, … would make the same text work.) The rest differs only in small ways:
+
+- Without a `note`, `#PCMWAVE` uses the `#PCMB`'s own key, because `#PCMB` already says what pitch the
+  sample is at. SiON's default is 69 (`o5a`). Fractional notes are allowed.
+- A left-out `start` is the first frame and a left-out `end` is the last. SiON skips quiet frames at the start
+  and end by itself.
+- A left-out `loop` keeps the `#PCMB`'s loop. A tail loop (below -1) doesn't crossfade.
+- `channels` is ignored, because samples are mono.
+- `%7` has 256 instruments (SiON has 128).
+
+Playback differs in one way: jumps from key-ons and volume and pan changes are smoothed over (see
+[Declicking](#how-playback-works)).
+
+Not supported: event triggers (`%t`, `%e`), which are skipped.

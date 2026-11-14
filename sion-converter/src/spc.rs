@@ -1277,6 +1277,22 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
     // (A tone's `@n` leaves the envelope clock as it was: a track that sets it anywhere sets it with every tone.)
     let clocked: HashSet<u32> = notes.iter().filter(|n| n.env.contains("@clock")).map(|n| n.ch).collect();
     for n in notes.iter_mut().filter(|n| clocked.contains(&n.ch) && !n.env.contains("@clock")) { n.env.push_str("@clock100") }
+    // Each sample with its envelope and settings is an instrument (`#PCMWAVE`, `#PCMVOICE`): a note changing to it
+    // chooses it by number (`@n`), not with all of it again. (Over 256 of them, the notes keep them in full.)
+    let tones: HashSet<&str> = notes.iter().filter(|n| n.instr == "%7").map(|n| n.env.as_str()).collect();
+    if tones.len() <= 256 {
+        // (Each tone's `@n`, by its `@sample,ar,dr,sr,rr,sl` and the commands after them.)
+        let mut num: HashMap<String, String> = HashMap::new();
+        for n in notes.iter_mut().filter(|n| n.instr == "%7") {
+            if let Some(i) = num.get(&n.env) { n.env = i.clone(); continue }
+            let Some(e) = n.env.strip_prefix('@') else { continue };
+            let (nums, cmds) = e.split_at(e.find(|c: char| !(c.is_ascii_digit() || c == ',' || c == '-')).unwrap_or(e.len()));
+            let v: Vec<i32> = nums.split(',').filter_map(|x| x.parse().ok()).collect();
+            let [smp, ar, dr, sr, rr, sl] = v[..] else { continue };
+            let i = format!("@{}", defs.pcm_voice(smp as usize, [ar, dr, sr, rr, sl], cmds));
+            num.insert(std::mem::replace(&mut n.env, i.clone()), i);
+        }
+    }
     if full { warnings.push("more than 256 different samples: the rest are left out".into()) }
     if notes.is_empty() { return Err("the SPC plays no sound the converter can carry over".into()) }
     header.extend(defs.header());

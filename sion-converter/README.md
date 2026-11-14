@@ -361,6 +361,10 @@ keyed on as it loads, as SPC players do (most snapshots are taken as a song star
   next note) instead of a rest after every note. Other key-offs go on a whole or half row close by, or else the
   nearest tick.
 - A voice that switches samples all the time (a drum kit) gets one track per sample, so each keeps its tone.
+- Each sample with its envelope, echo send and envelope clock is an instrument (`#PCMWAVE` naming the `#PCMB`,
+  `#PCMVOICE` with the envelope and the other settings after it), listed with the definitions at the top. A note
+  changing tone chooses one with `%7@n` instead of writing all of it again. The audio is identical, and the
+  files are about 1.3% smaller (4% of the text besides the sample data, on 269 test songs).
 
 An SPC holds no song length either: the song loops where the driver's state (RAM, CPU and DSP registers, timer
 settings) comes round to one it was in at an earlier timer tick, or else where its DSP writes repeat, or else

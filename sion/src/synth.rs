@@ -45,8 +45,28 @@ impl Sample {
     }
 }
 
+/// A `%7` voice from `#PCMWAVE` and `#PCMVOICE`: the sample each key plays (an index into `Shared::samples`;
+/// None without a `#PCMWAVE`: `#PCMB` n on every key; `NO_SAMPLE` for keys it leaves out), each key's level and pan offset, and the envelope
+/// (ar, dr, sr, rr, sl) and commands `#PCMVOICE` gives it.
+#[derive(Clone, Debug)]
+pub struct PcmVoice { pub keys: Option<Vec<usize>>, pub vol: Vec<f32>, pub pan: Vec<i32>, pub env: Option<[i32; 5]>, pub init: Vec<u8> }
+
+/// A `%10` key from `#SAMPLER`: its sample (an index into `Shared::samples`), whether it plays on through
+/// key-off, and its pan offset.
+#[derive(Clone, Copy, Debug)]
+pub struct KitKey { pub smp: usize, pub hold: bool, pub pan: i32 }
+
+/// Sample number for a key with none: plays nothing.
+pub const NO_SAMPLE: usize = usize::MAX;
+
 pub struct Shared {
+    /// `#PCMB` 0..255, then the parts of them `#PCMWAVE` and `#SAMPLER` cut out (`cuts`).
     pub samples: Vec<Option<Sample>>,
+    /// Each sample past 255: the `#PCMB` it is cut from, and its start, end, loop and key (see `cut` in lib.rs).
+    pub cuts: Vec<(usize, [Option<f32>; 4])>,
+    /// `%7@n` voices (`#PCMWAVE`, `#PCMVOICE`); `%10`'s four banks of 128 keys (`#SAMPLER`; None: a bank with none).
+    pub pcmv: Vec<Option<PcmVoice>>,
+    pub kit: Vec<Option<Vec<Option<KitKey>>>>,
     /// Which samples are NES DPCM (`#PCMB` flags 4): their frames are the level of the console's delta modulation
     /// channel, which a channel playing them keeps the way the console does (see `Chan::dpcm`).
     pub dpcm: Vec<bool>,
@@ -352,6 +372,11 @@ pub struct Chan {
     pub fine: f32,
     /// PCM module (7 or 10, else -1), its sample number (`%7@n`), and the playing sample, frame, fraction and step.
     pub pcm: i32, pub smp: usize, sidx: usize, spos: usize, sfrac: f32, sstep: f32,
+    /// The playing key's level and pan offset (`#PCMVOICE`, `#SAMPLER`), and whether it plays on through key-off.
+    svol: f32, span: i32, hold: bool,
+    /// How much louder the output was before the volume changes since the renderer last took this (see `volume`;
+    /// 1: none), for declicking.
+    pub vj: f32,
     /// Fraction of a frame added to the `@ph` start frame; how late (in output frames, 0..1) the last event
     /// came, so a PCM note's start or pitch change can be placed at its exact time.
     /// (`slate`: set by a key-on, used by this frame's pitch update only.)
@@ -416,7 +441,7 @@ impl Chan {
         Chan {
             ops: vec![], n: 1, alg: 0, act: 0, fb: 0, fbc: 0, fratio: 1.0, inp: (0, 0), ring: (0, 0), outp: (0, 0), stale: true,
             lfo: 2, lfo_tab: vec![], lfo_step: 0.0, lfo_ph: 0, lfo_t: 1.0, amd: 0, pmd: 0, am: 0.0, pm: 0,
-            vol: [0.0; 8], pan: 64, vm: (0, 0), xv: (128, 256), pitch: 0, on: false, fine: 0.0, pcm: -1, smp: 0, sidx: 0, spos: 0, sfrac: 0.0, sstep: 0.0, sfrac0: 0.0, slate: 0.0, slen: 0.0, sleft: 0.0,
+            vol: [0.0; 8], pan: 64, vm: (0, 0), xv: (128, 256), pitch: 0, on: false, fine: 0.0, pcm: -1, smp: 0, sidx: 0, svol: 1.0, span: 0, hold: false, vj: 1.0, spos: 0, sfrac: 0.0, sstep: 0.0, sfrac0: 0.0, slate: 0.0, slen: 0.0, sleft: 0.0,
             rejoin: false, dm: false, dplay: false, dnew: false, dprev: None, dlv: 0.0, doff: 0.0, dg: 0.0, dhp: (0.0, 0.0), wire: [wiring(b'i').1; 4],
             f_on: false, f_type: 0, f_cut: [128, 128, 128, 128, 0, 128], f_time: [0, 0, 0, i32::MAX, 0, i32::MAX], f_res: 1.0, f_v: [0.0; 3], cutoff: 128, cut_off: 0, f_st: 5, f_step: i32::MAX, f_next: 0, f_inc: 0, f_cnt: i32::MAX,
             ks: false, kbuf: vec![], kidx: 0.0, kout: 0.0, k_lpf: 0.875, kx: 1.0,
@@ -451,7 +476,10 @@ impl Chan {
         (self.n, self.alg, self.act, self.fb) = (if cnt == 5 { 5 } else { ops }, alg, ops - 1, 0);
         let code = ALG[ops - 1].get(alg).filter(|_| cnt != 5).map_or(&b"iiii"[..], |c| c.as_bytes());
         for ((o, w), &c) in self.ops.iter_mut().zip(&mut self.wire).zip(code) { let (f, wc) = wiring(c); (o.fin, *w) = (f & 8 != 0, wc) }
+        // (The carriers changed: the old level says nothing about the new one, so this isn't a volume change.)
+        let vj = self.vj;
         self.volume(self.xv.0, self.xv.1);
+        self.vj = vj;
     }
 
     pub fn set_voice(&mut self, v: &Voice) {
@@ -477,12 +505,21 @@ impl Chan {
         }
     }
 
+    /// Also adds to `vj` how much louder the output was before (old over new gain; infinite: now silent, 0:
+    /// silent before).
     pub fn volume(&mut self, x: i32, vel: i32) {
         self.xv = (x, vel);
         if self.ks { self.kx = x as f32 / 128.0 }
         let tl = vtl(self.vm.1, if self.ks { 256 } else { x * 2 }) + vtl(self.vm.0, vel);
+        // (Every carrier gets the same offset, so the output scales by the change.)
+        let jump = self.ops.iter().find(|o| o.fin).filter(|o| o.tlo != tl)
+            .map_or(1.0, |o| if tl >= OFF { f32::INFINITY } else if o.tlo >= OFF { 0.0 } else { M::exp2((tl - o.tlo) / 64.0) });
         for o in &mut self.ops { o.tlo = if o.fin { tl } else { 0.0 } }
+        if jump != 1.0 { self.vj = if jump.is_infinite() || jump == 0.0 { jump } else { self.vj * jump } }
     }
+
+    /// The pan the output is at: the track's, plus the playing key's offset.
+    pub fn out_pan(&self) -> i32 { (self.pan + self.span).clamp(0, 128) }
 
     pub fn release_rate(&mut self, rr: i32, all: bool) {
         if self.ks { self.k_lpf = 1.0 - rr as f32 / 64.0 }
@@ -535,7 +572,8 @@ impl Chan {
     }
 
     pub fn note_off(&mut self) {
-        for o in &mut self.ops { o.shift(4) }
+        // (A `#SAMPLER` key that ignores key-off plays to its end.)
+        if !(self.pcm == 10 && self.hold) { for o in &mut self.ops { o.shift(4) } }
         if self.f_on { self.f_shift(4) }
         self.on = false;
     }
@@ -660,8 +698,19 @@ impl Chan {
         let (pm, pitch, fine, ks) = (self.pm, self.pitch, self.fine, self.ks);
         for o in &mut self.ops { if !ks { (o.pi, o.pf) = (pitch, fine) } o.pitch(sh, pm) }
         if self.pcm >= 0 {
-            // `%10` picks the sample by note number and plays it at its own rate.
-            self.sidx = if self.pcm == 10 { (pitch >> 6).max(0) as usize } else { self.smp };
+            // `%10` picks the sample by note number and plays it at its own rate: the bank's `#SAMPLER` key, or
+            // (a bank with none) `#PCMB` n. `%7` plays its voice's sample for the key (`#PCMWAVE`), or `#PCMB` n.
+            let note = (pitch >> 6).clamp(0, 127) as usize;
+            (self.svol, self.span, self.hold) = (1.0, 0, false);
+            self.sidx = if self.pcm == 10 {
+                match &sh.kit[self.smp & 3] {
+                    None => (pitch >> 6).max(0) as usize,
+                    Some(bank) => bank[note].map_or(NO_SAMPLE, |k| { (self.span, self.hold) = (k.pan, k.hold); k.smp }),
+                }
+            } else if let Some(v) = sh.pcmv.get(self.smp).and_then(|v| v.as_ref()) {
+                (self.svol, self.span) = (v.vol[note], v.pan[note]);
+                v.keys.as_ref().map_or(self.smp, |k| k[note])
+            } else { self.smp };
             self.dm = sh.dpcm.get(self.sidx).copied().unwrap_or(false);
             let semi = |s: &Sample| if self.pcm == 7 { M::exp2(((pitch + self.ops[0].det + pm - s.key * 64) as f32 + fine) / 768.0) } else { 1.0 };
             let step = sh.sample(self.sidx).map_or(0.0, |s| s.rate / RATE * semi(s));
@@ -696,7 +745,7 @@ impl Chan {
             // (The chips' sum also cancels at the sample rate, so deep feedback doesn't break into oscillation.)
             if sh.fb2 { (o.out + o.pout) * pow2(self.fb - 8) } else { o.out * pow2(self.fb - 7) }
         } else { 0.0 };
-        let mut x = if self.pcm >= 0 && self.dm { self.dpcm(sh, am) } else if self.pcm >= 0 {
+        let mut x = if self.pcm >= 0 && self.dm { self.dpcm(sh, am) * self.svol } else if self.pcm >= 0 {
             let o = &mut self.ops[0];
             match (sh.sample(self.sidx), o.eg(fr)) {
                 (Some(s), Some(lv)) => {
@@ -706,7 +755,7 @@ impl Chan {
                     advance(&mut self.spos, &mut self.sfrac, self.sstep);
                     if self.spos >= s.data.len() { match s.wrap(self.spos) { Some(u) => self.spos = u, None => o.st = 0 } }
                     if self.slen > 0.0 { self.sleft -= self.sstep; if self.sleft <= 0.0 { o.st = 0 } }
-                    o.out
+                    o.out * self.svol
                 }
                 _ => 0.0,
             }

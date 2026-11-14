@@ -4,7 +4,8 @@
 use crate::tracker::*;
 use crate::{module_to_mml, play, snr, Options};
 
-fn render(mml: &str) -> Vec<f32> { crate::render(mml, 60.0 * 30.0) }
+/// (Without declicking: the reference mix doesn't ramp either, so the conversion itself is what's compared.)
+fn render(mml: &str) -> Vec<f32> { crate::render_raw(mml, 60.0 * 30.0) }
 
 /// Convert, render, and compare with the reference: (SNR in dB, MML).
 fn compare(m: &Module) -> (f64, String) {

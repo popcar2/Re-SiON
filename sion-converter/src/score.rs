@@ -347,6 +347,8 @@ pub struct Defs {
     pub waves: Vec<Vec<i32>>,
     pub voices: Vec<String>,
     pub pcm: Vec<String>,
+    /// Sample instruments (`#PCMWAVE` + `#PCMVOICE`): sample number, envelope (ar, dr, sr, rr, sl) and commands.
+    pub pcm_voices: Vec<(usize, [i32; 5], String)>,
     /// `#TABLE`s, numbered down from 254 (custom LFO waveforms need 8..254).
     pub tables: Vec<String>,
     ids: std::collections::HashMap<String, usize>,
@@ -393,6 +395,14 @@ impl Defs {
         Some(self.pcm.len() - 1)
     }
 
+    /// Number of a sample instrument (`%7@n`): `#PCMB` `smp` with this envelope (ar, dr, sr, rr, sl) and these
+    /// commands. (SiON takes 256: the caller makes no more.)
+    pub fn pcm_voice(&mut self, smp: usize, env: [i32; 5], cmds: &str) -> usize {
+        if let Some(i) = self.pcm_voices.iter().position(|v| v.0 == smp && v.1 == env && v.2 == cmds) { return i }
+        self.pcm_voices.push((smp, env, cmds.into()));
+        self.pcm_voices.len() - 1
+    }
+
     pub fn header(&self) -> Vec<String> {
         let mut h: Vec<String> = self.waves.iter().enumerate()
             .map(|(i, w)| format!("#WAV{i}{{{}}}", w.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))).collect();
@@ -400,6 +410,10 @@ impl Defs {
         if self.voices.iter().any(|v| v.starts_with("#OPN@") || v.starts_with("#OPM@")) { h.push("#FBMODE{chip}".into()) }
         h.extend(self.voices.iter().cloned());
         h.extend(self.tables.iter().enumerate().map(|(i, t)| format!("#TABLE{}{{{t}}}", 254 - i)));
+        for (i, (smp, e, cmds)) in self.pcm_voices.iter().enumerate() {
+            h.push(format!("#PCMWAVE{i}{{{smp}}}"));
+            h.push(format!("#PCMVOICE{i}{{,,,,,,{}}}{cmds}", e.map(|x| x.to_string()).join(",")));
+        }
         h.extend(self.pcm.iter().enumerate().map(|(i, d)| format!("#PCMB{i}{d}")));
         h
     }

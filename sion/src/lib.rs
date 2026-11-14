@@ -1,6 +1,7 @@
 //! Player for SiON MML: `Song::new(mml)`, then `render` interleaved stereo f32 samples at `RATE` Hz.
 //!
-//! PCM samples (`%7`, `%10`) come from `#PCMB` definitions in the MML or from `Song::set_sample`.
+//! PCM samples (`%7`, `%10`) come from `#PCMB` definitions in the MML or from `Song::set_sample`; `#PCMWAVE`,
+//! `#PCMVOICE` and `#SAMPLER` build instruments and drum kits out of them.
 
 #![no_std]
 // The wasm and C interfaces (`wasm` and `ffi` features) are the only unsafe code.
@@ -114,6 +115,88 @@ fn pcm(bytes: &[u8], a: &[f32]) -> Sample {
         else { bytes.iter().map(|&b| b as i8 as f32 / 128.0).collect() };
     let lp = a.get(2).filter(|l| **l >= 0.0).map(|l| *l as usize);
     Sample { data, rate: a.first().copied().unwrap_or(RATE).max(0.0), key: a.get(1).map_or(60, |k| *k as i32), lp, bidi: flags & 2 != 0 }
+}
+
+/// Comma-separated arguments, each a number or left out (empty).
+fn fields(s: &[u8]) -> Vec<Option<f32>> { s.split(|c| *c == b',').map(|f| fnum(f, &mut 0)).collect() }
+
+/// Part of sample `s`, for `#PCMWAVE` and `#SAMPLER`. `a`, each of them optional: the first frame (0), the frame
+/// to stop before (the end), the frame to loop from (the sample's own loop; -1: none; below -1: the last that
+/// many frames), all counted in `s`; and the note it plays at `s`'s rate at (`s`'s own; fractions allowed).
+fn cut(s: &Sample, a: &[Option<f32>; 4]) -> Sample {
+    let n = s.data.len();
+    let st = a[0].filter(|v| *v >= 0.0).map_or(0, |v| (v as usize).min(n));
+    let en = a[1].filter(|v| *v >= 0.0).map_or(n, |v| (v as usize).min(n));
+    let en = if en <= st { n } else { en };
+    let lp = match a[2] { None => s.lp, Some(l) if l >= 0.0 => Some(l as usize), Some(l) if l < -1.0 => Some(en.saturating_sub(-l as usize)), _ => None };
+    let lp = lp.map(|l| l.max(st) - st).filter(|&l| l < en - st);
+    let (key, rate) = match a[3] { Some(k) => { let f = M::floor(k); (f as i32, s.rate * M::exp2((f - k) / 12.0)) } None => (s.key, s.rate) };
+    Sample { data: s.data[st..en].to_vec(), rate, key, lp, bidi: s.bidi }
+}
+
+/// Sample number for `#PCMWAVE` / `#SAMPLER` argument `id` (a `#PCMB` number) cut by `a` (see `cut`): the
+/// `#PCMB` itself if `a` changes nothing, else a cut of it (made once for the same arguments).
+fn cut_of(sh: &mut Shared, id: Option<f32>, a: [Option<f32>; 4]) -> Option<usize> {
+    let id = id.filter(|i| (0.0..256.0).contains(i))? as usize;
+    if a.iter().all(Option::is_none) { return Some(id) }
+    let k = sh.cuts.iter().position(|c| c.0 == id && c.1 == a).unwrap_or_else(|| { sh.cuts.push((id, a)); sh.cuts.len() - 1 });
+    Some(256 + k)
+}
+
+/// Make the cut samples from the `#PCMB`s they are cut from (`only`: just those of that one).
+fn cuts(sh: &mut Shared, only: Option<usize>) {
+    sh.samples.resize(256 + sh.cuts.len(), None);
+    sh.dpcm.resize(256 + sh.cuts.len(), false);
+    for (k, (id, a)) in sh.cuts.iter().enumerate() {
+        if only.is_some_and(|o| o != *id) { continue }
+        sh.samples[256 + k] = sh.samples[*id].as_ref().map(|s| cut(s, a));
+        sh.dpcm[256 + k] = sh.dpcm[*id];
+    }
+}
+
+/// `#PCMVOICE`'s key scaling, as SiON's: below `center - range / 2` keys have `below`, then each one `step` more
+/// up to `center + range / 2`, and `above` from there.
+fn key_scale(center: f32, range: f32, below: f32, step: f32, above: f32) -> Vec<f32> {
+    let (lo, hi, mut v) = ((center - range * 0.5) as i32, (center + range * 0.5) as i32, below);
+    (0..128).map(|i| if i < lo { below } else if i < hi { v += step; v - step } else { above }).collect()
+}
+
+/// `#PCMWAVE` (`W`), `#PCMVOICE` (`V`) or `#SAMPLER` (`S`) number `k`. They only refer to `#PCMB`s by number, so
+/// they can come before them: the cut samples are made once all are read (`cuts`). See the README for the
+/// arguments.
+fn pcm_table(sh: &mut Shared, kind: u8, k: usize, dat: &[u8], pfx: &[u8]) {
+    let blank = || PcmVoice { keys: None, vol: vec![1.0; 128], pan: vec![0; 128], env: None, init: vec![] };
+    let f = fields(dat);
+    let a = |i: usize| f.get(i).copied().flatten();
+    let at = |i: usize, d: f32| a(i).unwrap_or(d);
+    match kind {
+        // `#PCMWAVEn{id,note,from,to,channels,start,end,loop}`
+        b'W' => {
+            let Some(smp) = cut_of(sh, a(0), [a(5), a(6), a(7), a(1)]) else { return };
+            let (from, to) = (at(2, 0.0).max(0.0) as usize, at(3, 127.0) as i32);
+            let to = if to == -1 { from } else { to.min(127) as usize };
+            let v = sh.pcmv[k & 255].get_or_insert_with(blank);
+            let keys = v.keys.get_or_insert_with(|| vec![NO_SAMPLE; 128]);
+            for key in keys.iter_mut().take(to + 1).skip(from) { *key = smp }
+        }
+        // `#PCMVOICEn{volume center,range,amount, pan center,range,width, ar,dr,sr,rr,sl}commands`
+        b'V' => {
+            let v = sh.pcmv[k & 255].get_or_insert_with(blank);
+            let (vc, vr, vw) = (at(0, 64.0) as i32 as f32, at(1, 0.0), at(2, 0.0) / 128.0);
+            let step = |w: f32, r: f32| if r == 0.0 { w } else { w / r };
+            v.vol = key_scale(vc, vr, 1.0 - vw.max(0.0), step(vw, vr), 1.0 + vw.min(0.0));
+            let (pc, pr, pw) = (at(3, 64.0) as i32 as f32, at(4, 0.0), at(5, 0.0));
+            v.pan = key_scale(pc, pr, -pw * 0.5, step(pw, pr), pw * 0.5).iter().map(|p| *p as i32).collect();
+            v.env = Some([at(6, 63.0), at(7, 0.0), at(8, 0.0), at(9, 63.0), at(10, 0.0)].map(|x| x as i32));
+            v.init = pfx.to_vec();
+        }
+        // `#SAMPLERn{id,ignore key-off,pan,channels,start,end,loop}`: bank n / 128, key n % 128.
+        _ => {
+            let Some(smp) = cut_of(sh, a(0), [a(4), a(5), a(6), None]) else { return };
+            let bank = sh.kit[(k >> 7) & 3].get_or_insert_with(|| vec![None; 128]);
+            bank[k & 127] = Some(KitKey { smp, hold: at(1, 0.0) != 0.0, pan: at(2, 0.0) as i32 });
+        }
+    }
 }
 
 /// All numbers in a voice definition.
@@ -311,6 +394,71 @@ struct Track {
     /// Byte offset in the source MML of the note playing now (-1: none), from `\x03<offset>` markers (see `spans`).
     src: i32,
     ch: Chan,
+    dc: Declick,
+}
+
+/// Smooths over the jumps in a track's output that a key-on, volume or pan change makes mid-wave (a waveform
+/// restarting at its first frame, a hard pan flip), as trackers ramp them: the output picks up where it would
+/// have been without the change, and the difference fades out within about a millisecond. A key-on only
+/// carries the old note's level over (so attacks stay sharp). Output that no such change touches is exactly
+/// SiON's.
+#[derive(Clone, Copy, Default)]
+struct Declick {
+    /// The last channel sample and pan: while nothing is fading, the last output is that sample at that pan.
+    v: f32, pan: i32,
+    /// A key-on since the last sample (that has a level to carry over: a plucked string's starts a noise burst).
+    kon: bool,
+    /// While an offset is fading (`left` samples more): it (left, right, mono: for a send without panning), what
+    /// it drops by each sample, and the last output.
+    left: u32, off: [f32; 3], step: [f32; 3], last: [f32; 3],
+}
+
+/// Samples a declick offset takes to fade out (about a millisecond).
+const DECLICK: u32 = 48;
+
+impl Declick {
+    fn new(pan: i32) -> Declick { Declick { pan, ..Declick::default() } }
+
+    fn fading(&self) -> bool { self.left > 0 }
+
+    /// Nothing to do this sample (the usual case): no changes (`vj`: see `Chan::vj`), nothing fading, the pan as
+    /// it was.
+    #[inline]
+    fn calm(&self, pan: i32, vj: f32) -> bool { !self.kon && vj == 1.0 && !self.fading() && pan == self.pan }
+
+    /// The output for channel sample `v` at pan `pan` (gains `lr`; `old`: those of the last pan), after a key-on
+    /// or volume changes since the last sample (`vjump`: see `Chan::vj`), or with an offset still fading.
+    /// A key-on, or a volume change from silence, only carries the old level over; other changes ease all the
+    /// way.
+    #[cold]
+    #[inline(never)]
+    fn run(&mut self, v: f32, pan: i32, lr: [f32; 2], old: [f32; 2], vjump: f32) -> [f32; 3] {
+        let kon = core::mem::take(&mut self.kon);
+        let o = [v * lr[0], v * lr[1], v];
+        let last = if self.fading() { self.last } else { [self.v * old[0], self.v * old[1], self.v] };
+        if kon || vjump != 1.0 || pan != self.pan {
+            // (Turned up from silence, or starting after it, is an attack too.)
+            let attack = kon || vjump == 0.0 || last == [0.0; 3];
+            for k in 0..3 {
+                let l = last[k];
+                self.off[k] = if attack { (l - o[k]).clamp(l.min(0.0), l.max(0.0)) } else {
+                    // What it would have been: the old gains, plus what was still fading.
+                    let was = if vjump.is_finite() { v * vjump * if k < 2 { old[k] } else { 1.0 } + self.off[k] } else { l };
+                    was - o[k]
+                };
+                self.step[k] = self.off[k] / DECLICK as f32;
+            }
+            self.left = if self.off == [0.0; 3] { 0 } else { DECLICK };
+        }
+        let mut out = o;
+        if self.fading() {
+            for k in 0..3 { out[k] += self.off[k]; self.off[k] -= self.step[k] }
+            self.left -= 1;
+            if self.left == 0 { self.off = [0.0; 3] }
+        }
+        (self.v, self.pan, self.last) = (v, pan, out);
+        out
+    }
 }
 
 impl Track {
@@ -321,7 +469,7 @@ impl Track {
             oct: 5, len: 480, ns: 0, vel: 256, vsh: sh.vmode.2, x: 128, kt: 0, k: 0, kf: 0.0, note: 0, slur: false, md: 0, tone: 0,
             set: [[None; 5]; 2], xoff: [false; 2], sweep: [0; 2], swe0: 0.0, modt: [None, None], env: [None; 5], menv: None,
             swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 0.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0, src: -1,
-            ch: Chan::new(),
+            ch: Chan::new(), dc: Declick::new(64),
         };
         t.ch.vm = (sh.vmode.0, sh.vmode.1);
         t.module(sh, 0, MIN);
@@ -349,7 +497,14 @@ impl Track {
                 self.ch.volume(self.x, self.vel);
                 return Some(&voice.init);
             }
-            7 | 10 => { self.ch.smp = v.max(0) as usize; self.ch.stale = true }
+            7 | 10 => {
+                (self.ch.smp, self.ch.stale) = (v.max(0) as usize, true);
+                // A `#PCMVOICE`'s envelope and commands.
+                if let Some(p) = sh.pcmv.get(self.ch.smp).and_then(|p| p.as_ref()).filter(|_| self.md == 7) {
+                    if let Some(e) = p.env { self.ch.params(&e) }
+                    return Some(&p.init);
+                }
+            }
             11 => {}
             _ => { let o = &mut self.ch.ops[self.ch.act]; (o.pg, o.pt) = tone(self.md, v) }
         }
@@ -382,6 +537,7 @@ impl Track {
             if self.ch.on { self.ch.note_off() }
             self.process(sh, 1);
             self.ch.note_on();
+            self.dc.kon = !self.ch.ks;
         } else if self.sweep[1] > 0 {
             self.ch.pitch = old;
             (self.sws, self.swe, self.swp) = ((pi - old) as f64 / self.sweep[1] as f64, pi as f64, old as f64);
@@ -705,6 +861,8 @@ impl Default for Slot {
 
 pub struct Song {
     tracks: Vec<Track>, sh: Shared, slots: Vec<Slot>, bpm: f64, now: f64, tail: usize,
+    /// Smooth over the jumps from key-ons and volume and pan changes (see `Declick`; on by default).
+    declick: bool,
     /// Frames played (rendered or skipped) so far.
     pos: u64,
     /// Tick and tempo at the last tempo change, and frames since: `now` is computed from these rather than summed
@@ -890,12 +1048,19 @@ fn inline(s: &[u8], tables: &mut [Option<Table>], next: &mut usize) -> Vec<u8> {
 }
 
 impl Song {
-    /// Set PCM sample `n` (0..255), replacing any `#PCMB` of that number.
+    /// Set PCM sample `n` (0..255), replacing any `#PCMB` of that number (and the parts of it that `#PCMWAVE`
+    /// and `#SAMPLER` cut out).
     pub fn set_sample(&mut self, n: usize, s: Sample) {
-        if let Some(slot) = self.sh.samples.get_mut(n) { *slot = Some(s); self.sh.dpcm[n] = false }
+        if n < 256 { self.sh.samples[n] = Some(s); self.sh.dpcm[n] = false; cuts(&mut self.sh, Some(n)) }
     }
 
     pub fn new(mml: &str) -> Song { Song::from_bytes(mml.as_bytes()) }
+
+    /// Turn declicking on (the default) or off. Off, the output is exactly SiON's, jumps and all.
+    pub fn set_declick(&mut self, on: bool) { self.declick = on; self.declick_reset() }
+
+    /// Forget what declicking took note of: nothing from before now is smoothed over.
+    fn declick_reset(&mut self) { for t in &mut self.tracks { (t.dc, t.ch.vj) = (Declick::new(t.ch.out_pan()), 1.0) } }
 
     /// `new` for MML as bytes (UTF-8, though only the ASCII in it matters), so no text conversion is needed.
     pub fn from_bytes(src: &[u8]) -> Song {
@@ -917,7 +1082,7 @@ impl Song {
 
         let (sine, pan, att) = tables();
         let mut sh = Shared {
-            samples: vec![None; 256], dpcm: vec![false; 256], waves: vec![vec![]; 256], noise: noise(), tables: vec![None; 512], voices: vec![None; 256],
+            samples: vec![None; 256], cuts: vec![], pcmv: vec![None; 256], kit: vec![None; 4], dpcm: vec![false; 256], waves: vec![vec![]; 256], noise: noise(), tables: vec![None; 512], voices: vec![None; 256],
             fps: 60.0, quant: 8, tmode: (0, 1.0), vmode: (0, 0, 4), rev: (1, 1), fb2: false, sign: [0; 7], sine, pan, att,
         };
 
@@ -1003,11 +1168,16 @@ impl Song {
                     sh.dpcm[k & 255] = a.get(3).is_some_and(|f| *f as i32 & 4 != 0);
                     if sh.dpcm[k & 255] { raw.push((k & 255, bytes)) }
                 }
+                b"PCMWAVE" => pcm_table(&mut sh, b'W', k, dat, pfx),
+                b"PCMVOICE" => pcm_table(&mut sh, b'V', k, dat, pfx),
+                b"SAMPLER" => pcm_table(&mut sh, b'S', k, dat, pfx),
                 b"EFFECT" => effects.push((k, dat.to_vec(), pfx.to_vec())),
                 b"FM" => conn.push((seqs.len(), dat.to_vec())),
                 _ => {}
             }
         }
+
+        cuts(&mut sh, None);
 
         // Effect chains: `name arg,arg,...` units in series, then `p`/`@p`/`@v` for the slot's return.
         let mut slots: Vec<Slot> = (0..8).map(|_| Slot::default()).collect();
@@ -1043,7 +1213,7 @@ impl Song {
         }
         let mut next = 511;
         let tracks = seqs.into_iter().map(|s| Track::new(statics(&inline(&s, &mut sh.tables, &mut next), &sh), &sh)).collect();
-        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, pos: 0, base: (0.0, 120.0, 0), pipes: vec![[0.0; 4]; PIPE_BLOCK] }
+        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, declick: true, pos: 0, base: (0.0, 120.0, 0), pipes: vec![[0.0; 4]; PIPE_BLOCK] }
     }
 
     /// Per track, the byte offset in the source MML of the note it is playing now (-1: none, resting or ended),
@@ -1107,6 +1277,8 @@ impl Song {
         for t in self.tracks.iter_mut().filter(|t| t.ch.ks) { t.next = t.next.min(self.pos) }
         while self.pos < tail { self.sequence(tail, true, true) }
         self.catch_up();
+        // (Nothing to smooth over from before the skip.)
+        self.declick_reset();
         let (mut buf, mut playing) = ([0f32; 512], self.tail < RATE as usize / 2);
         while self.pos < end { playing = self.render(&mut buf[..2 * (end - self.pos).min(256) as usize]) }
         playing
@@ -1181,15 +1353,24 @@ impl Song {
             for t in &mut self.tracks {
                 t.run(&self.sh, self.now, &mut self.bpm);
                 let v = t.ch.sample(&self.sh, &mut pipes) * 0.5;
-                if v == 0.0 { continue }
-                let pan = t.ch.pan.clamp(0, 128) as usize;
-                let (l, r) = (self.sh.pan[128 - pan], self.sh.pan[pan]);
+                // (Silent, and silent before: nothing to carry over; changes meanwhile wait for the next sound.)
+                if v == 0.0 && t.dc.v == 0.0 && !t.dc.fading() { continue }
+                let pan = t.ch.out_pan();
+                let lr = |p: i32| [self.sh.pan[(128 - p) as usize], self.sh.pan[p as usize]];
+                let o = if !self.declick || t.dc.calm(pan, t.ch.vj) {
+                    t.dc.v = v;
+                    if v == 0.0 { continue }
+                    let [l, r] = lr(pan);
+                    [v * l, v * r, v]
+                } else {
+                    t.dc.run(v, pan, lr(pan), lr(t.dc.pan), core::mem::replace(&mut t.ch.vj, 1.0))
+                };
                 let sends = if t.ch.vol[1..].iter().any(|v| *v > 0.0) { 8 } else { 1 };
                 for (k, s) in self.slots.iter_mut().enumerate().take(sends) {
-                    let g = v * t.ch.vol[k];
+                    let g = t.ch.vol[k];
                     if g != 0.0 && (k == 0 || !s.fx.is_empty()) {
-                        s.buf[i][0] += g * if s.mono { 1.0 } else { l };
-                        s.buf[i][1] += g * if s.mono { 1.0 } else { r };
+                        s.buf[i][0] += g * if s.mono { o[2] } else { o[0] };
+                        s.buf[i][1] += g * if s.mono { o[2] } else { o[1] };
                     }
                 }
             }
