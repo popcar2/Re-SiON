@@ -1211,6 +1211,8 @@ impl Song {
                     }
                     match (post, name) {
                         (false, name) => slot.fx.extend(Fx::new(name, &a, &sh.tables)),
+                        // (Without a value the return stays as it is: NaN would silence the mix, or pan it hard left.)
+                        _ if a[0].is_nan() => {}
                         (_, b"p") => slot.pan = (a[0] as i32 * 16).clamp(0, 128),
                         (_, b"@p") => slot.pan = (a[0] as i32).clamp(-64, 64) + 64,
                         (_, b"@v") => slot.vol = (a[0] / 128.0).clamp(0.0, 1.0),

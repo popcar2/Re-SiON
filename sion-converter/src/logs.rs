@@ -139,7 +139,7 @@ pub fn gym_to_vgm(d: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
         for &(c, r, x) in f {
             match c {
                 1 if r == 0x2a => { if dac_on { dac.push(x) } }
-                1 | 2 => { if r == 0x2b { dac_on = x & 0x80 != 0 } v.body.extend([0x51 + c, r, x]) }
+                1 | 2 => { if c == 1 && r == 0x2b { dac_on = x & 0x80 != 0 } v.body.extend([0x51 + c, r, x]) }
                 _ => v.body.extend([0x50, x]),
             }
         }
@@ -182,7 +182,8 @@ pub fn s98_to_vgm(d: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
     let entry = |k: usize| (0x20 + 16 * k + 16 <= d.len()).then(|| (u32le(d, 0x20 + 16 * k), u32le(d, 0x24 + 16 * k)));
     match version {
         2 => { for k in 0.. { match entry(k) { Some((t, c)) if t != 0 => devs.push((t, c)), _ => break } } }
-        3 => { for k in 0..u32le(d, 0x1c) as usize { devs.extend(entry(k)) } }
+        // (Up to the end of the file, whatever count the header gives.)
+        3 => { for k in 0..u32le(d, 0x1c) as usize { match entry(k) { Some(e) => devs.push(e), None => break } } }
         _ => {}
     }
     if devs.is_empty() { devs.push((4, 7987200)) }

@@ -41,15 +41,17 @@ pub fn parse(data: &[u8]) -> Result<Smf, String> {
     let ppq = (if smpte { (256 - (div >> 8)) * (div & 0xff) } else { div }) as u32;
     if ppq == 0 { return Err("invalid MIDI time division".into()) }
 
-    let (mut raw, mut pos, mut trk) = (vec![], 8 + be(&d[4..8]), 0);
-    while pos + 8 <= d.len() {
+    // (Chunk lengths are 32-bit: on wasm32 they can overflow `usize` arithmetic, so it saturates.)
+    let (mut raw, mut pos, mut trk) = (vec![], be(&d[4..8]).saturating_add(8), 0);
+    while pos.saturating_add(8) <= d.len() {
         let len = be(&d[pos + 4..pos + 8]);
-        let body = &d[pos + 8..d.len().min(pos + 8 + len)];
+        let end = (pos + 8).saturating_add(len);
+        let body = &d[pos + 8..d.len().min(end)];
         if &d[pos..pos + 4] == b"MTrk" {
             track(body, trk, &mut raw);
             trk += 1;
         }
-        pos = pos.saturating_add(8 + len);
+        pos = end;
     }
     if trk == 0 { return Err("MIDI file has no tracks".into()) }
     raw.sort_by_key(|&(t, k, s, _)| (t, k, s));
