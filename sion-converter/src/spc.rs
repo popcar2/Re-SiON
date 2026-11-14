@@ -9,7 +9,7 @@
 //! and the echo as a delay send (`#EFFECT1`, `@v`). Like an NSF, an SPC holds no song length: the song loops where
 //! the driver's state comes round again, or where its writes repeat, or ends at the ID666 tag's play time.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f64::consts::PI;
 
 use crate::nsf::mix;
@@ -96,8 +96,13 @@ const RELEASE: u8 = 3;
 #[derive(Clone, Copy, Default)]
 struct Voice { delay: u8, mode: u8, env: i32, hidden: i32, addr: u16, chunk: u8, interp: u32, header: u8 }
 
-/// A decoded sample: its frames (16-bit), and the frame its loop starts on.
-struct Brr { data: Vec<i16>, lp: Option<usize> }
+/// A decoded sample: its frames (16-bit), the frame its loop starts on, and where it is in RAM (start and loop
+/// addresses).
+struct Brr { data: Vec<i16>, lp: Option<usize>, at: (u16, u16) }
+
+/// A sample found this many times with different contents is a wave the driver rewrites as it plays: its later
+/// key-ons play the last version decoded, and so do the earlier ones (`Dsp::canon`), so the voice keeps one tone.
+const VERSIONS: usize = 4;
 
 /// A key-on: when it started (DSP samples), the voice, its sample (index into `Dsp::samples`), and all the DSP
 /// registers as they were.
@@ -126,6 +131,8 @@ struct Dsp {
     envs: [Vec<u16>; 8],
     samples: Vec<Brr>,
     cache: HashMap<(u16, u16, u64), usize>,
+    /// The versions decoded of each sample (start and loop addresses).
+    versions: HashMap<(u16, u16), Vec<usize>>,
 }
 
 impl Dsp {
@@ -144,7 +151,7 @@ impl Dsp {
         let a = a as usize;
         self.writes.push((self.t, a as u8, v));
         match a {
-            KON => self.new_kon |= v,
+            KON => { self.new_kon = v; self.regs[a] = v }
             ENDX => self.regs[ENDX] = 0,
             _ => self.regs[a] = v,
         }
@@ -162,9 +169,19 @@ impl Dsp {
         let (blocks, at) = chain(ram, start, lp);
         let h = blocks.iter().fold(0u64, |h, b| b.iter().fold(h, |h, &x| mix(h, x as u64)));
         if let Some(&i) = self.cache.get(&(start, lp, h)) { return i }
-        self.samples.push(Brr { data: decode(&blocks), lp: at.map(|i| i * 16) });
-        self.cache.insert((start, lp, h), self.samples.len() - 1);
-        self.samples.len() - 1
+        let vs = self.versions.entry((start, lp)).or_default();
+        if vs.len() >= VERSIONS { return *vs.last().unwrap() }
+        let i = self.samples.len();
+        vs.push(i);
+        self.samples.push(Brr { data: decode(&blocks), lp: at.map(|i| i * 16), at: (start, lp) });
+        self.cache.insert((start, lp, h), i);
+        i
+    }
+
+    /// The sample a key-on of sample `i` is written with: the last version of a rewritten wave.
+    fn canon(&self, i: usize) -> usize {
+        let vs = &self.versions[&self.samples[i].at];
+        if vs.len() >= VERSIONS { *vs.last().unwrap() } else { i }
     }
 
     fn step(&mut self, ram: &[u8]) {
@@ -176,7 +193,7 @@ impl Dsp {
         let fires = |r: usize| RATES[r] != 0 && (counter + OFFSETS[r]) % RATES[r] == 0;
         for i in 0..8 {
             let (bit, r) = (1u8 << i, i * 16);
-            if even && (koff & bit != 0 || flg & 0x80 != 0) && self.v[i].mode != RELEASE && self.v[i].delay == 0 {
+            if even && (koff & bit != 0 || flg & 0x80 != 0) && self.v[i].mode != RELEASE {
                 self.v[i].mode = RELEASE;
                 self.offs.push((self.t, i));
             }
@@ -208,8 +225,7 @@ impl Dsp {
                 if adsr1 & 0x80 != 0 {
                     data = adsr2;
                     if v.mode >= DECAY {
-                        env -= 1;
-                        env -= env >> 8;
+                        env = fall(env);
                         rate = if v.mode == DECAY { (adsr1 as usize >> 3 & 0x0e) + 0x10 } else { adsr2 as usize & 0x1f };
                     } else {
                         rate = (adsr1 as usize & 0x0f) * 2 + 1;
@@ -225,7 +241,7 @@ impl Dsp {
                         rate = gain as usize & 0x1f;
                         match mode {
                             4 => env -= 0x20,
-                            5 => { env -= 1; env -= env >> 8 }
+                            5 => env = fall(env),
                             _ => { env += 0x20; if mode > 6 && v.hidden as u32 >= 0x600 { env += 0x8 - 0x20 } }
                         }
                     }
@@ -330,6 +346,13 @@ struct Apu {
     /// The DSP writes since the last timer tick (a hash), and whether a timer read found a tick.
     sig: u64,
     tick: bool,
+    /// For skipping a driver's wait for its timer: writes and reads of anything that changes with time (the
+    /// DSP, a timer that has ticked) so far, and whether the last instruction read a timer that hadn't.
+    writes: u64,
+    volatile: u64,
+    waited: bool,
+    /// The timers read (without a tick) since the last such wait.
+    polled: u8,
 }
 
 /// A RAM cell's share of the RAM's hash (splitmix64 of address and value, so different changes can't cancel).
@@ -341,6 +364,15 @@ fn cell(a: u16, v: u8) -> u64 {
 }
 
 impl Apu {
+    /// The cycle at which one of these running timers' output next counts up (each counts its own clock up to
+    /// its target).
+    fn next_tick(&self, which: u8) -> Option<u64> {
+        self.timers.iter().enumerate().filter(|&(k, t)| t.on && which >> k & 1 != 0).map(|(_, t)| {
+            let target = if t.target == 0 { 256 } else { t.target as u64 };
+            (t.at / t.period + target - t.div) * t.period
+        }).min()
+    }
+
     /// The state the driver's future depends on.
     fn state(&self, cpu: &Cpu) -> u64 {
         let mut h = mix(self.hash, cpu.pc as u64 | (cpu.a as u64) << 16 | (cpu.x as u64) << 24 | (cpu.y as u64) << 32 | (cpu.sp as u64) << 40 | (cpu.psw as u64) << 48);
@@ -354,13 +386,13 @@ impl Bus for Apu {
     fn read(&mut self, a: u16, cycle: u64) -> u8 {
         match a {
             0xf2 => self.addr,
-            0xf3 => { self.dsp.sync(cycle, &self.ram); self.dsp.read(self.addr) }
+            0xf3 => { self.volatile += 1; self.dsp.sync(cycle, &self.ram); self.dsp.read(self.addr) }
             0xf4..=0xf7 => self.ports[a as usize - 0xf4],
             0xfd..=0xff => {
                 let t = &mut self.timers[a as usize - 0xfd];
                 t.sync(cycle);
                 let v = std::mem::take(&mut t.out);
-                if v != 0 { self.tick = true }
+                if v != 0 { (self.tick, self.volatile) = (true, self.volatile + 1) } else { (self.waited, self.polled) = (true, self.polled | 1 << (a - 0xfd)) }
                 v
             }
             0xf0 | 0xf1 | 0xfa..=0xfc => 0,
@@ -370,6 +402,16 @@ impl Bus for Apu {
     }
 
     fn write(&mut self, a: u16, v: u8, cycle: u64) {
+        // (Only writes that change something count: a driver's wait loop may store the same values every round.
+        // The ports' writes go to the other side.)
+        let changes = match a {
+            0xf1 | 0xf3 => true,
+            0xf2 => v != self.addr,
+            0xfa..=0xfc => v != self.timers[a as usize - 0xfa].target,
+            0xf0..=0xff => false,
+            _ => v != self.ram[a as usize],
+        };
+        self.writes += changes as u64;
         match a {
             0xf1 => {
                 for (k, t) in self.timers.iter_mut().enumerate() {
@@ -414,25 +456,51 @@ fn play(d: &[u8], warnings: &mut Vec<String>) -> Result<Played, String> {
     for (k, t) in timers.iter_mut().enumerate() {
         (t.on, t.target, t.out, t.period) = (ram[0xf1] >> k & 1 != 0, ram[0xfa + k], ram[0xfd + k] & 15, if k == 2 { 16 } else { 128 });
     }
-    let mut dsp = Dsp { regs, v: Default::default(), new_kon: 0, counter: 0, t: 0, writes: vec![], keyons: vec![], offs: vec![], envs: Default::default(), samples: vec![], cache: HashMap::new() };
-    // (The snapshot's voices are silent: the DSP's own state isn't in the file.)
+    let mut dsp = Dsp { regs, v: Default::default(), new_kon: 0, counter: 0, t: 0, writes: vec![], keyons: vec![], offs: vec![], envs: Default::default(), samples: vec![], cache: HashMap::new(), versions: HashMap::new() };
+    // (The DSP's own state isn't in the file: the voices start silent, and those whose KON bit is set are keyed
+    // on, as SPC players do. A snapshot taken as a song starts holds its first key-ons there.)
     for v in &mut dsp.v { v.mode = RELEASE }
-    dsp.regs[KON] = 0;
-    let mut apu = Apu { ipl: ram[0xf1] & 0x80 != 0, ports: [ram[0xf4], ram[0xf5], ram[0xf6], ram[0xf7]], addr: ram[0xf2], ram, rom, timers, dsp, hash, sig: 0, tick: false };
+    dsp.new_kon = regs[KON];
+    let mut apu = Apu { ipl: ram[0xf1] & 0x80 != 0, ports: [ram[0xf4], ram[0xf5], ram[0xf6], ram[0xf7]], addr: ram[0xf2], ram, rom, timers, dsp, hash, sig: 0, tick: false, writes: 0, volatile: 0, waited: false, polled: 0 };
     let mut cpu = Cpu { pc: u16::from_le_bytes([d[0x25], d[0x26]]), a: d[0x27], x: d[0x28], y: d[0x29], psw: d[0x2a], sp: d[0x2b], ..Cpu::default() };
 
-    // Run until the driver's state repeats (the song loops), or the time runs out.
+    // Run until the driver's state repeats (the song loops), or the time runs out. (Or until the driver's writes
+    // or key-ons have been repeating for a while: the same loop found at two checks in a row.)
     let max = (tags.secs.map_or(MAX_SECS, |s| s.max(MAX_SECS)) * CLOCK) as u64;
     let (mut seen, mut ticks, mut sigs) = (HashMap::new(), vec![], vec![]);
     let mut exact = None;
+    let check = (CHECK_SECS * CLOCK) as u64;
+    let (mut next_check, mut found) = (2 * check, None);
+    // A driver waiting for its timer goes round the same loop, reading the timer and nothing else that changes,
+    // until it ticks: those rounds are skipped (all but the last), as whole rounds.
+    let mut wait: Option<((u16, u8, u8, u8, u8, u8), u64, u64, u64)> = None;
     while cpu.cycles < max && !cpu.halted {
         cpu.step(&mut apu);
+        if std::mem::take(&mut apu.waited) {
+            let at = (cpu.pc, cpu.a, cpu.x, cpu.y, cpu.sp, cpu.psw);
+            if let Some((_, c0, ..)) = wait.filter(|&(w, c0, writes, volatile)| w == at && writes == apu.writes && volatile == apu.volatile && cpu.cycles > c0) {
+                let round = cpu.cycles - c0;
+                if let Some(n) = apu.next_tick(apu.polled).map(|t| t.saturating_sub(cpu.cycles) / round).filter(|&n| n >= 2) { cpu.cycles += (n - 1) * round }
+            }
+            wait = Some((at, cpu.cycles, apu.writes, apu.volatile));
+            apu.polled = 0;
+        }
         if apu.tick {
             apu.tick = false;
             let k = ticks.len();
             ticks.push(cpu.cycles);
             sigs.push(std::mem::take(&mut apu.sig));
             if let Some(j) = seen.insert(apu.state(&cpu), k) { exact = Some((j, k)); break }
+        }
+        if cpu.cycles >= next_check {
+            next_check += check;
+            apu.dsp.sync(cpu.cycles, &apu.ram);
+            let f = repeats(&sigs, &ticks, &apu.dsp.keyons, apu.dsp.t);
+            // (A section can repeat twice and go on, and an ambient piece can repeat a phrase for two minutes
+            // before it changes: only a loop that has held three times round, and for `HOLD_SECS`, is taken.)
+            let held = f.is_some_and(|(e, l)| apu.dsp.t - l >= (3 * (e - l)).max((HOLD_SECS * RATE) as u64));
+            if held && f == found { break }
+            found = f;
         }
     }
     if cpu.halted { warnings.push("the driver stopped the CPU (SLEEP or STOP)".into()) }
@@ -441,35 +509,24 @@ fn play(d: &[u8], warnings: &mut Vec<String>) -> Result<Played, String> {
     let at = |cycles: u64| cycles / 32;
     let (mut end, mut lp) = match exact {
         Some((j, k)) => (at(ticks[k]), Some(at(ticks[j]))),
-        None => {
-            // The writes repeating (ticks with writes, so a driver's tempo counter can move them by a tick), with a
-            // loop of at least a second; or the tag's play time; or all of it.
-            let busy: Vec<usize> = (0..sigs.len()).filter(|&k| sigs[k] != 0).collect();
-            let per_sec = busy.len() as f64 / (now as f64 / RATE).max(1.0);
-            let sig: Vec<u64> = busy.iter().map(|&k| sigs[k]).collect();
-            // Failing that (drivers whose vibrato runs on through the loop), the key-ons repeating: voice, sample
-            // and pitch.
-            let kons = &apu.dsp.keyons;
-            let ksig: Vec<u64> = kons.iter().map(|k| k.sig()).collect();
-            let kps = kons.len() as f64 / (now as f64 / RATE).max(1.0);
-            match crate::nsf::repeat(&sig, per_sec as usize) {
-                Some((j, p)) if j + p < busy.len() => (at(ticks[busy[j + p]]), Some(at(ticks[busy[j]]))),
-                _ if let Some((j, p)) = crate::nsf::repeat(&ksig, (kps as usize).max(1)).filter(|&(j, p)| j + p < kons.len()) => (kons[j + p].t, Some(kons[j].t)),
-                _ => match tags.secs {
-                    Some(s) => ((s * RATE) as u64, None),
-                    None => { warnings.push(format!("no loop found in the first {} minutes: converted that much", MAX_SECS / 60.0)); (now, None) }
-                },
-            }
-        }
+        None => match repeats(&sigs, &ticks, &apu.dsp.keyons, now) {
+            Some((e, l)) => (e, Some(l)),
+            // (Or the tag's play time; or all of it.)
+            None => match tags.secs {
+                Some(s) => ((s * RATE) as u64, None),
+                None => { warnings.push(format!("no loop found in the first {} minutes: converted that much", MAX_SECS / 60.0)); (now, None) }
+            },
+        },
     };
-    // A loop found by the driver's state can be several times round the music (its tempo counter coming back
-    // into phase only then): if the key-ons repeat sooner within it, loop there.
+    // A loop found by the driver's state (or writes) can be several times round the music (its tempo counter or
+    // a vibrato coming back into phase only then): if the key-ons repeat sooner within it, from where it starts
+    // (or before), loop there. (Not a figure repeated just before its end: the whole loop must repeat.)
     if let Some(l) = lp {
         let kons: Vec<&KeyOn> = apu.dsp.keyons.iter().filter(|k| k.t < end).collect();
         let ksig: Vec<u64> = kons.iter().map(|k| k.sig()).collect();
         let kps = kons.len() as f64 / (end as f64 / RATE).max(1.0);
         if let Some((j, p)) = crate::nsf::repeat(&ksig, (kps as usize).max(1))
-            .filter(|&(j, p)| j + p < kons.len() && kons[j + p].t > l && kons[j + p].t - kons[j].t >= 2 * RATE as u64 && kons[j + p].t - kons[j].t < end - l)
+            .filter(|&(j, p)| j + p < kons.len() && kons[j].t <= l + RATE as u64 / 8 && kons[j + p].t > l && kons[j + p].t - kons[j].t >= 2 * RATE as u64 && kons[j + p].t - kons[j].t < end - l)
         {
             (end, lp) = (kons[j + p].t, Some(kons[j].t));
         }
@@ -488,6 +545,27 @@ fn play(d: &[u8], warnings: &mut Vec<String>) -> Result<Played, String> {
         }
     }
     Ok(Played { dsp: apu.dsp, regs0: regs, end: end.min(now), lp, tags })
+}
+
+/// How often (seconds of the song) to look for the loop in the driver's writes and key-ons while it plays.
+const CHECK_SECS: f64 = 20.0;
+/// How long a loop found that way must have been playing (seconds) before the run stops there.
+const HOLD_SECS: f64 = 150.0;
+
+/// Where the song loops, from the driver's writes repeating (ticks with writes, so a driver's tempo counter can
+/// move them by a tick), with a loop of at least a second; failing that (drivers whose vibrato runs on through
+/// the loop), from its key-ons repeating: voice, sample and pitch. (End, loop start) in DSP samples, as played up
+/// to `now`.
+fn repeats(sigs: &[u64], ticks: &[u64], kons: &[KeyOn], now: u64) -> Option<(u64, u64)> {
+    let secs = (now as f64 / RATE).max(1.0);
+    let busy: Vec<usize> = (0..sigs.len()).filter(|&k| sigs[k] != 0).collect();
+    let sig: Vec<u64> = busy.iter().map(|&k| sigs[k]).collect();
+    if let Some((j, p)) = crate::nsf::repeat(&sig, (busy.len() as f64 / secs) as usize).filter(|&(j, p)| j + p < busy.len()) {
+        return Some((ticks[busy[j + p]] / 32, ticks[busy[j]] / 32));
+    }
+    let ksig: Vec<u64> = kons.iter().map(|k| k.sig()).collect();
+    let (j, p) = crate::nsf::repeat(&ksig, ((kons.len() as f64 / secs) as usize).max(1)).filter(|&(j, p)| j + p < kons.len())?;
+    Some((kons[j + p].t, kons[j].t))
 }
 
 /// A voice's envelope as the hardware runs it from a key-on.
@@ -509,6 +587,8 @@ impl Env {
     }
     /// Turns a sounding voice down to silence.
     fn falls(self) -> bool { matches!(self, Env::Slope(4 | 5, r) if r > 0) || self == Env::Direct(0) }
+    /// Its fixed GAIN level (full scale 1), or 1 for one that moves.
+    fn gain(self) -> f32 { if let Env::Direct(l) = self { l as f32 * 16.0 / 2047.0 } else { 1.0 } }
 }
 
 /// The SiON rate (1..63) whose step is closest to `a` units per frame; 0 for none.
@@ -518,12 +598,88 @@ fn sion_rate(a: f64) -> i32 {
     (1..=60).min_by(|&x, &y| (env_inc(x) / a).ln().abs().total_cmp(&(env_inc(y) / a).ln().abs())).unwrap()
 }
 
-/// SiON rates for an exponential fall of one DSP step (-1/256 of the level) every `p` samples, a linear rise of
-/// 1/64 of full scale every `p` (matched at half level: SiON's attack is a curve), and a linear fall of
-/// `step` / 2048 every `p` (matched 20 dB down).
-fn exp_rate(p: u32) -> i32 { if p == 0 { 0 } else { sion_rate(0.2620 / p as f64) } }
-fn rise_rate(p: u32) -> i32 { if p == 0 { 0 } else if p == 1 { 63 } else { sion_rate(37.8 / (44.1 * p as f64)) } }
-fn fall_rate(p: u32, step: f64) -> i32 { if p == 0 { 0 } else { sion_rate(213.0 / (1842.0 / step * p as f64 * 44100.0 / RATE)) } }
+/// SiON steps (`env_inc`'s units; 0: none, infinite: at once) for an exponential fall of one DSP step (-1/256 of
+/// the level) every `p` samples, a linear rise of 1/64 of full scale every `p` (matched at half level: SiON's
+/// attack is a curve), and a linear fall of `step` / 2048 every `p` (matched 20 dB down).
+fn exp_inc(p: u32) -> f64 { if p == 0 { 0.0 } else { 0.2620 / p as f64 } }
+fn rise_inc(p: u32) -> f64 { if p == 0 { 0.0 } else if p == 1 { f64::INFINITY } else { 37.8 / (44.1 * p as f64) } }
+fn fall_inc(p: u32, step: f64) -> f64 { if p == 0 { 0.0 } else { 213.0 / (1842.0 / step * p as f64 * 44100.0 / RATE) } }
+
+/// The DSP's exponential fall, one step: -1, then -1/256 of the level. (So it falls faster, in decibels, the lower
+/// it is: below 256 it is linear.)
+fn fall(e: i32) -> i32 { let e = e - 1; e - (e >> 8) }
+
+/// An envelope level (0..2047) in decibels.
+fn env_db(e: i32) -> f64 { 20.0 * (e.max(1) as f64 / 2047.0).log10() }
+
+/// The SiON step (3/32 dB per 44.1 kHz frame) that falls `db` decibels in `n` DSP samples.
+fn db_inc(db: f64, n: f64) -> f64 { if n <= 0.0 { f64::INFINITY } else { db.abs() / 0.09375 / (n * 44100.0 / RATE) } }
+
+/// SiON steps for an ADSR envelope's decay and sustain (rates `d`, `sr`, level `s`) and SiON's sustain level (3 dB
+/// steps), fitted to the DSP's curve over a note of `len` samples. The DSP's falls are faster, in decibels, the
+/// lower they go, and SiON's are straight lines: the decay goes to SiON's sustain level in the time the DSP's takes
+/// to reach its own, and the sustain is the least-squares line on from there until the note ends (or the DSP's is
+/// 40 dB down). Without a decay stage (`s` = 7) SiON's decay is free: the sustain is fitted as two lines, with the
+/// knee where they come closest (weighted by the level: what is loud counts most).
+fn adsr_fit(d: u8, s: u8, sr: u8, len: u64) -> (f64, f64, i32) {
+    let (pd, ps) = (RATES[d as usize * 2 + 16] as u64, RATES[sr as usize] as u64);
+    let sl = if s == 7 { 0 } else { (-20.0 * ((s as f64 + 1.0) / 8.0).log10() / 3.0103).round() as i32 };
+    let (mut e, mut t) = (0x7ff, 0u64);
+    if s < 7 { while e >> 8 != s as i32 && e > 0 { e = fall(e); t += pd } }
+    let di = if s == 7 { exp_inc(pd as u32) } else { db_inc(sl as f64 * 3.0103, t as f64) };
+    // The DSP's sustain, from where the decay leaves it: (sample, dB), to the note's end, down to -40 dB.
+    let mut curve = vec![(t as f64, env_db(e))];
+    let mut at = t;
+    while ps > 0 && at < len && e > 0 && env_db(e) > -40.0 { e = fall(e); at += ps; curve.push((at as f64, env_db(e))) }
+    if curve.len() < 3 { return (di, exp_inc(ps as u32), sl) }
+    let per = 0.09375 * 44100.0 / RATE; // (dB per DSP sample, per SiON step)
+    // The sustain on from a knee `sl` 3 dB steps down at sample `at`, and how far the whole curve is from the DSP's.
+    let fit = |sl: i32, at: f64| -> (f64, f64) {
+        let knee = -(sl as f64) * 3.0103;
+        let w = |db: f64| 10f64.powf(db / 20.0);
+        let (mut sxy, mut sxx) = (0.0, 0.0);
+        for &(t, db) in curve.iter().filter(|c| c.0 >= at) { sxy += (knee - db) * (t - at); sxx += (t - at).powi(2) }
+        let b = if sxx > 0.0 { (sxy / sxx).max(0.0) } else { 0.0 };
+        let first = curve[0].0;
+        let err = curve.iter().map(|&(t, db)| {
+            let sion = if t < at { knee * (t - first) / (at - first) } else { knee - b * (t - at) };
+            (sion - db).powi(2) * w(db)
+        }).sum();
+        (b, err)
+    };
+    if s < 7 { return (di, fit(sl, t as f64).0 / per, sl) }
+    let (b, mut err) = fit(0, 0.0);
+    let mut best = (di, b / per, 0);
+    for k in 1..=12 {
+        let knee = -(k as f64) * 3.0103;
+        for &(at, _) in curve.iter().step_by((curve.len() / 64).max(1)).filter(|c| c.0 > 0.0 && (c.1 - knee).abs() < 6.0) {
+            let (b, x) = fit(k, at);
+            if x < err { (best, err) = ((-knee / at / per, b / per, k), x) }
+        }
+    }
+    best
+}
+
+/// The SiON step for an exponential release (a step every `p` samples), fitted over its first 40 dB.
+fn release_fit(p: u32) -> f64 {
+    if p == 0 { return 0.0 }
+    let (mut e, mut k) = (0x7ff, 0u64);
+    while env_db(e) > -40.0 { e = fall(e); k += 1 }
+    db_inc(40.0, (k * p as u64) as f64)
+}
+
+/// SiON rates for envelope stages (steps as above, each with how much its accuracy counts), and the envelope clock
+/// (`@clock`, percent) that brings them closest: SiON's rates are 19% apart, so a long decay could otherwise end
+/// up a decibel or two off. (The clock only where some rate is more than 3% closer for it.)
+fn fit_rates(stages: &[(f64, f64)]) -> (Vec<i32>, u32) {
+    let pick = |c: f64| -> Vec<i32> { stages.iter().map(|&(a, _)| if a.is_infinite() { 63 } else { sion_rate(a / c) }).collect() };
+    let cost = |c: f64| -> f64 {
+        stages.iter().zip(pick(c)).filter(|&(&(a, _), r)| a.is_finite() && (1..=60).contains(&r)).map(|(&(a, w), r)| w * (env_inc(r) * c / a).ln().powi(2)).sum()
+    };
+    let (best, least) = (85..=118).map(|c| (c, cost(c as f64 / 100.0))).min_by(|x, y| x.1.total_cmp(&y.1)).unwrap();
+    let c = if cost(1.0) - least > 0.03f64.powi(2) { best } else { 100 };
+    (pick(c as f64 / 100.0), c)
+}
 
 /// The release after a key-off: -8 every sample.
 const KEY_OFF: (u32, f64) = (1, 8.0);
@@ -546,6 +702,8 @@ struct Raw {
     vol0: (f32, i32),
     vols: Vec<(u64, (f32, i32))>,
     echo: bool,
+    /// Its pitch is modulated by the previous voice (PMON).
+    pmon: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -587,7 +745,11 @@ fn grid(times: &[f64]) -> (f64, f64) {
     let mut p = 0.4;
     while p > 0.04 { cands.push((p, coherence(p))); p *= 0.9997 }
     let best = cands.iter().map(|c| c.1).fold(0.0, f64::max);
-    let (mut per, _) = *cands.iter().find(|c| c.1 >= best * 0.9).unwrap();
+    // (Candidates run from long rows to short: the first one good enough is on its peak's slope, so climb to
+    // the top of that peak.)
+    let mut i = cands.iter().position(|c| c.1 >= best * 0.9).unwrap();
+    while i + 1 < cands.len() && cands[i + 1].1 >= cands[i].1 { i += 1 }
+    let mut per = cands[i].0;
     // Phase: the mean of the key-ons modulo the row.
     let phase_of = |p: f64, pts: &[f64]| { let (s, c) = pts.iter().fold((0.0, 0.0), |a, &x| { let ph = 2.0 * PI * x / p; (a.0 + ph.sin(), a.1 + ph.cos()) }); s.atan2(c) / (2.0 * PI) * p };
     let mut ph = phase_of(per, windows[0]);
@@ -637,6 +799,82 @@ fn soften(d: &[i16], lp: Option<usize>) -> Vec<i16> {
     (0..n as isize).map(|i| (GAUSS * at(i - 1) + (1.0 - 2.0 * GAUSS) * at(i) + GAUSS * at(i + 1)).round().clamp(-32768.0, 32767.0) as i16).collect()
 }
 
+/// Below this rate (Hz) a pitch-modulating voice is a vibrato, played as SiON's pitch LFO (`@lfo`, `mp`).
+const LFO_HZ: f64 = 20.0;
+
+/// SiON's pitch LFO for a modulator `m` playing sample `b` at up to `env` (envelope, full scale 1): `@lfo` with the
+/// loop's shape (`#TABLE`, 256 steps: several cycles of it when that brings the rate, a whole number of 1/60 s
+/// frames, within 0.5%), and its depth (`mp`, 1/64 semitones) at that envelope. The DSP's modulation is in
+/// frequency, × (1 + level), SiON's in pitch: the table is the level's log (1 + level) at that envelope, so a deep
+/// one rises less than it falls, as on the DSP; lower envelopes scale it down.
+fn vibrato(m: &Raw, b: &Brr, env: f64, defs: &mut Defs) -> Option<(String, f64)> {
+    let lp = loop_of(b)?;
+    let hz = loop_hz(m.p0, lp.len());
+    let frames = 60.0 / hz;
+    let err = |k: usize| { let n = (frames * k as f64).round().max(1.0); (n, (n / k as f64 / frames - 1.0).abs()) };
+    let k = (1..=8).find(|&k| err(k).1 < 0.005).unwrap_or_else(|| (1..=8).min_by(|&a, &c| err(a).1.total_cmp(&err(c).1)).unwrap());
+    if env <= 0.0 || err(k).0 > 32767.0 { return None }
+    let at = |p: f64| { let p = p * lp.len() as f64; let (i, f) = (p as usize % lp.len(), p.fract()); lp[i] as f64 * (1.0 - f) + lp[(i + 1) % lp.len()] as f64 * f };
+    // (The pitch can't go below zero: down to 6 octaves.)
+    let semis: Vec<f64> = (0..256).map(|i| 12.0 * (1.0 + env * at((i * k) as f64 / 256.0 % 1.0)).max(1.0 / 64.0).log2()).collect();
+    let top = semis.iter().fold(0f64, |p, v| p.max(v.abs()));
+    if top <= 0.0 { return None }
+    let body: Vec<String> = semis.iter().map(|v| ((128.0 + 127.0 * v / top).round().clamp(0.0, 255.0) as i32).to_string()).collect();
+    Some((format!("@lfo{},{}", err(k).0, defs.table(&body.join(","))), top * 64.0))
+}
+
+/// A sample's loop (frames, full scale 1), if it has one.
+fn loop_of(b: &Brr) -> Option<Vec<f32>> {
+    let n = loop_len(b)?;
+    Some(b.data[b.data.len() - n..].iter().map(|&v| v as f32 / 32768.0).collect())
+}
+
+/// How many frames a sample's loop has, if it has one.
+fn loop_len(b: &Brr) -> Option<usize> { b.lp.filter(|&l| b.data.len() >= l + 2).map(|l| b.data.len() - l) }
+
+/// How many times a second a loop of `frames` goes round at pitch `p` (P register).
+fn loop_hz(p: u32, frames: usize) -> f64 { RATE * p.max(1) as f64 / 4096.0 / frames as f64 }
+
+/// A sample's loop as a `#WAV` (see `wavetable`): (wave, level, loop frames).
+fn loop_wave(b: &Brr, integrate: bool, defs: &mut Defs) -> Option<(usize, f32, usize)> {
+    let lp = loop_of(b)?;
+    let (t, peak) = wavetable(&lp, integrate)?;
+    Some((defs.wave(&t), peak, lp.len()))
+}
+
+/// A key's detune from the note's `key` in 1/64 semitones. (Detunes of a few 64ths are the drivers' pitch tables
+/// rounding: inaudible.)
+fn detune(k: f64, key: f64) -> i32 { let k = ((k - key) * 64.0).round() as i32; if k.abs() <= 3 { 0 } else { k } }
+
+/// The value at `t` of a sorted list of changes (`before` the first).
+fn step_at<T: Copy>(xs: &[(u64, T)], t: u64, before: T) -> T { let i = xs.partition_point(|x| x.0 <= t); if i == 0 { before } else { xs[i - 1].1 } }
+
+/// A loop of up to 1024 frames as a wavetable (`#WAV`: 1024 values, -128..127; SiON reads it without
+/// interpolating): its harmonics as
+/// the DSP plays them (its Gaussian interpolation is a gentle low-pass in the sample's own frames, like `soften`
+/// on top of linear interpolation), and, with `integrate`, their integral (in frames: what a pitch modulated by
+/// the loop adds up to). Also the level of full scale, in the loop's units (frames, integrated).
+fn wavetable(lp: &[f32], integrate: bool) -> Option<(Vec<i32>, f32)> {
+    // (A longer loop has more harmonics than 1024 values hold: a recorded sound, not one wave.)
+    let n = lp.len();
+    if n > 1024 { return None }
+    let w = |k: usize| 2.0 * PI * k as f64 / n as f64;
+    // (Linear interpolation's response, and the softening's.)
+    let h = |o: f64| { let s = if o == 0.0 { 1.0 } else { (o / 2.0).sin() / (o / 2.0) }; s * s * ((1.0 - 2.0 * GAUSS) + 2.0 * GAUSS * o.cos()) };
+    let harmonics: Vec<(f64, f64)> = (1..=(n - 1) / 2).map(|k| {
+        let (re, im) = lp.iter().enumerate().fold((0.0, 0.0), |a, (i, &v)| (a.0 + v as f64 * (w(k) * i as f64).cos(), a.1 - v as f64 * (w(k) * i as f64).sin()));
+        let g = 2.0 / n as f64 * h(w(k)) / if integrate { w(k) } else { 1.0 };
+        // (Integrating turns cos into sin: a quarter cycle back.)
+        if integrate { (im * g, -re * g) } else { (re * g, im * g) }
+    }).collect();
+    let table: Vec<f64> = (0..1024).map(|j| {
+        let ph = j as f64 / 1024.0 * n as f64;
+        harmonics.iter().enumerate().map(|(i, &(a, b))| a * (w(i + 1) * ph).cos() - b * (w(i + 1) * ph).sin()).sum()
+    }).collect();
+    let peak = table.iter().fold(0.0, |m: f64, v| m.max(v.abs()));
+    (peak > 1e-6).then(|| (table.iter().map(|v| (v / peak * 127.0).round().clamp(-128.0, 127.0) as i32).collect(), peak as f32))
+}
+
 /// The fundamental period (frames at 32 kHz) of a sample's loop (or of its start, if it doesn't loop), by YIN.
 fn period(b: &Brr) -> Option<f64> {
     let seg: Vec<f32> = match b.lp {
@@ -667,7 +905,7 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
 
     // Notes: each key-on, until the voice's next one (or it falls silent).
     let mut raws: Vec<Raw> = vec![];
-    let (mut pmon, mut changed) = (false, 0usize);
+    let mut changed = 0usize;
     for (i, k) in dsp.keyons.iter().enumerate() {
         if k.t >= end { break }
         let v = k.voice;
@@ -680,7 +918,6 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         // (Key-offs are in time order.)
         let off = dsp.offs[dsp.offs.partition_point(|o| o.0 <= k.t)..].iter().take_while(|o| o.0 < heard).find(|o| o.1 == v).map(|o| o.0);
         let bit = 1u8 << v;
-        pmon |= k.regs[PMON] & bit != 0 && v > 0;
         let env = Env::of(&k.regs, v);
         let (mut rel, mut stop, mut manual) = (Rel::Linear(KEY_OFF.0, KEY_OFF.1), off.unwrap_or(heard), false);
         let (mut pitch, mut vols) = (vec![], vec![]);
@@ -714,9 +951,8 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         let manual = manual.then(|| (a..((stop / 32) as usize).min(envs.len())).map(|j| (j as u64 * 32, envs[j] as f32 / 2047.0)).collect::<Vec<_>>());
         let noise = (k.regs[NON] & bit != 0).then(|| { let r = RATES[k.regs[FLG] as usize & 31]; if r == 0 { 0.0 } else { RATE / r as f64 } });
         let echo = k.regs[EON] & bit != 0;
-        raws.push(Raw { voice: v, start: k.t, end: stop.max(k.t + 1), smp: k.smp, noise, env, rel, manual, p0, pitch, vol0, vols, echo });
+        raws.push(Raw { voice: v, start: k.t, end: stop.max(k.t + 1), smp: dsp.canon(k.smp), noise, env, rel, manual, p0, pitch, vol0, vols, echo, pmon: k.regs[PMON] & bit != 0 && v > 0 });
     }
-    if pmon { warnings.push("pitch modulation (PMON) is not converted".into()) }
     if changed > 0 { warnings.push(format!("{changed} notes change their envelope as they play: written as volume steps")) }
 
     // Each sample's tuning, from the pitches it is played at.
@@ -731,17 +967,15 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
     // Timing: rows on the key-ons' grid, 12 ticks each (1/16 note: a quarter is 48 ticks).
     let secs = |t: u64| t as f64 / RATE;
     let (row, phase) = grid(&raws.iter().map(|r| secs(r.start)).collect::<Vec<_>>());
-    let tick = |t: u64| ((secs(t) - phase) / (row / 12.0)).round().max(0.0) as u64;
+    let at = |t: u64| ((secs(t) - phase) / (row / 12.0)).max(0.0);
+    let tick = |t: u64| at(t).round() as u64;
+    // (A tick position on the first of these (unit, tolerance) grids it is close to, else the nearest tick.)
+    let snap = |x: f64, grids: &[(f64, f64)]| {
+        grids.iter().find_map(|&(unit, tol)| { let s = (x / unit).round() * unit; ((x - s).abs() <= tol).then_some(s as u64) }).unwrap_or(x.round() as u64)
+    };
     // Key-ons on the nearest whole row, half row, triplet or 1/64 note close by (drivers' timing jitters by a
     // timer tick or two).
-    let on_grid = |t: u64| {
-        let x = ((secs(t) - phase) / (row / 12.0)).max(0.0);
-        for (unit, tol) in [(12.0, 2.0), (6.0, 1.5), (4.0, 1.0), (3.0, 1.0)] {
-            let s = (x / unit).round() * unit;
-            if (x - s).abs() <= tol { return s as u64 }
-        }
-        x.round() as u64
-    };
+    let on_grid = |t: u64| snap(at(t), &[(12.0, 2.0), (6.0, 1.5), (4.0, 1.0), (3.0, 1.0)]);
 
     // Echo: the settings that hold longest, as a delay on send 1.
     let mut held: HashMap<[u8; 15], u64> = HashMap::new();
@@ -772,17 +1006,74 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         header.push(format!("#EFFECT1{{delay{},{},0,100}}", e[0] as u32 * 16, fb.round()));
     }
 
-    // Tones: the sample and its envelope; SiON's rates go up with the key (by `kc >> 5`), so each tone's are
-    // taken down by that at its usual key.
+    // Tones: the sample and its envelope, with its falls fitted over how long its notes usually last (the median);
+    // SiON's rates go up with the key (by `kc >> 5`), so each tone's are taken down by that at its usual key.
     let mut defs = Defs::default();
     let mut pcm: HashMap<usize, Option<usize>> = HashMap::new();
-    let mut keys: HashMap<(usize, Env, bool), Vec<f64>> = HashMap::new();
-    for r in &raws { keys.entry((r.smp, r.env, r.noise.is_some())).or_default().push(key_of(r, r.p0)) }
-    let ks: HashMap<(usize, Env, bool), i32> = keys.into_iter().map(|(k, mut v)| { v.sort_by(f64::total_cmp); let m = v[v.len() / 2].round() as i32; (k, ((m - 16).clamp(0, 127)) >> 5) }).collect();
+    let tone_of = |r: &Raw| (r.smp, r.env, r.noise.is_some());
+    let mut usual: HashMap<(usize, Env, bool), (Vec<f64>, Vec<u64>)> = HashMap::new();
+    for r in &raws { let u = usual.entry(tone_of(r)).or_default(); u.0.push(key_of(r, r.p0)); u.1.push(r.end - r.start) }
+    // (Per tone: the rate scaling at its median key, and its median length.)
+    let usual: HashMap<(usize, Env, bool), (i32, u64)> = usual.into_iter().map(|(k, (mut keys, mut lens))| {
+        keys.sort_by(f64::total_cmp);
+        lens.sort();
+        (k, (((keys[keys.len() / 2].round() as i32 - 16).clamp(0, 127)) >> 5, lens[lens.len() / 2]))
+    }).collect();
+    // (Envelope fits, per (decay, sustain level, sustain rate, length) and release: the same for every note of a tone.)
+    let mut adsr_fits: HashMap<(u8, u8, u8, u64), (f64, f64, i32)> = HashMap::new();
+    let mut release_fits: HashMap<u32, f64> = HashMap::new();
     let mut notes = vec![];
     let mut full = false;
-    for r in &raws {
-        let instr = if r.noise.is_some() { "%2".to_string() } else {
+    // Each note's next key-on on the same voice.
+    let mut next = vec![None; raws.len()];
+    let mut last: [Option<usize>; 8] = [None; 8];
+    for (i, r) in raws.iter().enumerate() { if let Some(p) = last[r.voice] { next[p] = Some(i) } last[r.voice] = Some(i) }
+    // Each voice's usual gap before the next key-on (ticks), if it has one: gaps a tick either side of it are the
+    // driver's timer against the rows, and come out as that.
+    let gap: Vec<Option<u64>> = (0..8).map(|v| {
+        let mut n: HashMap<u64, usize> = HashMap::new();
+        for (i, r) in raws.iter().enumerate().filter(|x| x.1.voice == v) {
+            if let Some(g) = next[i].map(|k| at(raws[k].start) - at(r.end)).filter(|&g| g > 0.5 && g < 12.0) { *n.entry(g.round() as u64).or_default() += 1 }
+        }
+        let total: usize = n.values().sum();
+        n.into_iter().max_by_key(|&(g, c)| (c, std::cmp::Reverse(g))).filter(|&(_, c)| c >= 4 && c * 3 >= total).map(|x| x.0)
+    }).collect();
+    // Pitch-modulated (PMON) voices play their sample's loop as a wavetable, one table a loop: SiON modulates an
+    // operator's phase from a pipe, not PCM's (see below). Per sample: (wave, level, loop frames).
+    let mut carrier_wave: HashMap<usize, Option<(usize, f32, usize)>> = HashMap::new();
+    let (mut carriers, mut note_of) = (vec![], vec![None; raws.len()]);
+    // (A modulator slower than `LFO_HZ` is a vibrato: SiON's pitch LFO, on the note as it is; see below. The
+    // first modulator note under each such key-on.)
+    let mod_rate = |m: &Raw| -> Option<f64> { if m.noise.is_some() { return None } Some(loop_hz(m.p0, loop_len(&dsp.samples[m.smp])?)) };
+    // (Each pitch-modulated note's modulators: the voice before's notes sounding with it.)
+    let mut by_voice: [Vec<usize>; 8] = Default::default();
+    for (i, r) in raws.iter().enumerate() { by_voice[r.voice].push(i) }
+    let mods_of: Vec<Vec<usize>> = raws.iter().map(|r| {
+        if !r.pmon || r.voice == 0 { return vec![] }
+        by_voice[r.voice - 1].iter().copied().filter(|&m| raws[m].start < r.end && raws[m].end > r.start).collect()
+    }).collect();
+    let slow: Vec<Option<usize>> = raws.iter().enumerate().map(|(i, r)| {
+        let ms = &mods_of[i];
+        (r.noise.is_none() && !ms.is_empty() && ms.iter().all(|&m| mod_rate(&raws[m]).is_some_and(|f| f < LFO_HZ))).then(|| ms[0])
+    }).collect();
+    // (Each slow modulator sample's loudest envelope under the notes it modulates: its LFO table's depth.)
+    let mut vib_env: HashMap<usize, f64> = HashMap::new();
+    let mut vib_done = vec![false; raws.len()];
+    // (Per modulator sample and pitch.)
+    let mut quiet_env = vec![String::new(); raws.len()];
+    let mut lfo_of: HashMap<(usize, u32), Option<(String, f64)>> = HashMap::new();
+    for (ri, r) in raws.iter().enumerate() {
+        let Some(m) = slow[ri] else { continue };
+        let e = &dsp.envs[r.voice - 1];
+        let top = e.get((r.start / 32) as usize..((r.end / 32) as usize).min(e.len())).map_or(0, |s| s.iter().copied().max().unwrap_or(0));
+        let x = vib_env.entry(raws[m].smp).or_default();
+        *x = x.max(top as f64 / 2047.0);
+    }
+    for (ri, r) in raws.iter().enumerate() {
+        let wav = if r.pmon && r.noise.is_none() && slow[ri].is_none() {
+            *carrier_wave.entry(r.smp).or_insert_with(|| loop_wave(&dsp.samples[r.smp], false, &mut defs))
+        } else { None };
+        let instr = if r.noise.is_some() { "%2".to_string() } else if let Some((w, ..)) = wav { format!("%4@{w}") } else {
             let Some(n) = *pcm.entry(r.smp).or_insert_with(|| {
                 let b = &dsp.samples[r.smp];
                 let bk = base[&r.smp];
@@ -793,58 +1084,183 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
             }) else { full = true; continue };
             format!("%7@{n}")
         };
-        let ks = ks[&(r.smp, r.env, r.noise.is_some())];
-        let adj = |x: i32| if x == 0 || x >= 63 { x } else { (x - ks).clamp(1, 62) };
         let mut amp = r.vol0.0;
-        let (ar, dr, sr, sl) = match (r.manual.is_some(), r.env) {
-            (true, _) => (63, 0, 0, 0),
+        // Steps of attack, decay, sustain and release, and the sustain level.
+        let ((ai, di, si), sl) = match (r.manual.is_some(), r.env) {
+            (true, _) => ((f64::INFINITY, 0.0, 0.0), 0),
             (_, Env::Adsr(a, d, s, sr)) => {
-                let a = if a == 15 { 63 } else { adj(rise_rate(RATES[a as usize * 2 + 1])) };
-                let sl = if s == 7 { 0 } else { (-20.0 * ((s as f64 + 1.0) / 8.0).log10() / 3.0103).round() as i32 };
-                (a, adj(exp_rate(RATES[d as usize * 2 + 16])), adj(exp_rate(RATES[sr as usize])), sl)
+                let a = if a == 15 { f64::INFINITY } else { rise_inc(RATES[a as usize * 2 + 1]) };
+                let len = usual[&tone_of(r)].1;
+                let (di, si, sl) = *adsr_fits.entry((d, s, sr, len)).or_insert_with(|| adsr_fit(d, s, sr, len));
+                ((a, di, si), sl)
             }
-            (_, Env::Direct(l)) => { amp *= l as f32 * 16.0 / 2047.0; (63, 0, 0, 0) }
+            (_, Env::Direct(_)) => { amp *= r.env.gain(); ((f64::INFINITY, 0.0, 0.0), 0) }
             (_, Env::Slope(m, rt)) => match m {
-                6 | 7 => (adj(rise_rate(RATES[rt as usize])), 0, 0, 0),
+                6 | 7 => ((rise_inc(RATES[rt as usize]), 0.0, 0.0), 0),
                 _ => continue, // (falling from silence: never heard)
             },
         };
-        let rr = adj(match r.rel { Rel::Linear(p, step) => fall_rate(p, step), Rel::Exp(p) => exp_rate(p) });
+        let reli = match r.rel { Rel::Linear(p, step) => fall_inc(p, step), Rel::Exp(p) => *release_fits.entry(p).or_insert_with(|| release_fit(p)) };
+        let (rates, clock) = fit_rates(&[(ai, 0.25), (di, 1.0), (si, 1.0), (reli, 0.5)]);
+        // (The note's key: a wavetable plays its loop once a cycle.)
+        let key_at = |p: u32| match wav { Some((_, _, n)) => hz_key(loop_hz(p, n)) as f64, None => key_of(r, p) };
+        let k0 = key_at(r.p0);
+        let key = k0.round().clamp(0.0, 127.0);
+        let ks = if wav.is_some() { ((key as i32 - 16).clamp(0, 127)) >> 5 } else { usual[&tone_of(r)].0 };
+        if let Some((_, peak, _)) = wav { amp *= peak }
+        let adj = |x: i32| if x == 0 || x >= 63 { x } else { (x - ks).clamp(1, 62) };
+        let [ar, dr, sr, rr] = [adj(rates[0]), adj(rates[1]), adj(rates[2]), adj(rates[3])];
         let tone = if r.noise.is_some() { 1 } else { instr[3..].parse().unwrap() };
         let send = if echo_on { format!("@v64,{}", if r.echo { send } else { 0 }) } else { String::new() };
-        // Key-offs on whole rows (the drivers' gate times are fractions of a note), unless the note is shorter.
-        let (start, e) = (on_grid(r.start), tick(r.end));
-        let row_end = (e + 6) / 12 * 12;
-        let stop = if row_end > start { row_end } else { start + (((e as f64 - start as f64) / 3.0).round() as u64 * 3).max(3) };
-        let k0 = key_of(r, r.p0);
-        let key = k0.round().clamp(0.0, 127.0);
+        // Key-offs: a gap before the voice's next key-on (drivers key off a set time, or a fraction of the note,
+        // before it) is kept as it is, counted back from where that note is written, so it comes out the same
+        // every time (`@q`, `q`); otherwise on a whole or half row close by, or on the nearest tick.
+        let start = on_grid(r.start);
+        let xe = at(r.end);
+        let stop = match next[ri] {
+            Some(n) if at(raws[n].start) - xe < 12.0 => {
+                let g = (at(raws[n].start) - xe).max(0.0);
+                let g = match gap[r.voice] { Some(m) if (g - m as f64).abs() <= 1.0 => m, _ => g.round() as u64 };
+                on_grid(raws[n].start).saturating_sub(g)
+            }
+            _ => snap(xe, &[(12.0, 1.0), (6.0, 0.75)]),
+        }.max(start + 1);
         let level = r.noise.map_or(1.0, |hz| noise_level(hz));
-        let mut n = Note::new(r.voice as u32, start, stop, key as u8, amp * level, if r.noise.is_some() { "%2".into() } else { "%7".into() });
-        n.env = format!("@{tone},{ar},{dr},{sr},{rr},{sl}{send}");
+        let mut n = Note::new(r.voice as u32, start, stop, key as u8, amp * level, instr[..2].to_string());
+        let clk = if clock == 100 { String::new() } else { format!("@clock{clock}") };
+        n.env = format!("@{tone},{ar},{dr},{sr},{rr},{sl}{send}{clk}");
+        // (Without the echo send, for a copy into a pipe: it is not heard.)
+        quiet_env[ri] = format!("{ar},{dr},{sr},{rr},{sl}{clk}");
+        if let Some(m) = slow[ri] {
+            let top = vib_env[&raws[m].smp];
+            let lfo = lfo_of.entry((raws[m].smp, raws[m].p0)).or_insert_with(|| vibrato(&raws[m], &dsp.samples[raws[m].smp], top, &mut defs));
+            if let Some((cmd, full)) = lfo.clone() {
+                n.env.push_str(&cmd);
+                // The depth as the modulator's envelope goes (its VOL doesn't count), on each tick it changes.
+                let e = &dsp.envs[r.voice - 1];
+                let depth = |t: u64| { let e = e.get((t / 32) as usize).copied().unwrap_or(0) as f64 / 2047.0; (full * e / top).round() as i32 };
+                n.lfo0 = (depth(r.start), 0);
+                let mut t = r.start;
+                while t < r.end { let d = depth(t); if n.lfos.last().map_or(n.lfo0.0, |l| l.1.0) != d && tick(t) > n.start { n.lfos.push((tick(t), (d, 0))) } t += (RATE * row / 12.0) as u64 }
+                vib_done[ri] = true;
+            }
+        }
         n.pan = r.vol0.1;
-        // (Detunes of a few 64ths of a semitone are the drivers' pitch tables rounding: inaudible.)
-        let det = |k: f64| { let k = ((k - key) * 64.0).round() as i32; if k.abs() <= 3 { 0 } else { k } };
-        n.k0 = det(k0);
-        for &(t, p) in &r.pitch { n.bends.push((tick(t), det(key_of(r, p)))) }
+        n.k0 = detune(k0, key);
+        for &(t, p) in &r.pitch { n.bends.push((tick(t), detune(key_at(p), key))) }
         // Volume: VOL × MVOL, times the envelope where it's followed step by step.
-        let env_at = |t: u64| r.manual.as_ref().map_or(1.0, |m| { let i = m.partition_point(|x| x.0 <= t); if i == 0 { 0.0 } else { m[i - 1].1 } });
-        let vol_at = |t: u64| { let i = r.vols.partition_point(|x| x.0 <= t); if i == 0 { r.vol0 } else { r.vols[i - 1].1 } };
+        let env_at = |t: u64| r.manual.as_ref().map_or(1.0, |m| step_at(m, t, 0.0));
+        let vol_at = |t: u64| step_at(&r.vols, t, r.vol0);
         if let Some(m) = &r.manual {
-            n.amp = r.vol0.0 * level * env_at(r.start).max(m.first().map_or(0.0, |x| x.1));
+            let wl = wav.map_or(1.0, |w| w.1);
+            n.amp = r.vol0.0 * level * wl * env_at(r.start).max(m.first().map_or(0.0, |x| x.1));
             let mut times: Vec<u64> = m.iter().map(|x| x.0).chain(r.vols.iter().map(|x| x.0)).collect();
             times.sort();
-            for t in times { if t > r.start { n.vols.push((tick(t), vol_at(t).0 * level * env_at(t))) } }
+            for t in times { if t > r.start { n.vols.push((tick(t), vol_at(t).0 * level * wl * env_at(t))) } }
         } else {
             for &(t, (a, _)) in &r.vols { n.vols.push((tick(t), a * level * (amp / r.vol0.0.max(1e-9)))) }
         }
         for &(t, (_, p)) in &r.vols { n.pans.push((tick(t), p)) }
+        if wav.is_some() { carriers.push(ri) }
+        note_of[ri] = Some(notes.len());
         notes.push(n);
     }
+    let mut names: Vec<String> = (0..8).map(|v| format!("voice {}", v + 1)).collect();
+
+    // Pitch modulation (PMON): the DSP bends a voice's pitch by the previous voice's output (before its VOL),
+    // P × (1 + out / 32768): frequency modulation. In SiON a track's output can go to a pipe (`@o`) that
+    // modulates the phase of another's operator (`@i`). The carrier plays its loop as a wavetable (above); a copy
+    // of the modulator's notes plays the integral of its loop into the pipe, since modulating the phase by an
+    // integral is modulating the frequency by the wave itself. The depth in cycles is the carrier's table rate ×
+    // the integral's peak (frames at full scale) / the modulator's frames per second: `@i L` gives 2^(L-3) ×
+    // 127/128 cycles for a full-scale pipe, and the copy's volume the rest. (Noise can't be integrated: a noise
+    // modulator moves the phase by one noise step's worth, ±(carrier table rate / noise rate) cycles, which
+    // sounds alike: a rough, breathy carrier.) The copy comes before the carrier, as SiON renders the tracks in
+    // order a block at a time and reads a later track's pipe a block late; up to 4 pipes.
+    let full_depth = |l: i32| 2f64.powi(l - 3) * sion::PIPE_DEPTH as f64;
+    let mut mod_wave: HashMap<usize, Option<(usize, f32, usize)>> = HashMap::new();
+    let mut pm: HashMap<usize, (usize, u32, u32)> = HashMap::new(); // carrier voice: (pipe, copy channel, carrier channel)
+    let mut links: BTreeMap<usize, Vec<(usize, f64)>> = BTreeMap::new(); // modulator raw: (carrier raw, copy level)
+    let (mut pm_notes, mut pm_lost) = (0usize, 0usize);
+    for &ci in &carriers {
+        let c = &raws[ci];
+        let (Some(ni), Some((_, _, nc))) = (note_of[ci], carrier_wave[&c.smp]) else { continue };
+        let ftc = loop_hz(c.p0, nc);
+        let mut ds = vec![];
+        for &m in mods_of[ci].iter().filter(|&&m| note_of[m].is_some()) {
+            let rm = &raws[m];
+            let d = match rm.noise {
+                Some(hz) => (hz > 0.0).then(|| ftc / hz),
+                None => mod_wave.entry(rm.smp).or_insert_with(|| loop_wave(&dsp.samples[rm.smp], true, &mut defs))
+                    .map(|(_, peak, _)| ftc * peak as f64 / loop_hz(rm.p0, 1)),
+            };
+            // (Times its envelope's fixed GAIN level, if it has one.)
+            if let Some(d) = d { ds.push((m, d * rm.env.gain() as f64)) }
+        }
+        let dmax = ds.iter().map(|x| x.1).fold(0.0, f64::max);
+        let next = pm.len();
+        if dmax <= 0.0 || (next >= 4 && !pm.contains_key(&c.voice)) { pm_lost += 1; continue }
+        let &mut (pipe, _, carrier_ch) = pm.entry(c.voice).or_insert_with(|| {
+            names.push(format!("voice {}, modulating voice {}", c.voice, c.voice + 1));
+            names.push(format!("voice {}, pitch-modulated", c.voice + 1));
+            (next, names.len() as u32 - 2, names.len() as u32 - 1)
+        });
+        let l = ((dmax / full_depth(3)).log2().ceil() as i32 + 3).clamp(1, 7);
+        notes[ni].env.push_str(&format!("@i{l},{pipe}"));
+        notes[ni].ch = carrier_ch;
+        for (m, d) in ds { links.entry(m).or_default().push((ci, (d / full_depth(l)).min(1.0))) }
+        pm_notes += 1;
+    }
+    // The modulators' copies, each at the depth of the carrier note sounding (none between them).
+    for (&m, carried) in &links {
+        let rm = &raws[m];
+        let (pipe, copy_ch, _) = pm[&(rm.voice + 1)];
+        let mut n = notes[note_of[m].unwrap()].clone();
+        n.ch = copy_ch;
+        let rest = &quiet_env[m];
+        if rm.noise.is_none() {
+            let (w, _, nm) = mod_wave[&rm.smp].unwrap();
+            let key_at = |p: u32| hz_key(loop_hz(p, nm)) as f64;
+            let k0 = key_at(rm.p0);
+            n.key = k0.round().clamp(0.0, 127.0) as u8;
+            let key = n.key as f64;
+            n.k0 = detune(k0, key);
+            n.bends = rm.pitch.iter().map(|&(t, p)| (tick(t), detune(key_at(p), key))).collect();
+            (n.instr, n.env) = ("%4".into(), format!("@{w},{rest}@o1,{pipe}"));
+        } else {
+            n.env = format!("@1,{rest}@o1,{pipe}");
+        }
+        // Level: the envelope (its GAIN level, or the steps it is followed in), not VOL, times the depth.
+        let depth: Vec<(u64, u64, f64)> = carried.iter().map(|&(ci, d)| { let c = &notes[note_of[ci].unwrap()]; (c.start, c.end, d) }).collect();
+        let depth_at = |t: u64| depth.iter().find(|d| d.0 <= t && t < d.1).map_or(0.0, |d| d.2) as f32;
+        let env: Vec<(u64, f32)> = rm.manual.as_ref().map_or(vec![], |e| e.iter().map(|&(t, a)| (tick(t), a)).collect());
+        let env_at = |t: u64| if rm.manual.is_none() { rm.env.gain() } else { step_at(&env, t, env.first().map_or(0.0, |x| x.1)) };
+        let mut times: Vec<u64> = depth.iter().flat_map(|d| [d.0, d.1]).chain(env.iter().map(|x| x.0)).filter(|&t| t > n.start && t < n.end).collect();
+        times.sort();
+        times.dedup();
+        n.amp = env_at(n.start) * depth_at(n.start);
+        n.vols = times.into_iter().map(|t| (t, env_at(t) * depth_at(t))).collect();
+        n.pans.clear();
+        n.pan = 0;
+        notes.push(n);
+    }
+    let vibratos = vib_done.iter().filter(|&&d| d).count();
+    // (The copies' channels.)
+    let mut pipes: Vec<u32> = pm.values().map(|x| x.1).collect();
+    pipes.sort();
+    if vibratos > 0 { warnings.push(format!("pitch modulation (PMON) by a slow voice: {vibratos} notes, as a pitch LFO in its shape")) }
+    if pm_notes > 0 {
+        warnings.push(format!("pitch modulation (PMON): {pm_notes} notes, through a pipe from a copy of the voice before (a noise modulator is approximate)"));
+    }
+    let mut handled = vib_done;
+    for &c in &carriers { handled[c] = true }
+    let lost = pm_lost + raws.iter().enumerate().filter(|&(i, r)| r.pmon && r.noise.is_none() && note_of[i].is_some() && !handled[i]).count();
+    if lost > 0 { warnings.push(format!("pitch modulation (PMON) on {lost} notes is not converted (a carrier or modulator sample without a loop of up to 1024 frames, or more than 4 modulated voices)")) }
+
     // A voice plays one note at a time.
     crate::score::monophonic(&mut notes);
     // A voice switching samples all the time is a drum kit (or several parts sharing it): one track per sample,
-    // so each keeps its tone. (Channels 8.. after the voices.)
-    let mut names: Vec<String> = (0..8).map(|v| format!("voice {}", v + 1)).collect();
+    // so each keeps its tone. (Channels after the voices.)
     let mut split: HashMap<(u32, String), u32> = HashMap::new();
     for v in 0..8u32 {
         let of: Vec<usize> = (0..notes.len()).filter(|&i| notes[i].ch == v).collect();
@@ -858,6 +1274,9 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
             notes[i].ch = ch;
         }
     }
+    // (A tone's `@n` leaves the envelope clock as it was: a track that sets it anywhere sets it with every tone.)
+    let clocked: HashSet<u32> = notes.iter().filter(|n| n.env.contains("@clock")).map(|n| n.ch).collect();
+    for n in notes.iter_mut().filter(|n| clocked.contains(&n.ch) && !n.env.contains("@clock")) { n.env.push_str("@clock100") }
     if full { warnings.push("more than 256 different samples: the rest are left out".into()) }
     if notes.is_empty() { return Err("the SPC plays no sound the converter can carry over".into()) }
     header.extend(defs.header());
@@ -873,8 +1292,8 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         end_t += d;
     }
     let mut score = Score {
-        ppq: 48, tempos: vec![(0, 15.0 / row)], header, notes, end: end_t, lp: lp_t.filter(|&l| l < end_t), db: true,
-        names, title, ..Score::default()
+        ppq: 48, tempos: vec![(0, 15.0 / row)], header, notes, end: end_t, lp: lp_t.filter(|&l| l < end_t), db: true, gates: true,
+        names, title, pipes, ..Score::default()
     };
     score.drop_silent_loop();
     Ok((score, warnings))

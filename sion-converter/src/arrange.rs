@@ -1,6 +1,8 @@
 //! A `Score` → monophonic SiON tracks: tick scaling, tempo, volume, voice allocation; then each track as a
 //! token stream.
 
+use std::collections::HashMap;
+
 use crate::mml::{Lengths, Tok};
 use crate::score::Score;
 
@@ -45,6 +47,8 @@ impl Arranged {
 
 impl Track {
     fn set_x(&mut self, x: i32) {
+        // (A track playing into a pipe keeps its absolute level: the modulation's depth.)
+        if self.piped { return }
         let x = ((x as f32 * self.rel).round() as i32).clamp(1, 128);
         self.x = (x < 128).then_some(x);
     }
@@ -60,6 +64,8 @@ pub struct Track {
     x: Option<i32>,
     /// Its channel's gain (`Score::gains`) relative to the loudest channel's: scales the master volume.
     rel: f32,
+    /// It plays into a pipe (`Score::pipes`): full volume, whatever the master's.
+    piped: bool,
     /// Tempo commands carried by this track: (tick, `t...`).
     tempo: Vec<(u64, String)>,
     /// Rest until this tick after the last note (the song's end).
@@ -143,9 +149,11 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     let gmax = sc.notes.iter().map(|n| gain(n.ch)).fold(0.0, f32::max);
     let rel = |ch: u32| if gmax > 0.0 { gain(ch) / gmax } else { 1.0 };
     let mut mix: Vec<(u64, u64, f32)> = sc.mix.iter().map(|&(s, e, a)| { let (s, e) = span(s, e); (s, e, a / gmax.max(1e-6)) }).collect();
-    if mix.is_empty() { mix = sc.notes.iter().map(|n| { let (s, e) = span(n.start, n.end); (s, e, n.amp * rel(n.ch)) }).collect() }
-    let mut amax = sc.notes.iter().map(|n| n.amp).fold(0.0, f32::max).max(1e-6);
-    if sc.mix.is_empty() { amax = sc.notes.iter().flat_map(|n| n.vols.iter().map(|v| v.1)).fold(amax, f32::max) }
+    // (Channels playing into a pipe aren't heard: left out.)
+    let heard = |n: &&crate::score::Note| !sc.pipes.contains(&n.ch);
+    if mix.is_empty() { mix = sc.notes.iter().filter(heard).map(|n| { let (s, e) = span(n.start, n.end); (s, e, n.amp * rel(n.ch)) }).collect() }
+    let mut amax = sc.notes.iter().filter(heard).map(|n| n.amp).fold(0.0, f32::max).max(1e-6);
+    if sc.mix.is_empty() { amax = sc.notes.iter().filter(heard).flat_map(|n| n.vols.iter().map(|v| v.1)).fold(amax, f32::max) }
     let mut edges: Vec<(u64, bool, f32)> = mix.iter().flat_map(|&(s, e, a)| [(s, true, a), (e, false, a)]).collect();
     edges.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let (mut sum, mut smax) = (0f32, 1e-6f32);
@@ -153,7 +161,8 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     let master = opt.gain.map_or((5.0 * amax / smax).min(1.0), |g| (g * amax).min(1.0));
     let x = ((128.0 * master).round() as i32).clamp(1, 128);
     let vmax = sc.vmax();
-    let vol = |amp: f32, min: i32| {
+    let vol = |amp: f32, min: i32, piped: bool| {
+        let amax = if piped { 1.0 } else { amax };
         let v = if !sc.db { vmax as f32 * amp / amax } else if amp <= 0.0 { 0.0 } else { 128.0 + 20.0 * (amp / amax).log10() / 0.75 };
         (v.round() as i32).clamp(min, vmax as i32) as u16
     };
@@ -172,6 +181,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     let mut i = 0;
     while i < order.len() {
         let ch = sc.notes[order[i]].ch;
+        let piped = sc.pipes.contains(&ch);
         let mut voices: Vec<(u64, Vec<Note>, Option<bool>)> = vec![];
         while i < order.len() && sc.notes[order[i]].ch == ch {
             let n = &sc.notes[order[i]];
@@ -179,10 +189,10 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
             let (start, end) = span(n.start, n.end);
             let (k0, bends) = thin(n.k0, n.bends.iter().map(|&(t, k)| (map(t), k)), start, end, step);
             // (PCM notes may start silent: the sample runs from its key-on.)
-            let vmin = if sc.fine && !sc.db { 0 } else { 1 };
-            let (mut v, mut vols) = (vol(n.amp, vmin), vec![]);
+            let vmin = if (sc.fine && !sc.db) || piped { 0 } else { 1 };
+            let (mut v, mut vols) = (vol(n.amp, vmin, piped), vec![]);
             for &(t, a) in &n.vols {
-                let (t, nv) = (map(t), vol(a, 0));
+                let (t, nv) = (map(t), vol(a, 0, piped));
                 if t <= start { v = nv.max(vmin as u16); continue }
                 if t >= end { break }
                 let last = vols.last().map_or(v, |x: &(u64, u16)| x.1);
@@ -215,7 +225,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
             let busy = if n.drum.is_some() { start } else { end };
             match slot { Some(v) => { v.0 = busy; v.1.push(note) } None => voices.push((busy, vec![note], n.drum)) }
         }
-        tracks.extend(voices.into_iter().map(|(_, notes, drum)| Track { ch, notes, drum, x: None, rel: rel(ch), tempo: vec![], end: 0, lp: None, vmax, kmilli: sc.kmilli }));
+        tracks.extend(voices.into_iter().map(|(_, notes, drum)| Track { ch, notes, drum, x: None, rel: rel(ch), piped, tempo: vec![], end: 0, lp: None, vmax, kmilli: sc.kmilli }));
     }
 
     // Tempo: one `t` command per change, carried by whichever track has a convenient spot for it.
@@ -299,11 +309,12 @@ fn thin(k0: i32, b: impl Iterator<Item = (u64, i32)>, s: u64, e: u64, step: u64)
     (k0, out)
 }
 
-/// The track as tokens. With `gate` the key-off times are encoded through `q` where shorter
-/// (choosing `q` states by dynamic programming); otherwise every gap is an explicit rest under `q8`.
-pub fn tokens(tr: &Track, gate: bool, lens: &Lengths) -> Vec<Tok> {
+/// The track as tokens. With `gate` the key-off times are encoded through `q` and `@q` where shorter (choosing
+/// their states by dynamic programming, each change of state costing that many characters more: a readable
+/// track keeps its gate); otherwise every gap is an explicit rest under `q8`.
+pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths) -> Vec<Tok> {
     let mut out = vec![];
-    match tr.drum { Some(true) => out.push(Tok::Cmd("q0".into())), Some(false) => out.push(Tok::Cmd("q8".into())), None if !gate => out.push(Tok::Cmd("q8".into())), None => {} }
+    match tr.drum { Some(true) => out.push(Tok::Cmd("q0".into())), Some(false) => out.push(Tok::Cmd("q8".into())), None if gate.is_none() => out.push(Tok::Cmd("q8".into())), None => {} }
     if let Some(x) = tr.x { out.push(Tok::Cmd(format!("x{x}"))) }
     let (mut t, mut tempo) = (0, tr.tempo.iter().peekable());
     let (mut instr, mut v, mut pan, mut ptab, mut env, mut k, mut ph) = ("", tr.vmax, 0, None, "", 0, (0.0, 0.0));
@@ -439,59 +450,83 @@ pub fn tokens(tr: &Track, gate: bool, lens: &Lengths) -> Vec<Tok> {
         if let Some(Tok::Note { len, .. }) = merged.last_mut().filter(|_| tr.lp.is_none()) { *len = (*len).max(480) }
         return merged;
     }
-    if gate { gate_dp(&mut out, &gates, lens) }
+    if let Some(steady) = gate { gate_dp(&mut out, &gates, lens, steady) }
     out
 }
 
 /// A tone's envelope commands split before its LFO rate (`@3@lfo9` → `@3`, `@lfo9`).
 fn split_lfo(e: &str) -> (&str, &str) { e.find("@lfo").map_or((e, ""), |i| e.split_at(i)) }
 
-/// Choose a `q` (gate = q/8 of the written length) per note so that "note + rest" is written shortest.
-/// `q8` and an explicit rest always works; e.g. under `q4` a 1/8 note followed by a 1/8 rest is just `c4`.
-fn gate_dp(out: &mut Vec<Tok>, gates: &[(usize, usize)], lens: &Lengths) {
+/// Choose a gate per note so that "note + rest" is written shortest: `q` (q/8 of the written length) and `@q`
+/// (that much earlier: the key-off a fixed time before the next note, as many drivers do), as states chosen by
+/// dynamic programming. `q8` and an explicit rest always works; e.g. under `q4` a 1/8 note followed by a 1/8
+/// rest is just `c4`, and under `@q20` a note keyed off 1/96 before the next one needs no rest either.
+fn gate_dp(out: &mut Vec<Tok>, gates: &[(usize, usize)], lens: &Lengths, steady: u32) {
     const INF: u32 = u32::MAX / 4;
-    let opts: Vec<[Option<(u32, u32, u32)>; 9]> = gates.iter().map(|&(_, gi)| {
+    let note_rest = |gi: usize| -> (u32, u32) {
         let Tok::Note { len: g, .. } = out[gi] else { unreachable!() };
-        let r = match out.get(gi + 1) { Some(Tok::Rest(r)) => *r, _ => 0 };
-        let mut o = [None; 9];
-        for (q, slot) in o.iter_mut().enumerate().skip(1) {
-            if (8 * g) % q as u32 != 0 { continue }
-            let l = 8 * g / q as u32;
-            if l > g + r { continue }
-            let rr = g + r - l;
-            *slot = Some((lens.cost(l, 0) + if rr > 0 { 1 + lens.cost(rr, 0) } else { 0 }, l, rr));
+        (g, match out.get(gi + 1) { Some(Tok::Rest(r)) => *r, _ => 0 })
+    };
+    // `@q` candidates: the gaps (in SiON's 1/192 notes, so multiples of 10 here) that follow notes most often.
+    let mut freq: HashMap<u32, usize> = HashMap::new();
+    for &(_, gi) in gates { let (g, r) = note_rest(gi); if r > 0 && r % 10 == 0 && r < g { *freq.entry(r).or_default() += 1 } }
+    let mut abs: Vec<(u32, usize)> = freq.into_iter().filter(|&(_, n)| n >= 4).collect();
+    abs.sort_by_key(|&(r, n)| (std::cmp::Reverse(n), r));
+    let abs: Vec<u32> = std::iter::once(0).chain(abs.into_iter().take(3).map(|x| x.0)).collect();
+    let na = abs.len();
+    // State `q * na + a`: gate q/8 of the length, minus `abs[a]`.
+    let ns = 9 * na;
+    let opts: Vec<Vec<Option<(u32, u32, u32)>>> = gates.iter().map(|&(_, gi)| {
+        let (g, r) = note_rest(gi);
+        let mut o = vec![None; ns];
+        for q in 1..9u32 {
+            for (ai, &a) in abs.iter().enumerate() {
+                if (8 * (g + a)) % q != 0 { continue }
+                let l = 8 * (g + a) / q;
+                if l > g + r { continue }
+                let rr = g + r - l;
+                o[q as usize * na + ai] = Some((lens.cost(l, 0) + if rr > 0 { 1 + lens.cost(rr, 0) } else { 0 }, l, rr));
+            }
         }
         o
     }).collect();
-    let mut cost = [INF; 9];
-    cost[6] = 0; // SiON's default is q6
-    let mut back = vec![[0u8; 9]; gates.len()];
+    let cmd_cost: Vec<u32> = abs.iter().map(|a| 2 + (a / 10).to_string().len() as u32).collect();
+    let switch = |p: usize, s: usize| (if p / na != s / na { 2 + steady } else { 0 }) + if p % na != s % na { cmd_cost[s % na] + steady } else { 0 };
+    let mut cost = vec![INF; ns];
+    cost[6 * na] = 0; // SiON's default is q6 and no `@q`
+    let mut back = vec![vec![0u16; ns]; gates.len()];
     for (i, o) in opts.iter().enumerate() {
-        let mut nc = [INF; 9];
-        for q in 1..9 {
-            let Some((c, ..)) = o[q] else { continue };
-            for p in 1..9 {
-                let x = cost[p] + c + if p == q { 0 } else { 2 };
-                if x < nc[q] { nc[q] = x; back[i][q] = p as u8 }
+        let mut nc = vec![INF; ns];
+        for s in na..ns {
+            let Some((c, ..)) = o[s] else { continue };
+            for p in na..ns {
+                if cost[p] >= INF { continue }
+                let x = cost[p] + c + switch(p, s);
+                if x < nc[s] { nc[s] = x; back[i][s] = p as u16 }
             }
         }
         cost = nc;
     }
-    let mut q = (1..9).min_by_key(|&q| cost[q]).unwrap_or(8);
+    let mut st = (na..ns).min_by_key(|&s| cost[s]).unwrap_or(8 * na);
     let mut pick = vec![0; gates.len()];
-    for i in (0..gates.len()).rev() { pick[i] = q; q = back[i][q] as usize }
+    for i in (0..gates.len()).rev() { pick[i] = st; st = back[i][st] as usize }
+    let used_abs = pick.iter().any(|&s| s % na != 0);
+    let cmds = |res: &mut Vec<Tok>, from: Option<usize>, to: usize| {
+        if from.is_none_or(|f| f / na != to / na) { res.push(Tok::Cmd(format!("q{}", to / na))) }
+        if from.map_or(used_abs, |f| f % na != to % na) { res.push(Tok::Cmd(format!("@q{}", abs[to % na] / 10))) }
+    };
     let mut res = Vec::with_capacity(out.len() + 16);
-    let (mut gi, mut prev) = (0, 6);
+    let (mut gi, mut prev) = (0, Some(6 * na));
     let mut skip_rest = false;
     for (i, tok) in out.drain(..).enumerate() {
         if skip_rest { skip_rest = false; if matches!(tok, Tok::Rest(_)) { continue } }
-        // After the loop point `q` is whatever the track's end left it at: set it again.
+        // After the loop point the gate is whatever the track's end left it at: set it again.
         if matches!(&tok, Tok::Cmd(c) if c == "$") {
             res.push(tok);
-            if gi < gates.len() { res.push(Tok::Cmd(format!("q{}", pick[gi]))); prev = pick[gi] }
+            if gi < gates.len() { cmds(&mut res, None, pick[gi]); prev = Some(pick[gi]) }
             continue;
         }
-        if gi < gates.len() && i == gates[gi].0 && pick[gi] != prev { res.push(Tok::Cmd(format!("q{}", pick[gi]))); prev = pick[gi] }
+        if gi < gates.len() && i == gates[gi].0 && prev != Some(pick[gi]) { cmds(&mut res, prev, pick[gi]); prev = Some(pick[gi]) }
         if gi < gates.len() && i == gates[gi].1 {
             let (_, l, rr) = opts[gi][pick[gi]].unwrap();
             let Tok::Note { key, .. } = tok else { unreachable!() };

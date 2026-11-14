@@ -112,7 +112,7 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
     // (A looping song renders once through, plus a second of its loop.)
     let limit = loop_secs.map_or(60.0 * 30.0, |_| secs + 1.0);
     let mut lens = mml::Lengths::new();
-    let mut plain: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, false, &lens)).collect();
+    let mut plain: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, None, &lens)).collect();
     let mut plain_mml = mml::plain(&song.header, &plain, &lens);
     // The volume estimate can't know how loud SiON's waveforms and FM voices really come out: if the result
     // would clip, turn the master volume down until it doesn't.
@@ -122,17 +122,20 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
             let (peak, x) = (peak(&plain_mml, limit), song.master());
             if peak <= 0.98 || x <= 1 { break }
             song.set_master(((x as f32 * if peak >= 0.999 { 0.75 } else { 0.95 / peak }) as i32).min(x - 1));
-            plain = song.tracks.iter().map(|t| arrange::tokens(t, false, &lens)).collect();
+            plain = song.tracks.iter().map(|t| arrange::tokens(t, None, &lens)).collect();
             plain_mml = mml::plain(&song.header, &plain, &lens);
         }
     }
     // (The plain MML keeps the data as it was made, so a check against it covers the compacted data too.)
     let header: Vec<String> = song.header.iter().map(|h| mml::compact(h)).collect();
     let mml = if score.sections.is_empty() {
-        let toks: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, true, &lens)).collect();
+        let toks: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, Some(0), &lens)).collect();
         mml::minify(&header, &toks, &mut lens)
     } else {
-        let tracks: Vec<(String, &[_])> = song.tracks.iter().zip(&plain).enumerate().map(|(i, (t, toks))| {
+        // (Sources that key notes off before the next one: gate times rather than a rest after every note.)
+        let gated: Vec<_> = if score.gates { song.tracks.iter().map(|t| arrange::tokens(t, Some(GATE_STEADY), &lens)).collect() } else { vec![] };
+        let toks = if score.gates { &gated } else { &plain };
+        let tracks: Vec<(String, &[_])> = song.tracks.iter().zip(toks).enumerate().map(|(i, (t, toks))| {
             let name = score.names.get(t.ch as usize).filter(|n| !n.is_empty()).map_or(String::new(), |n| format!(", {n}"));
             (format!("Track {}{name}", i + 1), &toks[..])
         }).collect();
@@ -148,6 +151,9 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
         warnings,
     }
 }
+
+/// What a change of gate (`q`, `@q`) costs in a readable track, over its characters: each line restates it.
+const GATE_STEADY: u32 = 6;
 
 /// Render MML in chunks of interleaved stereo samples, passing each to `f`, until the song ends or `secs`
 /// seconds are rendered (the last chunk may reach past that).

@@ -326,38 +326,83 @@ driver, the song and the samples) and the S-DSP's registers. `src/spc.rs` runs t
 (`src/spc700.rs`: every instruction, with cycle counts) with the timers, I/O ports and IPL ROM, and a model of the
 DSP follows what it plays, sample by sample at 32 kHz: key-ons and key-offs, each voice's BRR blocks and loop,
 its pitch, and its envelope (ADSR and the GAIN modes, with the hardware's rate counter). It makes no sound itself:
-each key-on becomes a note on its voice's track.
+each key-on becomes a note on its voice's track. The voices whose bit is set in the snapshot's KON register are
+keyed on as it loads, as SPC players do (most snapshots are taken as a song starts, with its first notes there).
 
 - Samples: each one played is decoded from BRR as it was in RAM at its key-on and embedded (`#PCMB`, 16-bit, with
   its loop), played with `%7`. The DSP's Gaussian interpolation is softer than SiON's linear one; the samples get
-  a gentle low-pass to match (on test songs, within 1-2 dB of libgme up to 10 kHz).
+  a gentle low-pass to match (on test songs, within 1-2 dB of libgme up to 10 kHz). A sample found with four
+  different contents is a wave the driver rewrites as it plays (Chrono Trigger does): all its notes play the last
+  version, so the voice keeps one tone and one track.
 - Pitch: each sample's key is found from its loop's period (the octave kept so its usual note is within o3..o7)
   and its tuning from the pitches the driver plays it at, so the notes come out as whole notes. Pitch changes
   during a note (vibrato, slides) are `k` slurs.
-- Envelopes become SiON's own (`@n,ar,dr,sr,rr,sl`): attack matched at half level (the DSP's is linear),
-  decay and sustain rates (both exponential, like SiON's) to within SiON's rate steps, the sustain level to 3 dB.
-  SiON's rates rise with the key (`kc >> 5`), so each tone's are taken down by that at its usual key. A key-off
-  releases at the DSP's rate; a driver switching to a falling GAIN is a release at that rate. A note whose
-  envelope the driver changes otherwise as it plays is written with a flat envelope and volume steps.
+- Envelopes become SiON's own (`@n,ar,dr,sr,rr,sl`): attack matched at half level (the DSP's is linear), the
+  sustain level to 3 dB. The DSP's decay and sustain are not quite exponential (each step is -1, then -1/256 of
+  the level, so they fall faster the lower they go, and below 1/8 of full scale linearly), while SiON's are
+  straight lines in decibels: they are fitted to the DSP's own curve over how long the tone's notes usually last.
+  The decay reaches SiON's sustain level when the DSP's reaches its own, and the sustain is the least-squares line
+  on from there; with no decay stage (sustain level 7) SiON's decay is used as a second line, with the knee where
+  the two come closest (a long note falling 34 dB stays within 0.5 dB of the DSP down to -15 dB, 1.5 dB down to
+  -24 dB). SiON's rates are 19% apart: where some rate comes more than 3% closer for it, the tone also sets the
+  envelope clock (`@clock`, percent). SiON's rates rise with the key (`kc >> 5`), so each tone's are taken down
+  by that at its usual key. A key-off releases at the DSP's rate; a driver switching to a falling GAIN is a
+  release at that rate. A note whose envelope the driver changes otherwise as it plays is written with a flat
+  envelope and volume steps.
 - Volume and pan from VOL × MVOL (in decibels, `#VMODE{%v1,1}`); echo as a delay on send 1 (`#EFFECT1{delay}`,
   EDL × 16 ms, the feedback and level from EFB and EVOL against MVOL, through the FIR's gain at 1 kHz), with the
   voices that have it on (EON) sending to it (`@v64,n`). The setting that holds longest is used.
 - Timing: rows are the key-ons' grid (the longest row from 40 to 400 ms they line up with about as well as with
-  any, by phase coherence, then fitted over the song), a 1/16 note each; key-ons are put on the nearest row, half
-  row, triplet or 1/64 note within a timer tick or two, and key-offs on whole rows.
+  any, by phase coherence, climbing to the top of that peak, then fitted over the song), a 1/16 note each;
+  key-ons are put on the nearest row, half row, triplet or 1/64 note within a timer tick or two. A key-off a
+  little before the voice's next key-on (drivers key off a set time, or a fraction of the note, before the next)
+  keeps its gap, counted back from where that note is written and snapped to the voice's usual gap, so it comes
+  out the same every time; the readable MML writes those as gate times (`q`, and `@q` for a fixed time before the
+  next note) instead of a rest after every note. Other key-offs go on a whole or half row close by, or else the
+  nearest tick.
 - A voice that switches samples all the time (a drum kit) gets one track per sample, so each keeps its tone.
 
 An SPC holds no song length either: the song loops where the driver's state (RAM, CPU and DSP registers, timer
 settings) comes round to one it was in at an earlier timer tick, or else where its DSP writes repeat, or else
 where its key-ons (voice, sample, pitch) repeat; a state loop that is several times round the music (its tempo
-counter coming back into phase only then) is shortened to the key-ons' loop. The loop starts on a whole row. A
-loop of silence is the song having ended. Otherwise it plays the ID666 tag's time, or the first 10 minutes.
+counter coming back into phase only then) is shortened to the key-ons' loop, from where it starts. The loop
+starts on a whole row. A loop of silence is the song having ended. Otherwise it plays the ID666 tag's time, or
+the first 10 minutes. The driver's writes and key-ons are checked for a loop every 20 s of the song as it runs,
+and it stops early once the same loop is found twice in a row and has been playing three times round and for at
+least 150 s (a section can repeat twice and go on, and an ambient piece can repeat a phrase for two minutes
+before it changes). A driver waiting for its timer is skipped ahead to the tick, whole rounds of its wait loop
+at a time.
 
-Not converted (reported as notes): pitch modulation (PMON). Noise voices play SiON's noise (`%2`) at the DSP's
-noise rate. The echo FIR's shape (only its gain is kept) and per-side echo settings are not.
+Pitch modulation (PMON: a voice's pitch bent by the previous voice's output, before its VOL, P × (1 + out / 32768);
+Final Fantasy VI's wind and vibratos, several Chrono Trigger tracks) is frequency modulation. SiON's way for one
+track to modulate another is a pipe: a track's output goes to it (`@o`), and it moves another's operator phase
+(`@i`; SiON's PCM channel ignores it, so the carrier can't stay `%7`). So:
 
-Sizes: Super Mario World's tracks become 30-110 KB of MML, Final Fantasy VI's and Chrono Trigger's 75-175 KB (the
-samples are most of it); each takes a few seconds to convert.
+- The modulated voice plays its sample's loop (up to 1024 frames: a single-cycle wave, as these are) as a
+  wavetable (`#WAV`, `%4`), one table a loop, rebuilt from the loop's harmonics as the DSP plays them (SiON reads
+  a wavetable without interpolating: a short loop as a short table would be a staircase), with `@i`.
+- A copy of the modulating voice's notes, its own track just before the carrier's (SiON renders the tracks in
+  order a block at a time, and reads a later track's pipe a block late), plays the integral of its loop into the
+  pipe (`@o1`): moving the phase by an integral is moving the frequency by the wave. The depth, in cycles, is the
+  carrier's table rate × the integral's peak / the modulator's rate: `@i n` gives 2^(n-3) cycles, the copy's
+  volume (absolute, at full `x`, not heard) the rest. Its envelope is the modulator's; VOL doesn't count.
+- A noise modulator can't be integrated: it moves the phase by one noise step's worth, which sounds alike (a
+  rough, breathy carrier) but is approximate. A modulator that is itself modulated plays unmodulated into the pipe.
+- A modulator slower than 20 Hz is a vibrato: the carrier stays PCM, with SiON's pitch LFO (`@lfo`, a `#TABLE` in
+  the loop's shape, several cycles of it when that gets the rate within 0.5%; `mp` following the modulator's
+  envelope). The table is the log of 1 + the level, so a deep one rises less than it falls, as on the DSP.
+- Not converted (reported): a carrier or modulator sample without a loop of up to 1024 frames (a fast modulator),
+  or more than 4 modulated voices (SiON has 4 pipes).
+
+On a test song (a 62.5 Hz modulator under a 500 Hz carrier, deep enough that the sidebands are 10 dB over the
+carrier), the first two sideband pairs come out within 0.2 dB of the DSP's.
+
+Noise voices play SiON's noise (`%2`) at the DSP's noise rate. The echo FIR's shape (only its gain is kept) and
+per-side echo settings are not converted.
+
+Sizes: Super Mario World's tracks become 5-55 KB of MML (median 28 KB), Final Fantasy VI's, Chrono Trigger's and
+Donkey Kong Country's 25-210 KB (medians 110-135 KB; the samples are most of it); each takes a few seconds to
+convert.
 
 ## Minification (audio-identical, `--exact` modules)
 
@@ -376,7 +421,10 @@ that play YM2612 DAC samples (from the data bank, written directly, and by DAC s
 levels, and YM2610 ADPCM-A and -B, converts them (by default and with `--exact-pcm`, each checked against the
 chip's output), checks the notes and the Mega Drive's mix (PSG against FM, one-sided pan, feedback level, fast
 noise), and checks that the written MML renders identically to the plain conversion; an SPC with a hand-assembled
-SPC700 driver (a scale on a looping BRR square) checks the notes, the loop and the sample's pitch. `src/tests.rs`
+SPC700 driver (a scale on a looping BRR square) checks the notes, the loop and the sample's pitch, and a
+table-driven one checks that the snapshot's KON keys its voices on, that key-offs a set time before the next note
+are written as `@q` gates, that a long sustain follows the DSP's decay, and that pitch modulation comes out as
+the DSP's (through a pipe: the sidebands; as a vibrato: the pitch swing). `src/tests.rs`
 builds Amiga-period and linear (IT) modules with 8- and 16-bit, one-shot, looped and ping-pong samples and most
 effects (slides, arpeggio, vibrato, tremolo, offsets, retrigger, cuts, envelopes, background voices, tempo
 changes) and checks SiON's rendering against the reference mix.

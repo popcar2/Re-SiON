@@ -28,6 +28,12 @@ pub struct Score {
     /// Pitch to 1/1000 of SiON's 1/64-semitone step (fractional `k`, the notes' detunes in those units), with
     /// every change kept (tracker samples, which should play exactly as the module).
     pub kmilli: bool,
+    /// Key-offs as gate times (`q`, `@q`) in the readable output, where shorter, instead of explicit rests: for
+    /// sources whose notes stop a set time, or a set fraction, before the next one (SPC drivers).
+    pub gates: bool,
+    /// Channels that play into a pipe (`@o`) to modulate another (SPC pitch modulation): not heard, and their
+    /// levels are absolute (full scale 1), as the modulation's depth, not relative to the loudest note.
+    pub pipes: Vec<u32>,
     /// Where the source's own sections start (a tracker's patterns, as the order list plays them): written one per
     /// line, and repeated sections as loops and macros (other formats: bars, `set_bars`). Empty: the output is
     /// minified instead.

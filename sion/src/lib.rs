@@ -21,7 +21,7 @@ mod ffi;
 use alloc::{sync::Arc, vec, vec::Vec};
 use fx::Fx;
 use m::M;
-pub use synth::{Sample, RATE};
+pub use synth::{Sample, PIPE_DEPTH, RATE};
 use synth::*;
 
 const INF: f64 = f64::INFINITY;
@@ -695,7 +695,16 @@ pub struct Song {
     /// Tick and tempo at the last tempo change, and frames since: `now` is computed from these rather than summed
     /// frame by frame, so rounding can't build up over a long song.
     base: (f64, f64, u64),
+    /// The pipes (`@o`, `@i`, `@r`): each one's values over the last `PIPE_BLOCK` frames. SiON renders the tracks a
+    /// block at a time, one after another, so a track reads what the tracks before it wrote in the same block, but
+    /// from those after it the block before; and a pipe that no track overwrites keeps what it held, so `@o2`
+    /// alone adds onto that. A ring of one block's frames does the same frame by frame.
+    pipes: Vec<[f32; 4]>,
 }
+
+/// Frames in one of SiON's rendering blocks (its default buffer length): how far back a pipe written by a later
+/// track is read.
+const PIPE_BLOCK: usize = 2048;
 
 /// Note number of letter `c` with accidental `nx`, octave, note shift and key signature.
 fn key(c: u8, nx: Option<&u8>, oct: i32, ns: i32, sign: &[i32; 7]) -> i32 {
@@ -1014,7 +1023,7 @@ impl Song {
         }
         let mut next = 511;
         let tracks = seqs.into_iter().map(|s| Track::new(statics(&inline(&s, &mut sh.tables, &mut next), &sh), &sh)).collect();
-        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, pos: 0, base: (0.0, 120.0, 0) }
+        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, pos: 0, base: (0.0, 120.0, 0), pipes: vec![[0.0; 4]; PIPE_BLOCK] }
     }
 
     /// Per track, the byte offset in the source MML of the note it is playing now (-1: none, resting or ended),
@@ -1147,7 +1156,8 @@ impl Song {
         let n = out.len() / 2;
         for s in &mut self.slots { s.buf.clear(); s.buf.resize(n, [0.0; 2]) }
         for i in 0..n {
-            let mut pipes = [0f32; 4];
+            let at = (self.pos % PIPE_BLOCK as u64) as usize;
+            let mut pipes = self.pipes[at];
             for t in &mut self.tracks {
                 t.run(&self.sh, self.now, &mut self.bpm);
                 let v = t.ch.sample(&self.sh, &mut pipes) * 0.5;
@@ -1163,6 +1173,7 @@ impl Song {
                     }
                 }
             }
+            self.pipes[at] = pipes;
             self.advance(1);
         }
         let (master, sends) = self.slots.split_first_mut().unwrap();

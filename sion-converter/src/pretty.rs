@@ -20,6 +20,7 @@ fn kind(c: &str) -> Option<&'static str> {
     Some(match c {
         _ if c.starts_with('%') => "instr",
         _ if c.starts_with("@ph") => "ph",
+        _ if c.starts_with("@q") => "qa",
         _ if c.starts_with("@p") => "pan",
         _ if c.starts_with("@lfo") => "lfo",
         _ if c.starts_with("@v") => "fv",
@@ -40,7 +41,7 @@ fn kind(c: &str) -> Option<&'static str> {
 /// The tone: set where it changes, not restated.
 const TONE: [&str; 6] = ["instr", "env", "lfo", "ph", "mp", "ma"];
 
-const KINDS: [&str; 14] = ["x", "q", "instr", "env", "lfo", "fv", "ph", "mp", "ma", "rtab", "ptab", "v", "pan", "k"];
+const KINDS: [&str; 15] = ["x", "q", "qa", "instr", "env", "lfo", "fv", "ph", "mp", "ma", "rtab", "ptab", "v", "pan", "k"];
 
 #[derive(Clone, Default, PartialEq)]
 struct State(HashMap<&'static str, String>);
@@ -49,6 +50,8 @@ impl State {
     fn set(&mut self, k: &'static str, c: &str) {
         // (A module change resets the tone, its LFO and the sample position.)
         if k == "instr" { for r in ["env", "lfo", "ph", "mp", "ma"] { self.0.remove(r); } }
+        // (And an LFO setting, alone or in a tone, its depths.)
+        if k == "lfo" || (k == "env" && c.contains("@lfo")) { for r in ["mp", "ma"] { self.0.remove(r); } }
         self.0.insert(k, c.to_string());
     }
 }
@@ -56,18 +59,20 @@ impl State {
 /// Split a track's tokens at the boundaries (ticks): notes and rests crossing one are split there (a note
 /// slurred into its continuation). Returns the pieces and which piece the loop point (`$`) starts.
 /// Notes are split only where that sounds the same: not under a pitch table (a slurred note starts at its own
-/// pitch, not where the table has taken it) or a gate other than `q8` (each piece would be keyed off at its own
-/// gate); those run on into the next section. `st`: the state set before the tokens.
+/// pitch, not where the table has taken it) or a gate other than `q8` and no `@q` (each piece would be keyed off
+/// at its own gate); those run on into the next section. `st`: the state set before the tokens.
 fn split(toks: &[Tok], bounds: &[u64], st: &State) -> (Vec<Vec<Tok>>, Option<usize>) {
     let (mut pieces, mut cur, mut t, mut bi, mut lp) = (vec![], vec![], 0u64, 0, None);
-    let (mut ptab, mut gate) = (st.0.get("ptab").is_some_and(|c| c != "np"), st.0.get("q").is_none_or(|c| c != "q8"));
+    let mut ptab = st.0.get("ptab").is_some_and(|c| c != "np");
+    let (mut q, mut qa) = (st.0.get("q").is_none_or(|c| c != "q8"), st.0.get("qa").is_some_and(|c| c != "@q0"));
     for tok in toks {
         while bi < bounds.len() && bounds[bi] <= t { pieces.push(std::mem::take(&mut cur)); bi += 1 }
         match tok {
             Tok::Cmd(c) if c == "$" => lp = Some(pieces.len()),
             Tok::Cmd(c) if kind(c) == Some("ptab") => { ptab = c != "np"; cur.push(tok.clone()) }
-            Tok::Cmd(c) if kind(c) == Some("q") => { gate = c != "q8"; cur.push(tok.clone()) }
-            Tok::Note { key, len, slur } if ptab || gate => {
+            Tok::Cmd(c) if kind(c) == Some("q") => { q = c != "q8"; cur.push(tok.clone()) }
+            Tok::Cmd(c) if kind(c) == Some("qa") => { qa = c != "@q0"; cur.push(tok.clone()) }
+            Tok::Note { key, len, slur } if ptab || q || qa => {
                 cur.push(Tok::Note { key: *key, len: *len, slur: *slur });
                 t += *len as u64;
                 while bi < bounds.len() && bounds[bi] < t { bi += 1 }
@@ -163,8 +168,9 @@ impl Writer<'_> {
             else if (restate.contains(&k) && sounds) || changed { head += c }
         }
         head += &others;
-        // Beat groups: (start tick within the piece, text).
+        // Beat groups: (start tick within the piece, text), and the octave before and after each.
         let (mut groups, mut pend, mut t, mut oct): (Vec<(u64, String)>, String, u64, Option<usize>) = (vec![], String::new(), 0, None);
+        let mut octs: Vec<(Option<usize>, Option<usize>)> = vec![];
         for tok in &toks[first..] {
             match tok {
                 Tok::Cmd(c) => match kind(c) {
@@ -176,6 +182,7 @@ impl Writer<'_> {
                 },
                 Tok::Note { key, len, slur } => {
                     let o = *key as usize / 12;
+                    octs.push((oct, Some(o)));
                     match oct {
                         None => pend += &format!("o{o}"),
                         Some(p) if p + 1 == o => pend.push('<'),
@@ -191,20 +198,22 @@ impl Writer<'_> {
                     t += *len as u64;
                 }
                 Tok::Rest(len) => {
+                    octs.push((oct, oct));
                     pend += &format!("r{}", len_text(*len, self.l, self.lens));
                     groups.push((t, std::mem::take(&mut pend)));
                     t += *len as u64;
                 }
             }
         }
-        if !pend.is_empty() { groups.push((t, pend)) }
-        let body = join(&fold(&groups));
+        if !pend.is_empty() { groups.push((t, pend)); octs.push((oct, oct)) }
+        let body = join(&fold(&groups, &octs));
         match (head.is_empty(), body.is_empty()) { (true, _) => body, (_, true) => head, _ => format!("{head} {body}") }
     }
 }
 
 /// Runs of a repeated figure (up to 8 groups) as `[figure]n`, where that saves enough to be worth reading.
-fn fold(groups: &[(u64, String)]) -> Vec<(u64, String)> {
+/// `octs`: each group's octave before and after it.
+fn fold(groups: &[(u64, String)], octs: &[(Option<usize>, Option<usize>)]) -> Vec<(u64, String)> {
     let (mut out, mut i) = (vec![], 0);
     while i < groups.len() {
         let mut best: Option<(usize, usize, usize)> = None; // period, count, saving
@@ -212,6 +221,9 @@ fn fold(groups: &[(u64, String)]) -> Vec<(u64, String)> {
             let mut k = 1;
             while i + (k + 1) * p <= groups.len() && groups[i..i + p].iter().zip(&groups[i + k * p..i + (k + 1) * p]).all(|(a, b)| a.1 == b.1) { k += 1 }
             if k < 2 { continue }
+            // (SiON plays every repeat at the octave the loop starts at, so a figure that ends at another octave
+            // than it starts, which its text is the same but an octave on each time, can't be a loop.)
+            if octs[i].0 != octs[i + p - 1].1 { continue }
             let unit: usize = groups[i..i + p].iter().map(|g| g.1.len()).sum();
             let sav = (k - 1) * unit;
             let cost = 2 + k.to_string().len();
@@ -282,9 +294,12 @@ pub fn write(title: &str, header: &[String], tracks: &[(String, &[Tok])], sectio
     bounds.dedup();
     let names = if flats(tracks.iter().map(|t| t.1)) { &FLAT } else { &crate::mml::NAMES };
     for (label, toks) in tracks {
-        // Commands after the last note restore the state for the loop: each line restates it anyway, except the tone.
+        // Commands after the last note restore the state for the loop. They stay: a line restates its state only
+        // where it has notes, and the last note's release still sounds as the loop starts again, under them.
+        // (Without a loop there is nothing to restore: the tone only.)
         let last = toks.iter().rposition(|t| !matches!(t, Tok::Cmd(_))).map_or(0, |i| i + 1);
-        let toks: Vec<Tok> = toks.iter().enumerate().filter(|(i, t)| *i < last || matches!(t, Tok::Cmd(c) if kind(c).is_some_and(|k| TONE.contains(&k)))).map(|x| x.1.clone()).collect();
+        let looped = toks.iter().any(|t| matches!(t, Tok::Cmd(c) if c == "$"));
+        let toks: Vec<Tok> = toks.iter().enumerate().filter(|(i, t)| *i < last || looped || matches!(t, Tok::Cmd(c) if kind(c).is_some_and(|k| TONE.contains(&k)))).map(|x| x.1.clone()).collect();
         let toks = &toks[..];
         // Default length: the most common note or rest length.
         let mut freq: HashMap<u32, usize> = HashMap::new();
@@ -308,7 +323,7 @@ pub fn write(title: &str, header: &[String], tracks: &[(String, &[Tok])], sectio
         let mut init: Vec<String> = vec![];
         // (Restated state starts at SiON's defaults, so the first line states it too.)
         let mut st = State::default();
-        for (k, d) in [("v", format!("v{vmax}")), ("pan", "@p0".into()), ("k", "k0".into()), ("mp", "mp0".into()), ("ma", "ma0".into()), ("ptab", "np".into()), ("rtab", "_np".into())] {
+        for (k, d) in [("v", format!("v{vmax}")), ("pan", "@p0".into()), ("k", "k0".into()), ("mp", "mp0".into()), ("ma", "ma0".into()), ("ptab", "np".into()), ("rtab", "_np".into()), ("qa", "@q0".into())] {
             if restate.contains(&k) { st.0.insert(k, d); }
         }
         let mut rest = vec![];

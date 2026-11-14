@@ -771,3 +771,166 @@ fn spc_sample_plays_at_its_pitch() {
     let hz = ups as f64 * sion::RATE as f64 / seg.len() as f64;
     assert!((hz - 261.63).abs() < 3.0, "C4: {hz} Hz");
 }
+
+/// A table-driven driver: DSP registers set first (`init`), timer 0 at `target` (8 kHz / target, 0 = 256), then
+/// the `events` (register, value, ticks to wait after it), round and round. Voice 0 plays the 1 kHz square of
+/// `spc_scale` from sample directory entry 0. `regs`: the DSP registers in the snapshot itself.
+fn spc_table(init: &[(u8, u8)], target: u8, events: &[(u8, u8, u8)], regs: &[(u8, u8)]) -> Vec<u8> {
+    let dsp = |r: u8, v: u8| [0x8f, r, 0xf2, 0x8f, v, 0xf3]; // MOV $F2,#r; MOV $F3,#v
+    let mut p = vec![];
+    for &(r, v) in init { p.extend(dsp(r, v)) }
+    p.extend([0x8f, target, 0xfa, 0x8f, 0x01, 0xf1, 0xcd, 0x00]); // timer 0; MOV X,#0
+    let next = p.len();
+    p.extend([0xf5, 0x00, 0x06, 0x68, 0xff, 0xd0, 0x04, 0xcd, 0x00, 0x2f, 0x00]); // MOV A,$0600+X; CMP A,#$FF; BNE body; MOV X,#0; BRA next
+    let bra = p.len() - 2;
+    // body: MOV $F2,A; INC X; MOV A,$0600+X; MOV $F3,A; INC X; MOV A,$0600+X; INC X; MOV $00,A
+    p.extend([0xc4, 0xf2, 0x3d, 0xf5, 0x00, 0x06, 0xc4, 0xf3, 0x3d, 0xf5, 0x00, 0x06, 0x3d, 0xc4, 0x00]);
+    let wait = p.len();
+    p.extend([0xe4, 0x00, 0xf0, 0x00]); // wait: MOV A,$00; BEQ next
+    let tick = p.len();
+    p.extend([0xeb, 0xfd, 0xf0, 0x00, 0x8b, 0x00, 0x2f, 0x00]); // tick: MOV Y,$FD; BEQ tick; DEC $00; BRA wait
+    let rel = |from: usize, to: usize| (to as i32 - (from as i32 + 2)) as i8 as u8;
+    (p[bra + 1], p[wait + 3], p[tick + 3], p[tick + 7]) = (rel(bra, next), rel(wait + 2, next), rel(tick + 2, tick), rel(tick + 6, wait));
+    let mut table: Vec<u8> = events.iter().flat_map(|&(r, v, w)| [r, v, w]).collect();
+    table.push(0xff);
+    let mut brr = vec![0xa0];
+    brr.extend([0x77; 8]);
+    brr.push(0xa3);
+    brr.extend([0x99; 8]);
+    let mut f = spc(&p, &[(0x300, &[0x00, 0x05, 0x00, 0x05]), (0x500, &brr), (0x600, &table)]);
+    for &(r, v) in regs { f[0x10100 + r as usize] = v }
+    f
+}
+
+/// Voice 0 at 1 kHz (P = $1000) and full volume, echo off, sample directory at $0300.
+const VOICE0: [(u8, u8); 8] = [(0x5d, 0x03), (0x0c, 127), (0x1c, 127), (0x6c, 0x20), (0x00, 100), (0x01, 100), (0x02, 0x00), (0x03, 0x10)];
+
+/// Level (dB) of the left channel in windows of `w` seconds.
+fn levels(audio: &[f32], w: f64) -> Vec<f64> {
+    let n = (w * sion::RATE as f64) as usize;
+    audio.chunks(2 * n).map(|c| 10.0 * (c.iter().step_by(2).map(|&x| (x as f64).powi(2)).sum::<f64>() / n as f64 + 1e-12).log10()).collect()
+}
+
+#[test]
+fn spc_long_decay_keeps_its_level() {
+    // One note every 8.16 s (255 ticks of 31.25 Hz) that sustains with the exponential sustain rate 8 (a step
+    // every 384 samples), about 34 dB down by the next. The DSP's own steps (-1, then -1/256 of the level) fall
+    // faster as it goes down; SiON's are a fixed number of decibels: the converter fits two of them (decay and
+    // sustain) to the curve, at the note's key (SiON's rates rise with it).
+    let mut init = VOICE0.to_vec();
+    init.extend([(0x04, 0), (0x05, 0x8f), (0x06, 0xe8)]);
+    let out = check(&spc_table(&init, 0, &[(0x4c, 0x01, 255)], &[]));
+    let lv = levels(&render(&out.plain, 8), 0.25);
+    let dsp: Vec<f64> = (0..32).map(|k| {
+        let mut e = 0x7ffi32;
+        for _ in 0..((k as f64 + 0.5) * 0.25 * 32000.0 / 384.0) as usize { e -= 1; e -= e >> 8 }
+        20.0 * (e as f64 / 2047.0).log10()
+    }).collect();
+    let off = lv[1] - dsp[1];
+    let worst = |floor: f64| (1..31).filter(|&k| dsp[k] > floor).map(|k| (lv[k] - off - dsp[k]).abs()).fold(0.0, f64::max);
+    assert!(worst(-15.0) < 0.5, "within 0.5 dB of the DSP's decay down to -15 dB: off by {:.2}", worst(-15.0));
+    assert!(worst(-24.0) < 1.5, "within 1.5 dB down to -24 dB: off by {:.2}", worst(-24.0));
+}
+
+#[test]
+fn spc_snapshot_keys_on_its_voices() {
+    // The snapshot's own KON register keys voice 0 on as it loads (as SPC players do); the driver never does.
+    let mut regs = VOICE0.to_vec();
+    regs.extend([(0x04, 0), (0x05, 0x8f), (0x06, 0xe0), (0x4c, 0x01)]);
+    let out = check(&spc_table(&[], 0x50, &[(0x5c, 0x00, 200)], &regs));
+    // (Held across the loop point: a slur into it.)
+    let n = notes(&out.plain, 0);
+    assert!(!n.is_empty() && n.iter().all(|n| n == "6b"), "the snapshot's note (1 kHz): {n:?}");
+    let t = out.plain.split(";\n").find(|t| !t.starts_with('#')).unwrap();
+    assert!(t.find('o').unwrap() < t.find('r').unwrap_or(usize::MAX), "it starts at once: {t:.80}");
+}
+
+#[test]
+fn spc_key_offs_are_gate_times() {
+    // A scale whose notes, 25 and 15 ticks apart by turns (250 and 150 ms), are keyed off 5 ticks (50 ms) before
+    // the next: the readable MML (bars of 50 ms rows) keys them off with `@q` instead of a rest after every note.
+    let mut init = VOICE0.to_vec();
+    init.extend([(0x04, 0), (0x05, 0x8f), (0x06, 0xe0)]);
+    let mut ev = vec![];
+    for (i, f) in SCALE.iter().chain(SCALE.iter().rev().skip(1)).enumerate() {
+        let p = (4096.0 * f / 1000.0f64).round() as u16;
+        ev.extend([(0x02, p as u8, 0), (0x03, (p >> 8) as u8, 0), (0x5c, 0x00, 0), (0x4c, 0x01, if i % 2 == 0 { 20 } else { 10 }), (0x5c, 0x01, 5)]);
+    }
+    let out = check(&spc_table(&init, 0x50, &ev, &[]));
+    // (The loop starts on the row after the first C starts: that note is slurred across the loop point.)
+    let mut n = notes(&out.plain, 0);
+    n.dedup();
+    assert_eq!(n[..9], ["5c", "5e", "5g", "5a", "6c", "5a", "5g", "5e", "5c"]);
+    let body: String = out.mml.split(';').map(str::trim).filter(|t| !t.starts_with('#')).flat_map(|t| t.lines().filter(|l| !l.starts_with("//"))).collect();
+    assert!(out.mml.contains("\n// Track 1"), "written by bars");
+    assert!(body.contains("@q"), "gated with @q: {body:.300}");
+    assert!(body.matches('r').count() < 4, "no rest after each note: {body:.300}");
+}
+
+/// Voice 0 (silent, VOL 0) modulating voice 1's pitch (PMON), both the square of `spc_table` at full sustain:
+/// the modulator at P = `pm`, the carrier at `pc`. The DSP: the carrier's rate × (1 + the modulator's output).
+fn spc_pmon(pm: u16, pc: u16) -> Vec<u8> {
+    let init = [(0x5d, 0x03), (0x0c, 127), (0x1c, 127), (0x6c, 0x20), (0x2d, 0x02),
+        (0x00, 0), (0x01, 0), (0x02, pm as u8), (0x03, (pm >> 8) as u8), (0x04, 0), (0x05, 0x8f), (0x06, 0xe0),
+        (0x10, 100), (0x11, 100), (0x12, pc as u8), (0x13, (pc >> 8) as u8), (0x14, 0), (0x15, 0x8f), (0x16, 0xe0)];
+    spc_table(&init, 0, &[(0x4c, 0x03, 255)], &[])
+}
+
+/// Level (linear) of the left channel at `hz`, over `x` (a single-bin DFT, Hann window).
+fn bin(x: &[f32], hz: f64) -> f64 {
+    let n = x.len() as f64;
+    let (mut re, mut im) = (0.0, 0.0);
+    for (i, &v) in x.iter().enumerate() {
+        let w = 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n).cos();
+        let p = 2.0 * std::f64::consts::PI * hz * i as f64 / sion::RATE as f64;
+        (re, im) = (re + v as f64 * w * p.cos(), im - v as f64 * w * p.sin());
+    }
+    (re * re + im * im).sqrt()
+}
+
+#[test]
+fn spc_pitch_modulation_through_a_pipe() {
+    // A 62.5 Hz modulator under a 500 Hz carrier: the carrier's sidebands (500 ± 62.5k Hz) as frequency modulation
+    // by the modulator's square makes them (simulated here at the DSP's rate), within 2 dB.
+    let out = check(&spc_pmon(0x0100, 0x0800));
+    assert!(out.mml.contains("@o1,0") && out.mml.contains("@i"), "a modulator copy and a carrier wired by a pipe");
+    assert!(out.warnings.iter().any(|w| w.contains("PMON") && w.contains("pipe")), "{:?}", out.warnings);
+    let audio = render(&out.plain, 3);
+    let left: Vec<f32> = audio.iter().step_by(2).copied().collect();
+    let got = &left[sion::RATE as usize..sion::RATE as usize + 32768];
+    // (The DSP's output for the square: 7 << 10 >> 1, doubled, of 32768.)
+    let a = 7168.0 / 32768.0;
+    let mut ph = 0.0f64;
+    let want: Vec<f32> = (0..32768).map(|i| {
+        let t = i as f64 / sion::RATE as f64;
+        let m = if (t * 62.5).fract() < 0.5 { a } else { -a };
+        ph += 500.0 * (1.0 + m) / sion::RATE as f64;
+        (2.0 * std::f64::consts::PI * ph).sin() as f32
+    }).collect();
+    for k in [-2i32, -1, 1, 2] {
+        let hz = 500.0 + 62.5 * k as f64;
+        let (g, w) = (20.0 * (bin(got, hz) / bin(got, 500.0)).log10(), 20.0 * (bin(&want, hz) / bin(&want, 500.0)).log10());
+        assert!((g - w).abs() < 2.0, "sideband {k}: {g:.1} dB against {w:.1} dB");
+    }
+}
+
+#[test]
+fn spc_slow_pitch_modulation_is_a_vibrato() {
+    // A 7.8 Hz modulator is a vibrato: SiON's pitch LFO in its shape, swinging the carrier's frequency by
+    // × (1 ± 0.219) as on the DSP (a square: two pitches).
+    let out = check(&spc_pmon(0x0020, 0x0800));
+    assert!(out.mml.contains("@lfo") && out.mml.contains("mp"), "a pitch LFO");
+    let audio = render(&out.plain, 3);
+    let left: Vec<f32> = audio.iter().step_by(2).copied().collect();
+    // Periods between rising zero crossings (with hysteresis), over a second.
+    let x = &left[sion::RATE as usize..2 * sion::RATE as usize];
+    let thr = x.iter().fold(0f32, |m, v| m.max(v.abs())) * 0.5;
+    let (mut ups, mut high) = (vec![], x[0] > 0.0);
+    for (i, &v) in x.iter().enumerate() { if !high && v > thr { ups.push(i); high = true } else if high && v < -thr { high = false } }
+    let mut hz: Vec<f64> = ups.windows(2).map(|w| sion::RATE as f64 / (w[1] - w[0]) as f64).collect();
+    hz.sort_by(f64::total_cmp);
+    let (lo, hi) = (hz[hz.len() / 10], hz[hz.len() * 9 / 10]);
+    let a = 7168.0 / 32768.0;
+    assert!((hi / lo / ((1.0 + a) / (1.0 - a)) - 1.0).abs() < 0.08, "{lo:.0}..{hi:.0} Hz");
+    assert!((hi / 500.0 / (1.0 + a) - 1.0).abs() < 0.05, "top {hi:.0} Hz");
+}

@@ -127,6 +127,10 @@ fn half(p: f32) -> f32 { if p >= 0.5 { p - 0.5 } else { p } }
 fn tri(p: f32) -> f32 { if p < 0.25 { 4.0 * p } else if p < 0.75 { 2.0 - 4.0 * p } else { 4.0 * p - 4.0 } }
 fn saw(p: f32) -> f32 { if p < 0.5 { 2.0 * p } else { 2.0 * p - 2.0 } }
 
+/// How far a full-scale pipe input (`@i n`) moves the phase, as a share of 2^(n-3) cycles: a little under the round
+/// figure, as measured in GDSiON (a sine or a square modulator's sidebands against the carrier: 0.9918-0.9926).
+pub const PIPE_DEPTH: f32 = 127.0 / 128.0;
+
 /// Sample waveform `pg` (SiON "pgType") at phase `p` in 0..1.
 #[cfg_attr(feature = "small", optimize(speed))]
 pub fn wave(sh: &Shared, pg: i32, p: f32) -> f32 {
@@ -225,16 +229,21 @@ impl Op {
     /// Default pitch table of a waveform: sampled noise runs at a rate, not a frequency.
     pub fn pt_of(pg: i32) -> u8 { match pg { 6 | 16..=21 => 1, 26 => 3, _ => 0 } }
 
+    /// The key code (`kc`, which scales the envelope rates) of the operator's pitch, or its fixed note.
+    fn key_code(&mut self) {
+        if self.fix > 0 { self.pi = self.fix }
+        let n = (self.pi >> 6) & 127;
+        let i = n + n / 3;
+        self.kc = if i < 16 { i } else { (i - 16).min(127) };
+    }
+
     #[cfg_attr(feature = "small", optimize(speed))]
     fn pitch(&mut self, sh: &Shared, pm: i32) {
         const DT1: [u8; 96] = *b"\0\0\0\0\x01\x01\x01\x01\x01\x01\x01\x01\x02\x02\x02\x02\x02\x03\x03\x03\x04\x04\x04\x05\x05\x06\x06\x07\x08\x08\x08\x08\
 \x01\x01\x01\x01\x02\x02\x02\x02\x02\x03\x03\x03\x04\x04\x04\x05\x05\x06\x06\x07\x08\x08\x09\x0a\x0b\x0c\x0d\x0e\x10\x10\x10\x10\
 \x02\x02\x02\x02\x02\x03\x03\x03\x04\x04\x04\x05\x05\x06\x06\x07\x08\x08\x09\x0a\x0b\x0c\x0d\x0e\x10\x11\x13\x14\x16\x16\x16\x16";
         const FC: [f32; 16] = [4., 8., 16., 32., 64., 96., 128., 160., 202., 254., 380., 508., 762., 1016., 2034., 4068.];
-        if self.fix > 0 { self.pi = self.fix }
-        let n = (self.pi >> 6) & 127;
-        let i = n + n / 3;
-        self.kc = if i < 16 { i } else { (i - 16).min(127) };
+        self.key_code();
         let idx = self.pi + self.det + pm;
         let (semi, k) = (((idx & 8191) as f32 + self.pf) / 768.0, (idx >> 6) as usize);
         let len = match self.pg { 6 | 16 | 17 | 19 | 20 | 26 => 32768.0, 21 => 128.0, 256.. => sh.waves[(self.pg - 256) as usize & 255].len().max(1) as f32, _ => 1024.0 };
@@ -502,8 +511,13 @@ impl Chan {
         (self.f_st, self.f_step, self.f_cnt, self.f_next, self.f_inc) = (st, i32::MAX, i32::MAX, self.cutoff + 1, 0);
     }
 
+    /// Key on. The operators take the channel's pitch first, so the envelope starts at its rates for the new note's
+    /// key (as SiON sets the pitch, and with it the key code, before it keys on); `refresh` does the rest.
     pub fn note_on(&mut self) {
+        let (pitch, fine, ks) = (self.pitch, self.fine, self.ks);
         for o in &mut self.ops {
+            if !ks { (o.pi, o.pf) = (pitch, fine) }
+            o.key_code();
             match o.phase { 255 => {} -1 => o.ph = M::fract(o.ph * 7919.0 + 0.137), p => o.ph = (p & 255) as f32 / 256.0 }
             o.ssg_st = usize::MAX;
             o.shift(1);
@@ -677,7 +691,7 @@ impl Chan {
         }
         if self.stale { self.refresh(sh, late) }
         let (am, pm, fr, pitch) = (self.am, self.pm, self.fratio, self.pitch);
-        let fbin = if self.inp.0 > 0 { pipes[self.inp.1] * pow2(self.inp.0 - 3) } else if self.fb > 0 {
+        let fbin = if self.inp.0 > 0 { pipes[self.inp.1] * pow2(self.inp.0 - 3) * PIPE_DEPTH } else if self.fb > 0 {
             let o = &self.ops[self.fbc];
             // (The chips' sum also cancels at the sample rate, so deep feedback doesn't break into oscillation.)
             if sh.fb2 { (o.out + o.pout) * pow2(self.fb - 8) } else { o.out * pow2(self.fb - 7) }
