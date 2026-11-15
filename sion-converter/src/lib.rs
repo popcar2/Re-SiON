@@ -157,7 +157,7 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
             let name = score.names.get(t.ch as usize).filter(|n| !n.is_empty()).map_or(String::new(), |n| format!(", {n}"));
             (format!("Track {}{name}", i + 1), &toks[..])
         }).collect();
-        pretty::write(&score.title, &header, &tracks, &song.sections, song.lp, score.vmax(), &mut lens)
+        pretty::write(&score.title, &header, &tracks, &song.sections, song.lp, score.vmax(), song.frame(), &mut lens)
     };
     // (Notes keeping the table before them across lines read better, but can stop lines from repeating: the
     // shorter of the two.)

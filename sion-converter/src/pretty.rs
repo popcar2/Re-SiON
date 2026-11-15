@@ -45,6 +45,9 @@ const TONE: [&str; 6] = ["instr", "env", "lfo", "ph", "mp", "ma"];
 
 const KINDS: [&str; 17] = ["x", "q", "qa", "instr", "env", "lfo", "fv", "ph", "mp", "ma", "rtab", "ptab", "vtab", "ctab", "v", "pan", "k"];
 
+/// Command `c` of kind `k` sets the LFO (alone or in a tone), which resets its depths (`mp`, `ma`).
+fn resets_lfo(k: &str, c: &str) -> bool { k == "lfo" || (k == "env" && c.contains("@lfo")) }
+
 #[derive(Clone, Default, PartialEq)]
 struct State(HashMap<&'static str, String>);
 
@@ -53,7 +56,7 @@ impl State {
         // (A module change resets the tone, its LFO and the sample position.)
         if k == "instr" { for r in ["env", "lfo", "ph", "mp", "ma"] { self.0.remove(r); } }
         // (And an LFO setting, alone or in a tone, its depths.)
-        if k == "lfo" || (k == "env" && c.contains("@lfo")) { for r in ["mp", "ma"] { self.0.remove(r); } }
+        if resets_lfo(k, c) { for r in ["mp", "ma"] { self.0.remove(r); } }
         self.0.insert(k, c.to_string());
     }
 }
@@ -61,20 +64,24 @@ impl State {
 /// Split a track's tokens at the boundaries (ticks): notes and rests crossing one are split there (a note
 /// slurred into its continuation). Returns the pieces and which piece the loop point (`$`) starts.
 /// Notes are split only where that sounds the same: not under a pitch table (a slurred note starts at its own
-/// pitch, not where the table has taken it) or a gate other than `q8` and no `@q` (each piece would be keyed off
-/// at its own gate); those run on into the next section. `st`: the state set before the tokens.
-fn split(toks: &[Tok], bounds: &[u64], st: &State) -> (Vec<Vec<Tok>>, Option<usize>) {
+/// pitch, not where the table has taken it), except where the table steps (`frame`: ticks per envelope frame,
+/// from the key-on), or a gate other than `q8` and no `@q` (each piece would be keyed off at its own gate); those
+/// run on into the next section. `st`: the state set before the tokens.
+fn split(toks: &[Tok], bounds: &[u64], st: &State, frame: Option<u64>) -> (Vec<Vec<Tok>>, Option<usize>) {
     let (mut pieces, mut cur, mut t, mut bi, mut lp) = (vec![], vec![], 0u64, 0, None);
     let mut ptab = st.0.get("ptab").is_some_and(|c| c != "np");
     let (mut q, mut qa) = (st.0.get("q").is_none_or(|c| c != "q8"), st.0.get("qa").is_some_and(|c| c != "@q0"));
+    // The key-on of the note sounding, and whether the note before is slurred into the next.
+    let (mut kon, mut held) = (0u64, false);
     for tok in toks {
         while bi < bounds.len() && bounds[bi] <= t { pieces.push(std::mem::take(&mut cur)); bi += 1 }
+        if let Tok::Note { slur, .. } = tok { if !held { kon = t } held = *slur }
         match tok {
             Tok::Cmd(c) if c == "$" => lp = Some(pieces.len()),
             Tok::Cmd(c) if kind(c) == Some("ptab") => { ptab = c != "np"; cur.push(tok.clone()) }
             Tok::Cmd(c) if kind(c) == Some("q") => { q = c != "q8"; cur.push(tok.clone()) }
             Tok::Cmd(c) if kind(c) == Some("qa") => { qa = c != "@q0"; cur.push(tok.clone()) }
-            Tok::Note { key, len, slur } if ptab || q || qa => {
+            Tok::Note { key, len, slur } if q || qa => {
                 cur.push(Tok::Note { key: *key, len: *len, slur: *slur });
                 t += *len as u64;
                 while bi < bounds.len() && bounds[bi] < t { bi += 1 }
@@ -82,6 +89,7 @@ fn split(toks: &[Tok], bounds: &[u64], st: &State) -> (Vec<Vec<Tok>>, Option<usi
             Tok::Note { key, len, slur } => {
                 let mut len = *len as u64;
                 while bi < bounds.len() && t + len > bounds[bi] {
+                    if ptab && !frame.is_some_and(|f| (bounds[bi] - kon) % f == 0) { bi += 1; continue }
                     let part = bounds[bi] - t;
                     cur.push(Tok::Note { key: *key, len: part as u32, slur: true });
                     pieces.push(std::mem::take(&mut cur));
@@ -91,6 +99,7 @@ fn split(toks: &[Tok], bounds: &[u64], st: &State) -> (Vec<Vec<Tok>>, Option<usi
                 t += len;
             }
             Tok::Rest(len) => {
+                held = false;
                 let mut len = *len as u64;
                 while bi < bounds.len() && t + len > bounds[bi] {
                     let part = bounds[bi] - t;
@@ -170,7 +179,7 @@ impl Writer<'_> {
             if TONE.contains(&k) {
                 if changed || reset || (lfo_reset && matches!(k, "mp" | "ma")) {
                     head += c;
-                    lfo_reset |= k == "lfo" || (k == "env" && c.contains("@lfo"));
+                    lfo_reset |= resets_lfo(k, c);
                 }
             }
             // (A line of rests only needn't restate anything: the next line does.)
@@ -293,7 +302,8 @@ fn structure(ids: &[usize], lp: Option<usize>) -> Vec<Item> {
 
 /// Readable MML for these tracks: `tracks` as (comment, tokens), cut at `sections` (ticks), looping to `lp`.
 /// `vmax`: the loudest `v`, a track's volume before it sets one.
-pub fn write(title: &str, header: &[String], tracks: &[(String, &[Tok])], sections: &[u64], lp: Option<u64>, vmax: u16, lens: &mut Lengths) -> String {
+/// `frame`: ticks per envelope frame (see `split`).
+pub fn write(title: &str, header: &[String], tracks: &[(String, &[Tok])], sections: &[u64], lp: Option<u64>, vmax: u16, frame: Option<u64>, lens: &mut Lengths) -> String {
     let mut out = String::new();
     if !title.is_empty() { out += &format!("#TITLE{{{}}};\n", title.replace(['{', '}', ';'], "")) }
     let is_data = |h: &str| h.starts_with("#WAV") || h.starts_with("#PCMB");
@@ -305,10 +315,11 @@ pub fn write(title: &str, header: &[String], tracks: &[(String, &[Tok])], sectio
     for (label, toks) in tracks {
         // Commands after the last note restore the state for the loop. They stay: a line restates its state only
         // where it has notes, and the last note's release still sounds as the loop starts again, under them.
-        // (Without a loop there is nothing to restore: the tone only.)
+        // (Without a loop there is nothing to restore: the tone only, and a release silenced at the very end.)
         let last = toks.iter().rposition(|t| !matches!(t, Tok::Cmd(_))).map_or(0, |i| i + 1);
         let looped = toks.iter().any(|t| matches!(t, Tok::Cmd(c) if c == "$"));
-        let toks: Vec<Tok> = toks.iter().enumerate().filter(|(i, t)| *i < last || looped || matches!(t, Tok::Cmd(c) if kind(c).is_some_and(|k| TONE.contains(&k)))).map(|x| x.1.clone()).collect();
+        let keep = |k: &str| TONE.contains(&k) || matches!(k, "v" | "x");
+        let toks: Vec<Tok> = toks.iter().enumerate().filter(|(i, t)| *i < last || looped || matches!(t, Tok::Cmd(c) if kind(c).is_some_and(keep))).map(|x| x.1.clone()).collect();
         let toks = &toks[..];
         // Default length: the most common note or rest length.
         let mut freq: HashMap<u32, usize> = HashMap::new();
@@ -356,7 +367,7 @@ pub fn write(title: &str, header: &[String], tracks: &[(String, &[Tok])], sectio
         if l != 480 { init.push(format!("l{}", len_text(l, 0, lens))) }
         // (A tone and its envelope read as one: `%4@1s63`.)
         let init = init.iter().fold(String::new(), |s, c| if s.is_empty() || (c.starts_with('@') && !c.starts_with("@p")) { s + c } else { s + " " + c });
-        let (pieces, lpi) = split(&rest, &bounds, &st);
+        let (pieces, lpi) = split(&rest, &bounds, &st, frame);
         let w = Writer { lens, l, names };
         // Sections by text and the tone they start with: equal, the same music.
         let keys: Vec<(String, String)> = pieces.iter().map(|p| {

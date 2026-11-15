@@ -38,15 +38,23 @@ note's run of levels becomes an `na` table and its run of detunes an `np` table,
 (`v16e-&v20e-24&v16e-32&v13e-32&...` → `na12 e-8`). SiON starts a table at the key-on and steps it every frame,
 which is where the driver changed the chip. Notes share a table when it plays their values for as long as they
 sound, a run that settles into a repeating figure (a vibrato) loops it (`|`), and a note keeps the table before it
-when that one plays its values too. A pitch table is used only where it is shorter to write than its slurs.
+when that one plays its values too. A pitch table is used only where it is shorter to write than its slurs, and
+the tables used by the most notes get the shortest numbers. The frame is the one most notes' changes fall on. A note
+keeps its slurs where a table would play otherwise: one sounding through the loop point (going back, it is keyed
+on afresh there, and its table would start over), one whose other changes split it between frames (a slurred
+note starts from its own pitch until the next frame), and a sample keyed on between two output frames.
 
 - Volume tables set `x`, which multiplies with `v` (or adds, in decibels): a track with them has its master volume
   as its one `v` and the notes' levels in its tables, the same product (in decibels with `#VMODE{%x1}`, so `x`
-  steps as `v` does). A release the driver silences is a key-off table (`_na`: the level held, then 0), so `v`
-  never changes under a releasing note. A track gets volume tables only if all its notes can (levels up to 128).
+  steps as `v` does). A release the driver silences is a key-off table (`_na`: the level held, then 0, however
+  long the release), so `v`
+  never changes under a releasing note. A track gets volume tables only if all its notes can (levels up to 128,
+  none sounding through the loop point or silenced across it), and `x` is in decibels only for a song with one.
 - `--verify` checks the tables against the plain MML, which plays the same runs as slurs (with the levels in `x`).
-- VGM songs whose driver runs on the 60 Hz (or 50 Hz) frame get them; NSF (the NES frame is 733.8 samples), SPC,
-  MIDI and songs timed by the YM2612's timers don't (their frames aren't whole samples), and keep the slurs.
+- VGM songs whose driver runs on the 60 Hz frame get them, and on the 50 Hz one unless they have release pitch
+  sweeps (`_np` tables, which step at 1/60 s); tracker modules that keep one tempo get pitch tables on their ticks
+  (`#FPS{50}` at 125 BPM). NSF (the NES frame is 733.8 samples), SPC, MIDI and songs timed by the YM2612's timers
+  don't (their frames aren't whole samples), and keep the slurs.
 
 ## WebAssembly
 
@@ -119,8 +127,9 @@ $
 - A sample that is one cycle of a waveform (all loop, at most 1024 frames) becomes that wavetable (`#WAV`, exact);
   other samples are embedded (below). Wavetables and samples are written at the end of the file.
 - A note is cut at a line's end only where that sounds the same, as a slur (`c&` / `c`) into the next line: not
-  under a pitch table (`np`; a slurred note starts from its own pitch, not where the table has taken it) or a gate
-  other than `q8` (drum hits: each piece would be keyed off at its own gate). Those notes run on into the next line.
+  under a pitch table (`np`; a slurred note starts from its own pitch, not where the table has taken it), except
+  where the line's end falls on one of the table's frames (it steps there anyway), or a gate other than `q8` (drum
+  hits: each piece would be keyed off at its own gate). Those notes run on into the next line.
 - Data is written compactly, decoding to exactly the same values: runs of one value in `#WAV` and `#TABLE` (on
   each side of a table's loop point) as
   `(v)n` (which SiON and GDSiON both read as `n` copies; GDSiON crashes on `[v]n`, and `(v,v)n` rounds negative

@@ -166,3 +166,75 @@ fn data_written_compactly() {
     assert_eq!(compact("#PCMB1{AAAA}8400,60,10,0"), "#PCMB1{AAAA}8400,60,10");
     assert_eq!(compact("#PCMB2{=1}8400,60,-1,4,30"), "#PCMB2{=1}8400,60,-1,4,30");
 }
+
+/// Chip songs whose per-frame changes become envelope tables play exactly as the plain MML (what `--verify`
+/// checks), around the loop point and the song's end too: a note sounding through the loop point, a voice the
+/// end restores under a release, a release cut across the loop point or after the end, a vibrato split off its
+/// frames by other changes, a release silenced at the very end.
+#[test]
+fn envelope_tables_play_as_the_plain_mml() {
+    use crate::score::{Note, Score};
+    // FM voices with a slow release, so what happens under one is heard.
+    let voice = |n: u32, tl: u32| format!("#OPN@{n}{{4,6,31,0,0,2,0,{tl},0,1,7,0,18,10,0,2,1,0,0,4,7,0,31,0,0,2,0,23,0,2,3,0,18,10,0,2,1,0,0,2,3,0}}");
+    // A note on voice `v` whose level falls every `step` ticks, `n` times (a driver's envelope).
+    let note = |ch: u32, start: u64, end: u64, key: u8, v: u32, step: u64, n: u64| {
+        let mut x = Note::new(ch, start, end, key, 1.0, "%6".into());
+        x.env = format!("@{v}");
+        x.vols = (1..=n).map(|j| (start + j * step, 1.0 - 0.06 * j as f32)).collect();
+        x
+    };
+    let vibrato = |x: &mut Note, from: u64, step: u64, n: u64| x.bends = (0..n).map(|j| (from + j * step, [8, 16, 8, 0, -8, -16, -8, 0][j as usize % 8])).collect();
+    let check = |name: &str, notes: Vec<Note>, bpm: f64, end: u64, lp: Option<u64>| {
+        // (At 150 bpm a tick is a 60 Hz frame; at 300, half of one.)
+        let mut sc = Score { ppq: 24, tempos: vec![(0, bpm)], header: vec!["#FBMODE{chip}".into(), voice(0, 22), voice(1, 25)], notes, end, lp, db: true, ..Score::default() };
+        sc.set_bars(&[]);
+        let out = crate::write(&sc, &Options { gain: Some(1.0), ..Options::default() }, vec![]);
+        let secs = out.secs + out.loop_secs.unwrap_or(0.0) + 0.5;
+        assert!(crate::render(&out.plain, secs) == crate::render(&out.mml, secs), "{name}: the tables play otherwise than the plain MML\n{}", out.mml);
+        out.mml
+    };
+
+    let mut b = note(0, 36, 100, 64, 0, 1, 10);
+    vibrato(&mut b, 37, 3, 20);
+    check("a note through the loop point", vec![note(0, 0, 30, 60, 0, 1, 10), b], 150.0, 110, Some(42));
+    for cut in [None, Some(33)] {
+        let mut b = note(0, 14, 30, 64, 1, 1, 6);
+        b.cut = cut;
+        check("a voice restored under a release", vec![note(0, 0, 10, 60, 0, 1, 6), b], 150.0, 36, Some(12));
+    }
+    let mut a = note(0, 0, 20, 60, 0, 1, 10);
+    a.cut = Some(30);
+    check("a release cut across the loop point", vec![a, note(0, 40, 60, 64, 0, 1, 10)], 150.0, 62, Some(24));
+    check("going back under a release", vec![note(0, 10, 30, 60, 0, 1, 10)], 150.0, 34, Some(0));
+    let (mut a, mut b) = (note(0, 0, 30, 60, 0, 1, 10), note(1, 0, 20, 67, 0, 1, 10));
+    (a.cut, b.cut) = (Some(40), Some(26));
+    check("releases cut after the end", vec![a, b], 150.0, 0, None);
+    let mut a = note(0, 10, 30, 60, 0, 1, 10);
+    a.cut = Some(44);
+    check("a release cut after the end of a loop", vec![a], 150.0, 36, Some(0));
+    // (Most notes change every 2 ticks: the frame is 2 ticks.)
+    let mut notes: Vec<Note> = (0..4).map(|k| note(1, k * 40, k * 40 + 30, 60, 0, 2, 8)).collect();
+    let mut c = note(0, 0, 60, 64, 0, 1, 0);
+    vibrato(&mut c, 2, 2, 25);
+    c.vols = vec![(7, 0.7), (13, 0.5)];
+    notes.push(c);
+    check("a vibrato split between its frames", notes.clone(), 300.0, 170, None);
+    notes.pop();
+    let mut c = note(0, 0, 80, 64, 0, 1, 0);
+    vibrato(&mut c, 2, 2, 35);
+    notes.push(c);
+    check("a vibrato through the loop point", notes, 300.0, 170, Some(35));
+    let mut b = note(0, 50, 110, 62, 0, 1, 0);
+    b.cut = Some(120);
+    check("a release silenced at the very end", vec![note(0, 0, 40, 60, 0, 1, 0), b], 150.0, 120, None);
+    // A release silenced long after its key-off is still one key-off table (its level held, then 0).
+    let mut a = note(0, 0, 20, 60, 0, 1, 10);
+    a.cut = Some(330);
+    let mml = check("a long release", vec![a, note(0, 340, 360, 64, 0, 1, 10)], 150.0, 370, None);
+    assert!(mml.contains("_na"), "a long release: no key-off table\n{mml}");
+    // A note under a pitch table is split at the bar lines that fall on its frames: each bar is a line.
+    let mut c = note(0, 0, 300, 64, 0, 1, 0);
+    vibrato(&mut c, 1, 1, 299);
+    let mml = check("a vibrato across bars", vec![c], 150.0, 300, None);
+    assert!(mml.contains("o5e1&"), "a vibrato across bars: not split\n{mml}");
+}
