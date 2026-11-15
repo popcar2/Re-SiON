@@ -619,16 +619,22 @@ pub fn compact(def: &str) -> String {
     let close = def.rfind('}').unwrap_or(def.len());
     let (name, body, post) = (&def[..open], &def[open + 1..close], def.get(close + 1..).unwrap_or(""));
     if (name.starts_with("#WAV") && !name.starts_with("#WAVB")) || name.starts_with("#TABLE") {
-        if !body.bytes().all(|c| c.is_ascii_digit() || c == b'-' || c == b',') { return def.to_string() }
-        let vals: Vec<&str> = body.split(',').collect();
-        let (mut out, mut i) = (vec![], 0);
-        while i < vals.len() {
-            let n = vals[i..].iter().take_while(|v| **v == vals[i]).count();
-            let run = format!("({}){n}", vals[i]);
-            if run.len() < n * (vals[i].len() + 1) - 1 { out.push(run) } else { out.extend(std::iter::repeat_n(vals[i].to_string(), n)) }
-            i += n;
-        }
-        return format!("{name}{{{}}}{post}", out.join(","));
+        if !body.bytes().all(|c| c.is_ascii_digit() || c == b'-' || c == b',' || c == b'|') || body.matches('|').count() > 1 { return def.to_string() }
+        // (Runs stop at the loop point `|`: the part before it and the looped part each get their own.)
+        let runs = |part: &str| -> Vec<String> {
+            let vals: Vec<&str> = part.split(',').filter(|v| !v.is_empty()).collect();
+            let (mut out, mut i) = (vec![], 0);
+            while i < vals.len() {
+                let n = vals[i..].iter().take_while(|v| **v == vals[i]).count();
+                let run = format!("({}){n}", vals[i]);
+                if run.len() < n * (vals[i].len() + 1) - 1 { out.push(run) } else { out.extend(std::iter::repeat_n(vals[i].to_string(), n)) }
+                i += n;
+            }
+            out
+        };
+        let parts: Vec<Vec<String>> = body.split('|').map(runs).collect();
+        let text: Vec<String> = parts.iter().map(|p| p.join(",")).collect();
+        return format!("{name}{{{}}}{post}", text.join(if parts[0].is_empty() { "|" } else { ",|" }));
     }
     if name.starts_with("#PCMB") {
         // rate, key (60), loop (none: negative), flags (0), level (0).

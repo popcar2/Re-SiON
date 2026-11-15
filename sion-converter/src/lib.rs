@@ -123,7 +123,7 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
     // (A looping song renders once through, plus a second of its loop.)
     let limit = loop_secs.map_or(60.0 * 30.0, |_| secs + 1.0);
     let mut lens = mml::Lengths::new();
-    let mut plain: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, None, &lens)).collect();
+    let mut plain: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, None, &lens, None, false)).collect();
     let mut plain_mml = mml::plain(&song.header, &plain, &lens);
     // The volume estimate can't know how loud SiON's waveforms and FM voices really come out: if the result
     // would clip, turn the master volume down until it doesn't.
@@ -133,25 +133,39 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
             let (peak, x) = (peak(&plain_mml, limit), song.master());
             if peak <= 0.98 || x <= 1 { break }
             song.set_master(((x as f32 * if peak >= 0.999 { 0.75 } else { 0.95 / peak }) as i32).min(x - 1));
-            plain = song.tracks.iter().map(|t| arrange::tokens(t, None, &lens)).collect();
+            plain = song.tracks.iter().map(|t| arrange::tokens(t, None, &lens, None, false)).collect();
             plain_mml = mml::plain(&song.header, &plain, &lens);
         }
     }
     // (The plain MML keeps the data as it was made, so a check against it covers the compacted data too.)
-    let header: Vec<String> = song.header.iter().map(|h| mml::compact(h)).collect();
-    let mml = if score.sections.is_empty() {
-        let toks: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, Some(0), &lens)).collect();
-        mml::minify(&header, &toks, &mut lens)
-    } else {
+    // (The written MML plays the notes' per-frame runs from tables, the plain one as slurs: checked equal.)
+    let env = song.envelopes(false);
+    if !env.header.is_empty() {
+        plain = song.tracks.iter().enumerate().map(|(i, t)| arrange::tokens(t, None, &lens, Some((&env, i)), false)).collect();
+        plain_mml = mml::plain(&song.header, &plain, &lens);
+    }
+    let mut written = |env: &arrange::Envelopes| -> String {
+        let header: Vec<String> = song.header.iter().chain(&env.header).map(|h| mml::compact(h)).collect();
+        let toks_of = |gate: Option<u32>| -> Vec<Vec<mml::Tok>> { song.tracks.iter().enumerate().map(|(i, t)| arrange::tokens(t, gate, &lens, Some((env, i)), true)).collect() };
+        if score.sections.is_empty() {
+            let toks = toks_of(Some(0));
+            return mml::minify(&header, &toks, &mut lens);
+        }
         // (Sources that key notes off before the next one: gate times rather than a rest after every note.)
-        let gated: Vec<_> = if score.gates { song.tracks.iter().map(|t| arrange::tokens(t, Some(GATE_STEADY), &lens)).collect() } else { vec![] };
-        let toks = if score.gates { &gated } else { &plain };
-        let tracks: Vec<(String, &[_])> = song.tracks.iter().zip(toks).enumerate().map(|(i, (t, toks))| {
+        let toks = toks_of(score.gates.then_some(GATE_STEADY));
+        let tracks: Vec<(String, &[_])> = song.tracks.iter().zip(&toks).enumerate().map(|(i, (t, toks))| {
             let name = score.names.get(t.ch as usize).filter(|n| !n.is_empty()).map_or(String::new(), |n| format!(", {n}"));
             (format!("Track {}{name}", i + 1), &toks[..])
         }).collect();
         pretty::write(&score.title, &header, &tracks, &song.sections, song.lp, score.vmax(), &mut lens)
     };
+    // (Notes keeping the table before them across lines read better, but can stop lines from repeating: the
+    // shorter of the two.)
+    let mut mml = written(&env);
+    if !env.header.is_empty() {
+        let other = written(&song.envelopes(true));
+        if other.len() < mml.len() { mml = other }
+    }
     Converted {
         plain: plain_mml,
         mml,

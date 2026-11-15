@@ -22,3 +22,23 @@ fn a_tracks_first_note_has_its_keys_rates() {
     let r = fall(&hi, 0) / fall(&lo, 0);
     assert!((r - 1.6).abs() < 0.02, "o7e falls {r} times as fast as o2e");
 }
+
+/// The whole render (interleaved stereo), without declicking.
+fn render(mml: &str, frames: usize) -> Vec<f32> {
+    let mut song = Song::new(mml);
+    song.set_declick(false);
+    let mut out = vec![0f32; frames * 2];
+    song.render(&mut out);
+    out
+}
+
+#[test]
+fn table_steps_land_where_the_ticks_do() {
+    // As in SiON, a table's first value plays from the key-on and each next one an envelope frame (#FPS) later:
+    // at t150 a 1/96 note is 735 samples, one 60 fps frame, so the table steps with the `x` changes slurred in
+    // the first song, sample for sample. (Pitch too: `np` against `k`.)
+    let voice = "#OPN@0{4,6,31,0,0,15,0,22,0,1,7,0,18,10,0,15,1,0,0,4,7,0,31,0,0,15,0,23,0,2,3,0,18,10,0,15,1,0,0,2,3,0};";
+    let slurs = render(&format!("#VMODE{{%v1,1 %x1}};{voice} t150 q8 %6@0 l96 v120 o5c&x118c&x108k10c&k20c4 r8;"), RATE as usize);
+    let table = render(&format!("#VMODE{{%v1,1 %x1}};{voice} #TABLE0{{128,118,108}};#TABLE1{{0,0,10,20}}; t150 q8 %6@0 l96 na0 np1 v120 o5c4^96^96^96 r8;"), RATE as usize);
+    assert!(slurs == table, "first difference at sample {:?}", slurs.iter().zip(&table).position(|(a, b)| a != b).map(|i| i / 2));
+}

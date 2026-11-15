@@ -1,7 +1,7 @@
 //! A `Score` → monophonic SiON tracks: tick scaling, tempo, volume, voice allocation; then each track as a
 //! token stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::mml::{Lengths, Tok};
 use crate::score::Score;
@@ -34,6 +34,12 @@ pub struct Arranged {
     pub lp: Option<u64>,
     /// The master volume (`x`, before each track's own gain).
     x: i32,
+    /// Ticks per envelope-table frame and frames per second (`#FPS`), when every frame starts on a whole sample
+    /// and the song keeps one tempo: per-frame volume and detune runs can then be written as `na` / `np` tables
+    /// (`Arranged::envelopes`).
+    frame: Option<(u64, u32)>,
+    /// `#TABLE` numbers nobody else uses.
+    free: Vec<usize>,
 }
 
 impl Arranged {
@@ -50,6 +56,8 @@ impl Track {
         // (A track playing into a pipe keeps its absolute level: the modulation's depth.)
         if self.piped { return }
         let x = ((x as f32 * self.rel).round() as i32).clamp(1, 128);
+        // (In decibels, `#VMODE{%x1}`: rounded down, so the level never comes out louder than measured.)
+        let x = if self.xdb { (128.0 + 20.0 * (x as f64 / 128.0).log10() / DB_STEP).floor().max(1.0) as i32 } else { x };
         self.x = (x < 128).then_some(x);
     }
 }
@@ -76,7 +84,12 @@ pub struct Track {
     vmax: u16,
     /// Detunes are in thousandths of `k` (written with a fraction).
     kmilli: bool,
+    /// `x` is in decibels, as `v` (`#VMODE{%v1,1 %x1}`), so a volume table can hold the track's `v` steps.
+    xdb: bool,
 }
+
+/// One step of `v` and `x` in decibels (`%v1`, `%x1`): an eighth of an octave.
+const DB_STEP: f64 = 0.75257498916;
 
 struct Note {
     start: u64,
@@ -225,7 +238,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
             let busy = if n.drum.is_some() { start } else { end };
             match slot { Some(v) => { v.0 = busy; v.1.push(note) } None => voices.push((busy, vec![note], n.drum)) }
         }
-        tracks.extend(voices.into_iter().map(|(_, notes, drum)| Track { ch, notes, drum, x: None, rel: rel(ch), piped, tempo: vec![], end: 0, lp: None, vmax, kmilli: sc.kmilli }));
+        tracks.extend(voices.into_iter().map(|(_, notes, drum)| Track { ch, notes, drum, x: None, rel: rel(ch), piped, tempo: vec![], end: 0, lp: None, vmax, kmilli: sc.kmilli, xdb: false }));
     }
 
     // Tempo: one `t` command per change, carried by whichever track has a convenient spot for it.
@@ -246,12 +259,37 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     }
     let unit = [1.0, 10.0, 100.0, 1000.0].into_iter()
         .find(|u| tm.iter().all(|&(_, b)| ((b * u).round() / u - b).abs() / b < 1e-5)).unwrap_or(1000.0);
+    // Envelope frames: the most common spacing of the notes' volume and detune changes (from their starts), when
+    // that is a whole number of samples (`sion::RATE` / an integer `#FPS`, as SiON counts them) under one tempo.
+    // (Release tables and pitch tables step at 1/60 s: only then can the frame be another.)
+    let frame = match &tm[..] {
+        [(_, bpm)] => {
+            let bpm_w = (bpm * unit).round() / unit;
+            let mut freq: HashMap<u64, usize> = HashMap::new();
+            for n in tracks.iter().filter(|t| t.drum.is_none()).flat_map(|t| &t.notes) {
+                let g = n.vols.iter().map(|v| v.0).chain(n.bends.iter().map(|b| b.0)).fold(0, |g, t| gcd(g, t - n.start));
+                if g > 0 { *freq.entry(g).or_default() += 1 }
+            }
+            let sixty = tracks.iter().flat_map(|t| &t.notes).any(|n| n.rtab.is_some() || n.ptab.is_some());
+            let rate = sion::RATE as f64;
+            // (Or the longest part of it that is: a tracker's tick, where its rows are too long.)
+            freq.into_iter().max_by_key(|&(g, c)| (c, g)).and_then(|(g, _)| (1..=g).rev().filter(|d| g % d == 0).find_map(|f| {
+                let samples = f as f64 * rate * 60.0 / (bpm_w * 480.0);
+                let s = samples.round();
+                let ok = (samples - s).abs() < 1e-6 && s >= 1.0 && rate % s == 0.0 && if sixty { s * 60.0 == rate } else { rate / s <= 1000.0 };
+                ok.then_some((f, (rate / s) as u32))
+            }))
+        }
+        _ => None,
+    };
+    let xdb = sc.db && frame.is_some();
     let mut header = vec![];
     if unit > 1.0 { header.push(format!("#TMODE{{unit={unit}}}")) }
-    if sc.db { header.push("#VMODE{%v1,1}".into()) } else if sc.fine { header.push("#VMODE{%v0,0}".into()) }
+    if xdb { header.push("#VMODE{%v1,1 %x1}".into()) } else if sc.db { header.push("#VMODE{%v1,1}".into()) } else if sc.fine { header.push("#VMODE{%v0,0}".into()) }
+
     header.extend(sc.header.iter().cloned());
     header.extend(header_tabs);
-    for t in &mut tracks { t.set_x(x) }
+    for t in &mut tracks { t.xdb = xdb; t.set_x(x) }
     for (t, bpm) in tm {
         let val = (bpm * unit).round() as i64;
         if t == 0 && val as f64 == 120.0 * unit && tm_lp != Some(0) { continue }
@@ -277,8 +315,182 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     let notes = tracks.iter().map(|t| t.notes.len()).sum();
     let mut sections: Vec<u64> = sc.sections.iter().map(|&t| map(t)).filter(|&t| t < end).collect();
     sections.dedup();
-    Arranged { header, tracks, notes, sections, lp, x }
+    Arranged { header, tracks, notes, sections, lp, x, frame, free: free.collect() }
 }
+
+/// Per-frame volume and detune runs written as envelope tables: each note's run of values, one per envelope frame
+/// from its key-on (where SiON's tables start), becomes a reference to a `#TABLE` instead of a slur per frame.
+/// Notes share a table when it plays the same values for as long as they sound, and a run that settles into a
+/// repeating figure (vibrato) loops it (`|`).
+/// - Volume (`na`, absolute: the table sets `x` each frame): `x` and `v` multiply (or, in decibels, add), so
+///   the track's master volume moves to its `v` and the table plays the note's `v` levels in `x`: the same
+///   product. (`x` has 128 steps: only for tracks whose levels fit, and in decibels only with `%x1`.) Only for
+///   tracks whose every note can have one: `x` stays where a table left it until the next table restarts, and
+///   `v` never changes (a `v` sets `x` back to the track's, under a note still releasing). So a release the driver
+///   silences (`Note::cut`) does it from a key-off table (`_na`: the level held, then 0) instead of `v0`.
+/// - Detune (`np`): the pitch offset from the note's start, in 1/64 semitones.
+#[derive(Default)]
+pub struct Envelopes {
+    /// `#TABLE` definitions.
+    pub header: Vec<String>,
+    /// (track, note) → its volume table, its key-off volume table (silencing its release), its pitch table.
+    vol: HashMap<(usize, usize), usize>,
+    cut: HashMap<(usize, usize), usize>,
+    pitch: HashMap<(usize, usize), usize>,
+    /// Tracks with volume tables → their `v` (the master volume).
+    master: HashMap<usize, u16>,
+}
+
+/// A table's values and its loop point (the values from there repeat; without one the last value holds).
+type Table = (Vec<i32>, Option<usize>);
+
+/// What table `t` plays at frame `i` (as SiON steps it).
+fn tval(t: &Table, i: usize) -> i32 {
+    let n = t.0.len();
+    if i < n { t.0[i] } else { match t.1 { Some(l) => t.0[l + (i - l) % (n - l)], None => t.0[n - 1] } }
+}
+
+/// The shortest table that plays `s` for its length: a prefix, then a loop of the figure it settles into.
+fn shortest(s: &[i32]) -> Table {
+    let n = s.len();
+    // (A held last value needs no loop.)
+    let mut hold = n;
+    while hold > 1 && s[hold - 1] == s[hold - 2] { hold -= 1 }
+    let mut best: Table = (s[..hold].to_vec(), None);
+    for p in 2..=(n / 2).min(256) {
+        // The earliest point from which `s` repeats with period `p` to its end.
+        let mut from = n;
+        while from > p && s[from - 1] == s[from - 1 - p] { from -= 1 }
+        let l = from - p;
+        if l + p < best.0.len() { best = (s[..l + p].to_vec(), Some(l)) }
+    }
+    best
+}
+
+impl Arranged {
+    /// The envelope tables for the tracks' per-frame runs (see `Envelopes`), in the table numbers left free.
+    /// `lines`: a note keeps the table before it only within a line (see below).
+    pub fn envelopes(&self, lines: bool) -> Envelopes {
+        let mut env = Envelopes::default();
+        let Some((f, fps)) = self.frame else { return env };
+        let frames = |n: &Note| (n.end - n.start).div_ceil(f) as usize;
+        let at = |n: &Note, t: u64| (t - n.start) % f == 0;
+        // Runs: (kind, values, track, note); kinds: 0 volume, 1 key-off volume, 2 pitch.
+        let mut runs: Vec<(u8, Vec<i32>, usize, usize)> = vec![];
+        for (ti, tr) in self.tracks.iter().enumerate().filter(|(_, t)| t.drum.is_none()) {
+            // Volume: the notes' `v` levels, in `x`. (Linear `v` in 256 steps fits `x` up to 128; with `v` in
+            // decibels `x` has to be too.)
+            let fits = |n: &Note| n.v <= 128 && n.vols.iter().all(|v| v.1 <= 128 && at(n, v.0)) && n.cut.is_none_or(|c| (c - n.end) % f == 0);
+            let scale = if tr.vmax == 256 { !tr.kmilli } else { tr.xdb };
+            if scale && !tr.piped && tr.notes.iter().any(|n| !n.vols.is_empty()) && tr.notes.iter().all(fits) {
+                for (ni, n) in tr.notes.iter().enumerate() {
+                    let (mut v, mut it) = (n.v, n.vols.iter().peekable());
+                    let run: Vec<i32> = (0..frames(n)).map(|j| {
+                        while let Some(c) = it.next_if(|c| c.0 <= n.start + j as u64 * f) { v = c.1 }
+                        v as i32
+                    }).collect();
+                    // (From the key-off: the level the note ended at until the cut, then silence.)
+                    if let Some(c) = n.cut { let mut r = vec![v as i32; ((c - n.end) / f) as usize]; r.push(0); runs.push((1, r, ti, ni)) }
+                    runs.push((0, run, ti, ni));
+                }
+                env.master.insert(ti, tr.x.unwrap_or(128) as u16);
+            }
+            for (ni, n) in tr.notes.iter().enumerate() {
+                if tr.kmilli || n.bends.is_empty() || n.ptab.is_some() || !n.bends.iter().all(|b| at(n, b.0)) { continue }
+                let (mut k, mut it) = (n.k0, n.bends.iter().peekable());
+                let run = (0..frames(n)).map(|j| {
+                    while let Some(c) = it.next_if(|c| c.0 <= n.start + j as u64 * f) { k = c.1 }
+                    k - n.k0
+                }).collect();
+                runs.push((2, run, ti, ni));
+            }
+        }
+        // Longest first, so shorter runs find a table that starts as they do.
+        runs.sort_by(|a, b| (b.0, b.1.len()).cmp(&(a.0, a.1.len())));
+        // (Key-off volume tables are volume tables too: they share.)
+        let mut tables: Vec<(bool, Table, usize)> = vec![];
+        let mut free = self.free.iter();
+        // (Volume tables a track can't have all of: none for it.)
+        let mut failed: HashSet<usize> = HashSet::new();
+        for (kind, run, ti, ni) in &runs {
+            let vol = *kind < 2;
+            if vol && failed.contains(ti) { continue }
+            let found = tables.iter().find(|t| t.0 == vol && run.iter().enumerate().all(|(i, &x)| tval(&t.1, i) == x)).map(|t| t.2);
+            let id = found.or_else(|| {
+                // (A table is for an envelope, not a whole part: past `MAX_TABLE` values the note keeps its slurs.)
+                let t = shortest(run);
+                if t.0.len() > MAX_TABLE { return None }
+                let id = *free.next()?;
+                tables.push((vol, t, id));
+                Some(id)
+            });
+            match (id, kind) {
+                (Some(id), 0) => { env.vol.insert((*ti, *ni), id); }
+                (Some(id), 1) => { env.cut.insert((*ti, *ni), id); }
+                (Some(id), _) => { env.pitch.insert((*ti, *ni), id); }
+                (None, 2) => {}
+                (None, _) => { failed.insert(*ti); }
+            }
+        }
+        env.vol.retain(|k, _| !failed.contains(&k.0));
+        env.cut.retain(|k, _| !failed.contains(&k.0));
+        // A pitch table has to be shorter to write than the slurs it replaces (about `SLUR` characters a change),
+        // with a reference (`np12`) per note that uses it.
+        let mut gain: HashMap<usize, i64> = HashMap::new();
+        for (&(ti, ni), &id) in &env.pitch { *gain.entry(id).or_default() += SLUR * self.tracks[ti].notes[ni].bends.len() as i64 - 5 }
+        for (_, t, id) in tables.iter().filter(|t| !t.0) {
+            if gain.get(id).is_some_and(|&g| g < 12 + text_len(t)) { env.pitch.retain(|_, v| v != id) }
+        }
+        env.master.retain(|k, _| !failed.contains(k));
+        // A note keeps the table the note before it had wherever that plays its values too (a note without
+        // vibrato under a vibrato that starts later, an envelope cut short): fewer table changes to read. (With
+        // `lines`, within a line only: a line that comes back then starts the same wherever it is, and stays a loop
+        // or macro.)
+        let mut bounds: Vec<u64> = if lines { self.sections.iter().copied().chain(self.lp).collect() } else { vec![] };
+        bounds.sort_unstable();
+        let tab_of: HashMap<usize, &Table> = tables.iter().map(|t| (t.2, &t.1)).collect();
+        let plays = |id: usize, run: &[i32]| run.iter().enumerate().all(|(i, &x)| tval(tab_of[&id], i) == x);
+        let run_of: HashMap<(u8, usize, usize), &[i32]> = runs.iter().map(|r| ((r.0, r.2, r.3), &r.1[..])).collect();
+        for (ti, tr) in self.tracks.iter().enumerate() {
+            let (mut cv, mut cc, mut cp): (Option<usize>, Option<usize>, Option<usize>) = (None, None, None);
+            for (ni, n) in tr.notes.iter().enumerate() {
+                let prev = ni.checked_sub(1).map_or(0, |p| tr.notes[p].start);
+                if ni == 0 || bounds[bounds.partition_point(|&b| b <= prev)..].first().is_some_and(|&b| b <= n.start) { (cv, cc, cp) = (None, None, None) }
+                if env.master.contains_key(&ti) {
+                    if let (Some(c), Some(run)) = (cv, run_of.get(&(0, ti, ni))) { if plays(c, run) { env.vol.insert((ti, ni), c); } }
+                    cv = env.vol.get(&(ti, ni)).copied();
+                    if let (Some(c), Some(run)) = (cc, run_of.get(&(1, ti, ni))) { if plays(c, run) { env.cut.insert((ti, ni), c); } }
+                    cc = env.cut.get(&(ti, ni)).copied();
+                }
+                let zeros = vec![0; frames(n)];
+                let run = run_of.get(&(2, ti, ni)).copied().or((n.bends.is_empty() && n.ptab.is_none()).then_some(&zeros[..]));
+                if let (Some(c), Some(run)) = (cp, run) { if plays(c, run) { env.pitch.insert((ti, ni), c); } }
+                cp = env.pitch.get(&(ti, ni)).copied();
+            }
+        }
+        let used: HashSet<usize> = env.vol.values().chain(env.cut.values()).chain(env.pitch.values()).copied().collect();
+        tables.sort_by_key(|t| t.2);
+        for (_, t, id) in tables.iter().filter(|t| used.contains(&t.2)) { env.header.push(format!("#TABLE{id}{{{}}}", table_body(t))) }
+        // (Only the tables step at the frame rate: without them it needn't be said.)
+        if fps != 60 && !env.header.is_empty() { env.header.insert(0, format!("#FPS{{{fps}}}")) }
+        env
+    }
+}
+
+/// Most values a volume or pitch table holds (before its loop repeats).
+const MAX_TABLE: usize = 256;
+/// What a change written as a slur costs, about (`&k5o6d24`).
+const SLUR: i64 = 8;
+
+/// A `#TABLE`'s numbers, the loop point marked. (SiON reads a value as `(int)(v + 0.5)`: a negative one is
+/// written a step lower.)
+fn table_body((vals, lp): &Table) -> String {
+    let text = |v: i32| if v < 0 { (v - 1).to_string() } else { v.to_string() };
+    vals.iter().enumerate().map(|(i, &v)| if Some(i) == *lp { format!("|{}", text(v)) } else { text(v) }).collect::<Vec<_>>().join(",")
+}
+
+/// Length of a table's definition as written (runs compacted).
+fn text_len(t: &Table) -> i64 { crate::mml::compact(&format!("#TABLE0{{{}}}", table_body(t))).len() as i64 }
 
 /// A value's changes while a note sounds (from `start` to `end`): the last at or before `start` becomes `init`,
 /// and of changes on the same tick only the last counts; ones that repeat the value before them are left out.
@@ -311,14 +523,26 @@ fn thin(k0: i32, b: impl Iterator<Item = (u64, i32)>, s: u64, e: u64, step: u64)
 
 /// The track as tokens. With `gate` the key-off times are encoded through `q` and `@q` where shorter (choosing
 /// their states by dynamic programming, each change of state costing that many characters more: a readable
-/// track keeps its gate); otherwise every gap is an explicit rest under `q8`.
-pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths) -> Vec<Tok> {
+/// track keeps its gate); otherwise every gap is an explicit rest under `q8`. With `envs` (the song's tables and
+/// this track's number) the notes' per-frame runs that have a table play from it instead of slurs; or, without
+/// `tables`, as slurs with the levels the tables would hold in `x` (the plain MML for the same arithmetic).
+pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths, envs: Option<(&Envelopes, usize)>, tables: bool) -> Vec<Tok> {
     let mut out = vec![];
     match tr.drum { Some(true) => out.push(Tok::Cmd("q0".into())), Some(false) => out.push(Tok::Cmd("q8".into())), None if gate.is_none() => out.push(Tok::Cmd("q8".into())), None => {} }
-    if let Some(x) = tr.x { out.push(Tok::Cmd(format!("x{x}"))) }
+    // (A track with volume tables has its master volume in `v`: see `Envelopes`.)
+    let master = envs.and_then(|(e, ti)| e.master.get(&ti).copied());
+    if let Some(x) = tr.x.filter(|_| master.is_none()) { out.push(Tok::Cmd(format!("x{x}"))) }
+    // (Set before anything else, so it's the track's one `v`: the loop point has it too.)
+    let mut v = tr.vmax;
+    if let Some(m) = master.filter(|&m| m != tr.vmax) { out.push(Tok::Cmd(format!("v{m}"))); v = m }
+    // (Levels in `x`, without tables: written as `x` commands.)
+    let (xform, mut xl) = (master.is_some() && !tables, 128u16);
     let (mut t, mut tempo) = (0, tr.tempo.iter().peekable());
-    let (mut instr, mut v, mut pan, mut ptab, mut env, mut k, mut ph) = ("", tr.vmax, 0, None, "", 0, (0.0, 0.0));
+    let (mut instr, mut pan, mut ptab, mut env, mut k, mut ph) = ("", 0, None, "", 0, (0.0, 0.0));
     let (mut lfo, mut rtab, mut cut): ((i32, i32), Option<usize>, Option<u64>) = ((0, 0), None, None);
+    let (mut vtab, mut ctab): (Option<usize>, Option<usize>) = (None, None);
+    let vtab_cmd = |t: Option<usize>| t.map_or("na".into(), |t| format!("na{t}"));
+    let ctab_cmd = |t: Option<usize>| t.map_or("_na".into(), |t| format!("_na{t}"));
     let lfo_cmds = |out: &mut Vec<Tok>, cur: &mut (i32, i32), to: (i32, i32)| {
         if to.0 != cur.0 { out.push(Tok::Cmd(format!("mp{}", to.0))) }
         if to.1 != cur.1 { out.push(Tok::Cmd(format!("ma{}", to.1))) }
@@ -338,11 +562,11 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths) -> Vec<Tok> {
         if until > *t { out.push(Tok::Rest((until - *t) as u32)); *t = until }
     };
     // The loop point (`$`), and the channel state there, which the end of the track restores before going back.
-    struct Snap<'a> { instr: &'a str, env: &'a str, v: u16, pan: i32, ptab: Option<u8>, k: i32, ph: (f64, f64), lfo: (i32, i32), rtab: Option<usize> }
+    struct Snap<'a> { instr: &'a str, env: &'a str, v: u16, xl: u16, pan: i32, ptab: Option<u8>, k: i32, ph: (f64, f64), lfo: (i32, i32), rtab: Option<usize>, vtab: Option<usize>, ctab: Option<usize> }
     let mut mark: Option<Snap> = None;
     macro_rules! loop_point { () => {{
         out.push(Tok::Cmd("$".into()));
-        mark = Some(Snap { instr, env, v, pan, ptab, k, ph, lfo, rtab });
+        mark = Some(Snap { instr, env, v, xl, pan, ptab, k, ph, lfo, rtab, vtab, ctab });
     }} }
     // Rest until `until`, putting the loop point on the way.
     macro_rules! advance { ($until:expr) => {{
@@ -354,9 +578,13 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths) -> Vec<Tok> {
         }
         rest_to(&mut out, &mut t, until, true, &mut tempo);
     }} }
-    for n in &tr.notes {
+    for (ni, n) in tr.notes.iter().enumerate() {
+        let tabs = envs.filter(|_| tables).map(|(e, ti)| (e.vol.get(&(ti, ni)).copied(), e.pitch.get(&(ti, ni)).copied(), e.cut.get(&(ti, ni)).copied()));
+        let (ntab, npt, nctab) = tabs.unwrap_or((None, None, None));
+        let nv = master.unwrap_or(n.v);
+        let nptab = npt.map(|t| t as u8).or(n.ptab);
         // The previous note's release silenced (on the chip, by its driver) before this note.
-        if let Some(c) = cut.take().filter(|&c| c < n.start) { advance!(c); out.push(Tok::Cmd("v0".into())); v = 0 }
+        if let Some(c) = cut.take().filter(|&c| c < n.start) { advance!(c); if xform { out.push(Tok::Cmd("x0".into())); xl = 0 } else { out.push(Tok::Cmd("v0".into())); v = 0 } }
         advance!(n.start);
         // A module change (`%`) resets the tone and envelope; so going back to the module's defaults needs one.
         // (Both also reset the LFO: `%` the whole channel, `@lfo` in a tone its depths.)
@@ -369,14 +597,18 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths) -> Vec<Tok> {
         }
         lfo_cmds(&mut out, &mut lfo, n.lfo0);
         if n.rtab != rtab { out.push(Tok::Cmd(rtab_cmd(n.rtab))); rtab = n.rtab }
-        if n.v != v { out.push(Tok::Cmd(format!("v{}", n.v))); v = n.v }
+        if ntab != vtab { out.push(Tok::Cmd(vtab_cmd(ntab))); vtab = ntab }
+        if master.is_some() && nctab != ctab { out.push(Tok::Cmd(ctab_cmd(nctab))); ctab = nctab }
+        if nv != v { out.push(Tok::Cmd(format!("v{nv}"))); v = nv }
+        if xform && n.v != xl { out.push(Tok::Cmd(format!("x{}", n.v))); xl = n.v }
         if n.pan != pan { out.push(Tok::Cmd(format!("@p{}", n.pan))); pan = n.pan }
-        if n.ptab != ptab { out.push(Tok::Cmd(ptab_cmd(n.ptab))); ptab = n.ptab }
+        if nptab != ptab { out.push(Tok::Cmd(ptab_cmd(nptab))); ptab = nptab }
         if n.k0 != k { out.push(Tok::Cmd(kcmd(n.k0))); k = n.k0 }
         if (n.ofs, n.plen) != ph { ph = (n.ofs, n.plen); out.push(Tok::Cmd(ph_cmd(ph))) }
         // Pieces joined by slurs where the pitch bend or volume changes or a tempo change falls mid-note.
         let first = out.len();
-        let (mut bend, mut vols, mut pans) = (n.bends.iter().peekable(), n.vols.iter().peekable(), n.pans.iter().peekable());
+        let (bends, vls) = (if npt.is_some() { &[][..] } else { &n.bends[..] }, if ntab.is_some() { &[][..] } else { &n.vols[..] });
+        let (mut bend, mut vols, mut pans) = (bends.iter().peekable(), vls.iter().peekable(), n.pans.iter().peekable());
         let (mut lfos, mut waves) = (n.lfos.iter().peekable(), n.waves.iter().peekable());
         let mut at = n.start;
         // A bend of a semitone or more moves the slur to the nearer note (`c&d`) instead of a large `k`.
@@ -402,7 +634,8 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths) -> Vec<Tok> {
                 if nk != k { out.push(Tok::Cmd(kcmd(nk))); k = nk }
             }
             while let Some(&(_, nv)) = vols.next_if(|b| b.0 == split) {
-                if nv != v { out.push(Tok::Cmd(format!("v{nv}"))); v = nv }
+                if xform { if nv != xl { out.push(Tok::Cmd(format!("x{nv}"))); xl = nv } }
+                else if nv != v { out.push(Tok::Cmd(format!("v{nv}"))); v = nv }
             }
             while let Some(&(_, np)) = pans.next_if(|b| b.0 == split) {
                 if np != pan { out.push(Tok::Cmd(format!("@p{np}"))); pan = np }
@@ -416,10 +649,11 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths) -> Vec<Tok> {
         out.push(Tok::Note { key: key as u8, len: (n.end - at) as u32, slur: false });
         gates.push((first, out.len() - 1));
         t = n.end;
-        cut = n.cut;
+        // (A volume-table track silences the release by its key-off table.)
+        cut = n.cut.filter(|_| master.is_none() || xform);
     }
     // (After the last note, only within the song.)
-    if let Some(c) = cut.filter(|&c| c <= tr.end) { advance!(c); out.push(Tok::Cmd("v0".into())); v = 0 }
+    if let Some(c) = cut.filter(|&c| c <= tr.end) { advance!(c); if xform { out.push(Tok::Cmd("x0".into())); xl = 0 } else { out.push(Tok::Cmd("v0".into())); v = 0 } }
     let rest: Vec<u64> = tempo.clone().map(|x| x.0).collect();
     if let Some(&end) = rest.last() { advance!(end) }
     if tr.end > t || tr.lp.is_some() { advance!(tr.end) }
@@ -433,7 +667,10 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths) -> Vec<Tok> {
             if s.ph != ph { out.push(Tok::Cmd(ph_cmd(s.ph))) }
         }
         if s.rtab != rtab { out.push(Tok::Cmd(rtab_cmd(s.rtab))) }
+        if s.vtab != vtab { out.push(Tok::Cmd(vtab_cmd(s.vtab))) }
+        if s.ctab != ctab { out.push(Tok::Cmd(ctab_cmd(s.ctab))) }
         if s.v != v { out.push(Tok::Cmd(format!("v{}", s.v))) }
+        if xform && s.xl != xl { out.push(Tok::Cmd(format!("x{}", s.xl))) }
         if s.pan != pan { out.push(Tok::Cmd(format!("@p{}", s.pan))) }
         if s.ptab != ptab { out.push(Tok::Cmd(ptab_cmd(s.ptab))) }
         if s.k != k { out.push(Tok::Cmd(kcmd(s.k))) }
@@ -539,4 +776,22 @@ fn gate_dp(out: &mut Vec<Tok>, gates: &[(usize, usize)], lens: &Lengths, steady:
         res.push(tok);
     }
     *out = res;
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::{shortest, tval};
+
+    #[test]
+    fn runs_become_the_shortest_table_that_plays_them() {
+        // A vibrato after a delay loops its figure; a decay that settles holds its last value; each plays the run.
+        let vib: Vec<i32> = [0, 0, 0].into_iter().chain([4, 8, 4, 0, -4, -8, -4, 0].repeat(5)).take(39).collect();
+        let decay = vec![20, 16, 13, 10, 10, 10, 10];
+        for run in [vib, decay, vec![5], vec![1, 2, 1, 2, 1]] {
+            let t = shortest(&run);
+            assert!(run.iter().enumerate().all(|(i, &x)| tval(&t, i) == x), "{run:?} → {t:?}");
+        }
+        assert_eq!(shortest(&[20, 16, 13, 10, 10, 10, 10]), (vec![20, 16, 13, 10], None));
+        assert_eq!(shortest(&[0, 0, 0, 4, 8, 4, 0, -4, -8, -4, 0, 4, 8, 4, 0, -4, -8, -4, 0, 4]).1, Some(2));
+    }
 }

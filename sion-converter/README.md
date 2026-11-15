@@ -31,6 +31,23 @@ volume and layout handling. Each line is one section of the source: a tracker pa
 automatic volume would still clip (FM voices and some waveforms come out louder than estimated), the result is
 rendered and the master volume (`x`) is lowered until it doesn't.
 
+Per-frame changes become envelope tables where they play exactly the same (`Arranged::envelopes` in
+`src/arrange.rs`): when the song keeps one tempo and its notes' volume and detune changes fall on a grid of whole
+samples that SiON's table clock can step on (`#FPS`, 60 by default: a 1/60 s driver frame is 735 samples), each
+note's run of levels becomes an `na` table and its run of detunes an `np` table, instead of a slur per frame
+(`v16e-&v20e-24&v16e-32&v13e-32&...` → `na12 e-8`). SiON starts a table at the key-on and steps it every frame,
+which is where the driver changed the chip. Notes share a table when it plays their values for as long as they
+sound, a run that settles into a repeating figure (a vibrato) loops it (`|`), and a note keeps the table before it
+when that one plays its values too. A pitch table is used only where it is shorter to write than its slurs.
+
+- Volume tables set `x`, which multiplies with `v` (or adds, in decibels): a track with them has its master volume
+  as its one `v` and the notes' levels in its tables, the same product (in decibels with `#VMODE{%x1}`, so `x`
+  steps as `v` does). A release the driver silences is a key-off table (`_na`: the level held, then 0), so `v`
+  never changes under a releasing note. A track gets volume tables only if all its notes can (levels up to 128).
+- `--verify` checks the tables against the plain MML, which plays the same runs as slurs (with the levels in `x`).
+- VGM songs whose driver runs on the 60 Hz (or 50 Hz) frame get them; NSF (the NES frame is 733.8 samples), SPC,
+  MIDI and songs timed by the YM2612's timers don't (their frames aren't whole samples), and keep the slurs.
+
 ## WebAssembly
 
 `./build-wasm.sh` builds the converter as `convert.wasm` (needs the nightly toolchain with the
@@ -104,7 +121,8 @@ $
 - A note is cut at a line's end only where that sounds the same, as a slur (`c&` / `c`) into the next line: not
   under a pitch table (`np`; a slurred note starts from its own pitch, not where the table has taken it) or a gate
   other than `q8` (drum hits: each piece would be keyed off at its own gate). Those notes run on into the next line.
-- Data is written compactly, decoding to exactly the same values: runs of one value in `#WAV` and `#TABLE` as
+- Data is written compactly, decoding to exactly the same values: runs of one value in `#WAV` and `#TABLE` (on
+  each side of a table's loop point) as
   `(v)n` (which SiON and GDSiON both read as `n` copies; GDSiON crashes on `[v]n`, and `(v,v)n` rounds negative
   values differently), and `#PCMB` arguments at their defaults left off the end.
 
@@ -188,7 +206,8 @@ patch at different volumes share one voice. The song is played once, without its
   within 0.5%), each channel's vibrato depth (PMS) as `mp` and tremolo depth (AMS) as `ma` on the operators that have
   amplitude modulation on (`a1` in the voice). Depth changes during a note (a driver's delayed vibrato) are written
   mid-note, and turning the LFO off is `mp0`/`ma0`.
-- Volumes are in decibels (`#VMODE{%v1,1}`: `v0`..`v128` in 0.75 dB steps, the YM2612's own total-level step),
+- Volumes are in decibels (`#VMODE{%v1,1}`, with `%x1` where volume tables need `x` in decibels too: `v0`..`v128`
+  in 0.75 dB steps, the YM2612's own total-level step),
   so FM levels are exact and the PSG's 2 dB steps within 0.4 dB; songs with samples keep 256 linear steps,
   which a sample needs to come out as the chip played it.
 - Mega Drive songs (YM2612, SN76489) get a high shelf on the master, `#EFFECT0{hb9000,1,-3}`: libvgm, which

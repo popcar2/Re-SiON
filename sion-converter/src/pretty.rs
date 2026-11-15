@@ -26,7 +26,9 @@ fn kind(c: &str) -> Option<&'static str> {
         _ if c.starts_with("@v") => "fv",
         _ if c.starts_with('@') => "env",
         _ if c.starts_with("_np") => "rtab",
+        _ if c.starts_with("_na") => "ctab",
         _ if c.starts_with("np") => "ptab",
+        _ if c.starts_with("na") => "vtab",
         _ if c.starts_with("mp") => "mp",
         _ if c.starts_with("ma") => "ma",
         _ if c.starts_with('v') => "v",
@@ -41,7 +43,7 @@ fn kind(c: &str) -> Option<&'static str> {
 /// The tone: set where it changes, not restated.
 const TONE: [&str; 6] = ["instr", "env", "lfo", "ph", "mp", "ma"];
 
-const KINDS: [&str; 15] = ["x", "q", "qa", "instr", "env", "lfo", "fv", "ph", "mp", "ma", "rtab", "ptab", "v", "pan", "k"];
+const KINDS: [&str; 17] = ["x", "q", "qa", "instr", "env", "lfo", "fv", "ph", "mp", "ma", "rtab", "ptab", "vtab", "ctab", "v", "pan", "k"];
 
 #[derive(Clone, Default, PartialEq)]
 struct State(HashMap<&'static str, String>);
@@ -160,10 +162,17 @@ impl Writer<'_> {
         }
         let sounds = toks.iter().any(|t| matches!(t, Tok::Note { .. }));
         let reset = toks[..first].iter().any(|t| matches!(t, Tok::Cmd(x) if x.starts_with('%')));
+        // (A tone with an LFO rate, or the rate alone, resets the LFO's depths: written again after it.)
+        let mut lfo_reset = false;
         for k in KINDS {
             let Some(c) = st.0.get(k) else { continue };
             let changed = entry.0.get(k) != Some(c);
-            if TONE.contains(&k) { if changed || reset { head += c } }
+            if TONE.contains(&k) {
+                if changed || reset || (lfo_reset && matches!(k, "mp" | "ma")) {
+                    head += c;
+                    lfo_reset |= k == "lfo" || (k == "env" && c.contains("@lfo"));
+                }
+            }
             // (A line of rests only needn't restate anything: the next line does.)
             else if (restate.contains(&k) && sounds) || changed { head += c }
         }
@@ -323,18 +332,20 @@ pub fn write(title: &str, header: &[String], tracks: &[(String, &[Tok])], sectio
         let mut init: Vec<String> = vec![];
         // (Restated state starts at SiON's defaults, so the first line states it too.)
         let mut st = State::default();
-        for (k, d) in [("v", format!("v{vmax}")), ("pan", "@p0".into()), ("k", "k0".into()), ("mp", "mp0".into()), ("ma", "ma0".into()), ("ptab", "np".into()), ("rtab", "_np".into()), ("qa", "@q0".into())] {
+        for (k, d) in [("v", format!("v{vmax}")), ("pan", "@p0".into()), ("k", "k0".into()), ("mp", "mp0".into()), ("ma", "ma0".into()), ("ptab", "np".into()), ("vtab", "na".into()), ("ctab", "_na".into()), ("rtab", "_np".into()), ("qa", "@q0".into())] {
             if restate.contains(&k) { st.0.insert(k, d); }
         }
         let mut rest = vec![];
         // (The first line goes before the loop point. A tone set after it is set again on every pass, where `%`
         // resets the channel, cutting a release still sounding at the loop's end: it stays there.)
-        let mut looped = false;
+        // (Nor does a tone command once one before it stays: an `@lfo` resets the `mp` after it.)
+        let (mut looped, mut kept) = (false, false);
         for (i, t) in toks.iter().enumerate() {
             looped |= matches!(t, Tok::Cmd(c) if c == "$");
             match t {
                 Tok::Cmd(c) if i < first_note && c != "$" => match kind(c) {
-                    Some(k) if !restate.contains(&k) && (!TONE.contains(&k) || (tone_init.contains(&k) && !looped)) => { init.push(c.clone()); st.set(k, c) }
+                    Some(k) if !restate.contains(&k) && (!TONE.contains(&k) || (tone_init.contains(&k) && !looped && !kept)) => { init.push(c.clone()); st.set(k, c) }
+                    Some(k) if TONE.contains(&k) => { kept = true; rest.push(t.clone()) }
                     // (Tempo at the start goes on the first line too.)
                     None if c.starts_with('t') => init.insert(0, c.clone()),
                     _ => rest.push(t.clone()),

@@ -315,9 +315,13 @@ Define a table with `#TABLEn{...}`, then apply it per step to a note:
 | `nf` | Filter cutoff. |
 | `@@` | Tone number. |
 
-Prefix with `_` (`_na`) for the release part of the note. `!na` makes amplitude values absolute. A table can
-also be written inline: `na{0,8,16}`. Table syntax supports `(a,b)n` interpolation, `[...]n` repeats, a `|`
-loop point and a `*scale+offset` suffix.
+Prefix with `_` (`_na`) for the release part of the note. `na` values set the expression (`x`, 0..128) itself;
+`!na` adds them to the track's `x`. A table can also be written inline: `na{0,8,16}`. Table syntax supports
+`(a,b)n` interpolation, `[...]n` repeats, a `|` loop point and a `*scale+offset` suffix.
+
+As in SiON, a table's first value applies at the key-on (or key-off, for `_` tables) and each next one an
+envelope frame later (`#FPS`, `@fps`: 735 samples at the default 60), and values are read as `(int)(v + 0.5)`, so
+a negative value comes out one higher (`-10` plays as -9; write `-11` for -10).
 
 ### Definitions (`#` statements)
 

@@ -158,6 +158,9 @@ fn data_written_compactly() {
     assert_eq!(compact("#TABLE3{1,1,1,1}"), "#TABLE3{(1)4}");
     assert_eq!(compact("#TABLE2{(0,-768)4 -768}"), "#TABLE2{(0,-768)4 -768}");
     assert_eq!(compact("#OPN@0{1,1,1,1}"), "#OPN@0{1,1,1,1}");
+    // (Runs stop at a table's loop point.)
+    assert_eq!(compact("#TABLE4{0,0,0,0,|5,5,5,5,-3}"), "#TABLE4{(0)4,|(5)4,-3}");
+    assert_eq!(compact("#TABLE5{|7,7,7,7,8}"), "#TABLE5{|(7)4,8}");
     // `#PCMB` arguments at their defaults (key 60, no loop, flags 0, level 0) left off the end.
     assert_eq!(compact("#PCMB0{AAAA}8400,60,-1,0"), "#PCMB0{AAAA}8400");
     assert_eq!(compact("#PCMB1{AAAA}8400,60,10,0"), "#PCMB1{AAAA}8400,60,10");

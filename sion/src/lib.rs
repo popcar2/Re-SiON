@@ -472,7 +472,7 @@ impl Track {
             at: 0.0, koff: INF, kon: INF, q: (sh.quant * 3 / 4) as f64 / sh.quant as f64, qc: 0.0, kd: 0.0,
             oct: 5, len: 480, ns: 0, vel: 256, vsh: sh.vmode.2, x: 128, kt: 0, k: 0, kf: 0.0, note: 0, slur: false, md: 0, tone: 0,
             set: [[None; 5]; 2], xoff: [false; 2], sweep: [0; 2], swe0: 0.0, modt: [None, None], env: [None; 5], menv: None,
-            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 0.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0, src: -1,
+            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 1.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0, src: -1,
             ch: Chan::new(), dc: Declick::new(64),
         };
         t.ch.vm = (sh.vmode.0, sh.vmode.1);
@@ -524,7 +524,7 @@ impl Track {
         self.xo = if self.xoff[on] { self.x } else { 0 };
         self.pact = self.sweep[on] != 0 || self.set[on][2].is_some() || self.set[on][3].is_some();
         if self.env[4].is_some() { self.ch.f_on = true }
-        self.res = 0.0;
+        self.res = 1.0;
     }
 
     fn key_on(&mut self, sh: &Shared) {
