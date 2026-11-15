@@ -1,6 +1,6 @@
 <!doctype html>
-<!-- The home page of the SiON player for the browser. Serve this folder over HTTP (e.g. `python3 -m http.server`),
-     then open it. Uses the same files as songs.html (style.css, player.js, the workers, sion.wasm, songs.json, songs/). -->
+<!-- The home page of the SiON player for the browser. Serve this folder with `python3 serve.py`
+     (pages are linked without .html), then open it. Uses the same files as songs.html (style.css, js/, wasm/sion.wasm, songs/ with songs.json). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -18,7 +18,7 @@
 <main>
   <header>
     <h1><a href="./" aria-current="page">SiON</a></h1>
-    <nav><a href="songs.html">Songs</a><a href="playground.html">Playground</a><a href="convert.html">Convert</a><a href="docs.html">Docs</a></nav>
+    <nav><a href="songs">Songs</a><a href="playground">Playground</a><a href="convert">Convert</a><a href="docs">Docs</a></nav>
   </header>
   <article>
     <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. SiON is a small player for MML music: give it
@@ -33,9 +33,9 @@
 </main>
 
 <script type="module">
-import { createPlayer } from "./player.js";
+import { createPlayer } from "./js/player.js";
 
-// The examples, by file name in songs/. Their volumes come from songs.json, as on the song list.
+// The examples, by file name in songs/. Their volumes come from songs/songs.json, as on the song list.
 const EXAMPLES = [
   "rect - BOSCONIAN X68k _ Flash Flash Flash.mml",
   "Sonic the Hedgehog 3 (prototype) - Carnival Night Zone Act 1.mml",
@@ -50,7 +50,7 @@ const songs = EXAMPLES.map((file, i) => {
                  : { i, file, volume, artist: name.slice(0, cut), title: name.slice(cut + 3) };
 });
 // The volumes arrive in the background, so the list shows straight away; play() waits for them.
-const volumes = fetch("songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
+const volumes = fetch("songs/songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
   for (const { file, volume = 1 } of list) for (const s of songs) if (s.file === file) s.volume = volume;
 }).catch(() => {});
 

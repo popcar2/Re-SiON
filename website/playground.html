@@ -1,6 +1,6 @@
 <!doctype html>
 <!-- MML playground: write or paste MML and play it, with the notes being played highlighted in the text.
-     Uses the same files as songs.html (style.css, player.js, the workers, sion.wasm, songs/). -->
+     Uses the same files as songs.html (style.css, js/, wasm/sion.wasm, songs/). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -72,7 +72,7 @@
 <main>
   <header>
     <h1><a href="./">SiON</a></h1>
-    <nav><a href="songs.html">Songs</a><a href="playground.html" aria-current="page">Playground</a><a href="convert.html">Convert</a><a href="docs.html">Docs</a></nav>
+    <nav><a href="songs">Songs</a><a href="playground" aria-current="page">Playground</a><a href="convert">Convert</a><a href="docs">Docs</a></nav>
   </header>
   <div class="tools">
     <button class="go" id="run" title="Play from the start (Ctrl+Enter)">
@@ -92,7 +92,7 @@
 </main>
 
 <script type="module">
-import { createPlayer } from "./player.js";
+import { createPlayer } from "./js/player.js";
 const $ = (id) => document.getElementById(id);
 const text = $("mml"), view = $("view");
 
@@ -109,7 +109,7 @@ const EXAMPLES = [
   return { file, title: name.slice(cut + 3), artist: name.slice(0, cut), volume: 1 };
 });
 // The song list's per-song volumes (see songs.html), so examples play as loud as they do there.
-fetch("songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
+fetch("songs/songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
   for (const e of EXAMPLES) e.volume = list.find((s) => s.file === e.file)?.volume ?? 1;
 }).catch(() => {});
 
@@ -125,7 +125,7 @@ t100;           // tempo: 100 beats per minute
 %5@0,40,0,0,40  // attack and release speeds (0-63): each note fades in and out quickly to avoid popping
 v10             // volume: 10 out of 16, so it's not too loud
 l4              // note length: quarter notes, unless a note gives its own (r2 is a half-note rest)
-$ o5 c d e f g a b <c r2 c >b a g f e d c r2;  // o5: starts at the 5th octave
+$ o5 c d e f g a b <c r2 c> b a g f e d c r2;  // o5: starts at the 5th octave
 `;
 
 // ---- Editor ----

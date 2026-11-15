@@ -1,8 +1,8 @@
 <!doctype html>
-<!-- The song list of the SiON player (index.html is the home page). Serve this folder over HTTP (e.g. `python3 -m http.server`), then open it.
-     Needs style.css, player.js, sion.js, sion.wasm, render.js, worklet.js, length.js, songs.json and songs/
-     next to it; playground.html is the MML editor, convert.html the converter (convert.js, convert.wasm,
-     convert-worker.js), and docs.html the library docs. -->
+<!-- The song list of the SiON player (index.html is the home page). Serve this folder with `python3 serve.py` (pages are linked
+     without .html), then open it. Needs style.css, js/ (player.js, sion.js, render.js, worklet.js, length.js),
+     wasm/sion.wasm and songs/ (with songs.json) next to it; playground.html is the MML editor, convert.html the converter
+     (js/convert.js, wasm/convert.wasm, js/convert-worker.js), and docs.html the library docs. -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -14,18 +14,18 @@
 <main>
   <header>
     <h1><a href="./">SiON</a></h1>
-    <nav><a href="songs.html" aria-current="page">Songs</a><a href="playground.html">Playground</a><a href="convert.html">Convert</a><a href="docs.html">Docs</a></nav>
+    <nav><a href="songs" aria-current="page">Songs</a><a href="playground">Playground</a><a href="convert">Convert</a><a href="docs">Docs</a></nav>
   </header>
   <ol class="songs" id="list"></ol>
 </main>
 
 <script type="module">
-import { createPlayer } from "./player.js";
+import { createPlayer } from "./js/player.js";
 
-// songs.json: [{file, volume}], written by the desktop player's build (build.rs), which measures each song
+// songs/songs.json: [{file, volume}], written by the desktop player's build (build.rs), which measures each song
 // to find the volume that brings it to a common loudness.
 // (no-cache: revalidate with the server, so a song added or reconverted shows up without a hard refresh.)
-const files = await (await fetch("songs.json", { cache: "no-cache" })).json();
+const files = await (await fetch("songs/songs.json", { cache: "no-cache" })).json();
 const songs = files.map(({ file, volume = 1 }, i) => {
   const name = file.replace(/\.(sion)?mml$/i, "");
   const cut = name.indexOf(" - ");

@@ -7,12 +7,12 @@ authors = ["popcar2"]
 edition = "2021"
 
 [dependencies]
-sion = { path = "../../sion", features = ["small"] }
+sion = { path = "../sion", features = ["small"] }
 tinyaudio = "1"
 
 [build-dependencies]
 # build.rs measures each song's loudness to set its volume.
-sion = { path = "../../sion" }
+sion = { path = "../sion" }
 
 [profile.release]
 opt-level = "z"

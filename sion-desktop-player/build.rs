@@ -1,6 +1,6 @@
 //! Measures every song in `songs/` and picks a volume that brings it to a common loudness, so no song is
 //! much louder or quieter than the rest. The volumes are built into the desktop player (`volumes.rs` in
-//! OUT_DIR) and written, with the song list, to the web player's `songs.json`.
+//! OUT_DIR) and written, with the song list, to the web player's `songs/songs.json`.
 
 use std::{fs, path::Path, thread};
 
@@ -24,7 +24,7 @@ fn volume(mml: &str) -> f32 {
 }
 
 fn main() {
-    let (songs, web) = (Path::new("songs"), Path::new("../web-sion-player"));
+    let (songs, web) = (Path::new("songs"), Path::new("../website"));
     println!("cargo::rerun-if-changed=songs");
     println!("cargo::rerun-if-changed={}", web.join("songs").display());
     let list = |dir: &Path| {
@@ -46,6 +46,8 @@ fn main() {
     if web.join("songs").is_dir() {
         let json = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         let rows: Vec<String> = list(&web.join("songs")).iter().map(|n| format!("{{\"file\": \"{}\", \"volume\": {:.3}}}", json(n), lookup(n))).collect();
-        fs::write(web.join("songs.json"), format!("[\n{}\n]\n", rows.join(",\n"))).unwrap();
+        // Only when it changes: songs.json sits in songs/, which reruns this script whenever anything in it is touched.
+        let (path, text) = (web.join("songs/songs.json"), format!("[\n{}\n]\n", rows.join(",\n")));
+        if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) { fs::write(path, text).unwrap(); }
     }
 }

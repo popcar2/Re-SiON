@@ -2,7 +2,7 @@
 // From the page: {id, bytes, options}. To the page: {id, result} (see convert.js) or {id, error}.
 import { Converter } from "./convert.js";
 
-const conv = Converter.load(fetch("convert.wasm"));
+const conv = Converter.load(fetch("../wasm/convert.wasm"));
 
 onmessage = async ({ data: { id, bytes, options } }) => {
   try {

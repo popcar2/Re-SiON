@@ -40,11 +40,11 @@ export function createPlayer(hooks = {}) {
   let ctx, node, ready, song = null, id = 0; // song: what's loaded ({title, artist}); id: bumped per song
   let text = null; // the MML of the song loaded, once it has arrived (for the download button)
   // Songs are rendered ahead in a worker (render.js) and handed to the audio worklet, which only copies samples.
-  const renderer = new Worker("render.js", { type: "module" });
+  const renderer = new Worker(new URL("render.js", import.meta.url), { type: "module" });
   let pos = 0, dur = 0, loop = -1, dragging = false; // in frames; dur = 0 until measured, loop = -1 unless it loops
 
   // Song lengths are measured in a worker, so neither the page nor the audio thread stalls.
-  const lengths = new Worker("length.js", { type: "module" });
+  const lengths = new Worker(new URL("length.js", import.meta.url), { type: "module" });
   lengths.onmessage = ({ data }) => {
     if (data.id !== id) return;
     if ("frames" in data) dur = data.frames;
@@ -63,7 +63,7 @@ export function createPlayer(hooks = {}) {
     return ready ??= (async () => {
       // "playback": nothing here is live, so let the browser use its larger, more glitch-proof output buffer.
       ctx = new AudioContext({ sampleRate: RATE, latencyHint: "playback" });
-      await ctx.audioWorklet.addModule("worklet.js");
+      await ctx.audioWorklet.addModule(new URL("worklet.js", import.meta.url));
       node = new AudioWorkletNode(ctx, "sion", { numberOfInputs: 0, outputChannelCount: [2] });
       node.connect(ctx.destination);
       const { port1, port2 } = new MessageChannel();

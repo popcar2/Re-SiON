@@ -1,7 +1,7 @@
 <!doctype html>
 <!-- MML converter: drop a MIDI, tracker module, VGM/VGZ, GYM, S98, NSF/NSFE or SPC file to convert it to SiON MML, then
-     download or play the result. Runs convert.wasm in a worker (convert-worker.js, convert.js); plays through the
-     same player bar as the other pages (player.js and the rest). -->
+     download or play the result. Runs wasm/convert.wasm in a worker (js/convert-worker.js, js/convert.js); plays through
+     the same player bar as the other pages (js/player.js and the rest). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -70,7 +70,7 @@
 <main>
   <header>
     <h1><a href="./">SiON</a></h1>
-    <nav><a href="songs.html">Songs</a><a href="playground.html">Playground</a><a href="convert.html" aria-current="page">Convert</a><a href="docs.html">Docs</a></nav>
+    <nav><a href="songs">Songs</a><a href="playground">Playground</a><a href="convert" aria-current="page">Convert</a><a href="docs">Docs</a></nav>
   </header>
 
   <label class="drop" id="drop" tabindex="0">
@@ -123,7 +123,7 @@
 </main>
 
 <script type="module">
-import { createPlayer } from "./player.js";
+import { createPlayer } from "./js/player.js";
 const $ = (id) => document.getElementById(id);
 
 // ---- The worker ----
@@ -131,7 +131,7 @@ const $ = (id) => document.getElementById(id);
 let worker = null, busy = false, job = 0;
 function convert(bytes, options) {
   if (busy) { worker.terminate(); worker = null }
-  worker ??= new Worker("convert-worker.js", { type: "module" });
+  worker ??= new Worker("js/convert-worker.js", { type: "module" });
   busy = true;
   const id = ++job;
   return new Promise((resolve) => {

@@ -11,7 +11,7 @@ import { Sion } from "./sion.js";
 const CHUNK = 1024;   // frames per chunk (8 render quanta)
 const AHEAD = 16384;  // frames kept rendered ahead of playback (~370 ms at 44.1 kHz)
 
-const sion = Sion.load(fetch("sion.wasm"));
+const sion = Sion.load(fetch("../wasm/sion.wasm"));
 let port, song = null, mml = null, volume = 1, notes = false, gen = 0, ahead = 0, done = true;
 const spare = [];
 
