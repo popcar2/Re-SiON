@@ -3,6 +3,7 @@ name = "sion-converter"
 version = "0.2.0"
 authors = ["popcar2"]
 edition = "2021"
+license = "MIT"
 description = "Convert MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ, GYM and S98 chip music, NSF/NSFE and SPC to SiON MML"
 
 [[bin]]

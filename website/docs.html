@@ -44,6 +44,7 @@
   </header>
   <article>
 <p>A small player for SiON MML music. Give it MML text and it renders stereo audio. It has no dependencies and is <code>no_std</code>, so the same code runs as a Rust crate, as WebAssembly in the browser, and as a C library.</p>
+<p>Based on <a href="https://github.com/keim/SiON">SiON by keim</a> (MIT), while referencing <a href="https://github.com/YuriSizov/gdsion">GDSiON by Yuri Sizov</a> (MIT) for correctness. See the <a href="LICENSE.txt">license</a>.</p>
 <ul><li>Output: interleaved stereo <code>f32</code> (left, right, left, right…) at 44,100 Hz.</li><li>One <em>frame</em> is one left/right pair, so 44,100 frames are one second.</li><li>The MML language itself is described in the <a href="https://keim.github.io/SiON/mmlref/sion_mml_reference_e.html">SiON MML reference manual</a>. <a href="#mml-support">MML support</a> below lists what this player implements and where it differs.</li></ul>
 <nav class="toc" aria-label="Contents"><ol><li><a href="#quick-start">Quick start</a></li><li><a href="#how-playback-works">How playback works</a></li><li><a href="#rust-api">Rust API</a></li><li><a href="#javascript-api">JavaScript API</a></li><li><a href="#c-api">C API</a></li><li><a href="#building">Building</a></li><li><a href="#mml-support">MML support</a></li></ol></nav>
 <h2 id="quick-start">Quick start</h2>

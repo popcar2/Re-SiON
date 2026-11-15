@@ -3,6 +3,8 @@
 A small player for SiON MML music. Give it MML text and it renders stereo audio. It has no dependencies and is
 `no_std`, so the same code runs as a Rust crate, as WebAssembly in the browser, and as a C library.
 
+Based on [SiON by keim](https://github.com/keim/SiON) (MIT), while referencing [GDSiON by Yuri Sizov](https://github.com/YuriSizov/gdsion) (MIT) for correctness.
+
 - Output: interleaved stereo `f32` (left, right, left, right…) at 44,100 Hz.
 - One *frame* is one left/right pair, so 44,100 frames are one second.
 - The MML language itself is described in the

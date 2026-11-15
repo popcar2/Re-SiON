@@ -3,6 +3,8 @@
 Converts other music formats to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT),
 VGM/VGZ, GYM and S98 chip music logs, NSF/NSFE NES music and SPC SNES music. The format is recognized from the file's contents.
 
+Based on [SiON by keim](https://github.com/keim/SiON) (MIT), while referencing [GDSiON by Yuri Sizov](https://github.com/YuriSizov/gdsion) (MIT) for correctness.
+
 ```
 cargo run --release -- song.mid              # writes song.mml
 cargo run --release -- song.xm -o out.mml --verify
