@@ -1,5 +1,5 @@
 //! Converters to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT), VGM/VGZ, GYM and S98 chip
-//! logs, NSF/NSFE NES music and SPC SNES music.
+//! logs, NSF/NSFE/NSF2 NES music, GBS Game Boy music and SPC SNES music.
 //! Every reader produces a `score::Score`; `arrange` turns that into tracks, which `pretty` lays out by the score's
 //! sections (a tracker's patterns, bars for the other formats), or which `mml` minifies (`--exact` modules).
 
@@ -8,6 +8,7 @@ mod bytes;
 mod chips;
 mod cpu;
 mod fm;
+mod gbs;
 mod logs;
 pub mod midi;
 mod mml;
@@ -17,6 +18,7 @@ mod play;
 mod pretty;
 mod sample;
 mod score;
+mod sm83;
 mod spc;
 mod spc700;
 mod tracker;
@@ -43,7 +45,7 @@ pub struct Converted {
 
 /// Input formats, recognized from the file's contents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Format { Midi, Vgm, Gym, S98, Nsf, Spc, Module }
+pub enum Format { Midi, Vgm, Gym, S98, Nsf, Gbs, Spc, Module }
 
 pub fn detect(data: &[u8]) -> Option<Format> {
     if data.starts_with(b"Vgm ") { return Some(Format::Vgm) }
@@ -51,6 +53,7 @@ pub fn detect(data: &[u8]) -> Option<Format> {
     if logs::detect_s98(data) { return Some(Format::S98) }
     if data.starts_with(b"GYMX") { return Some(Format::Gym) }
     if nsf::detect(data) { return Some(Format::Nsf) }
+    if gbs::detect(data) { return Some(Format::Gbs) }
     if spc::detect(data) { return Some(Format::Spc) }
     if tracker::detect(data).is_some() { return Some(Format::Module) }
     if data.windows(4).any(|w| w == b"MThd") { return Some(Format::Midi) }
@@ -74,13 +77,14 @@ pub fn convert(data: &[u8], opt: &Options) -> Result<Converted, String> {
                     (score, w)
                 }
                 Format::Nsf => nsf::to_score(data, opt.exact_pcm, opt.track)?,
+                Format::Gbs => gbs::to_score(data, opt.track)?,
                 _ => spc::to_score(data)?,
             };
             // (Chip logs have no bars of their own: the tempo makes a row a 1/16 note, so a line is 16 rows.)
             score.set_bars(&[]);
             Ok(write(&score, opt, w))
         }
-        None => Err("unrecognized file (supported: MIDI, MOD, S3M, XM, IT, VGM/VGZ, GYM, S98, NSF/NSFE, SPC)".into()),
+        None => Err("unrecognized file (supported: MIDI, MOD, S3M, XM, IT, VGM/VGZ, GYM, S98, NSF/NSFE/NSF2, GBS, SPC)".into()),
     }
 }
 

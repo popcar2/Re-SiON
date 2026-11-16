@@ -157,8 +157,11 @@ fn flats<'a>(tracks: impl Iterator<Item = &'a [Tok]>) -> bool {
 struct Writer<'a> { lens: &'a Lengths, l: u32, names: &'a [&'a str; 12] }
 
 impl Writer<'_> {
-    /// One section as text: restated state, then the notes in beat groups, repeated figures as loops.
-    fn piece(&self, toks: &[Tok], st: &mut State, restate: &[&'static str]) -> String {
+    /// One section as text: restated state, then the notes in beat groups, repeated figures as loops. `held`: it
+    /// starts partway into a note (slurred on from the section before); returned too for where it ends.
+    /// The volume (`v`, `x`) is restated just before the first key-on: set where a note (or its release) is still
+    /// sounding, it would set it there, where a volume table (`na`) has taken it elsewhere.
+    fn piece(&self, toks: &[Tok], st: &mut State, restate: &[&'static str], held: bool) -> (String, bool) {
         // Commands before the first note or rest belong to the state restated at the start.
         let first = toks.iter().position(|t| !matches!(t, Tok::Cmd(_))).unwrap_or(toks.len());
         let mut head = String::new();
@@ -173,6 +176,9 @@ impl Writer<'_> {
         let reset = toks[..first].iter().any(|t| matches!(t, Tok::Cmd(x) if x.starts_with('%')));
         // (A tone with an LFO rate, or the rate alone, resets the LFO's depths: written again after it.)
         let mut lfo_reset = false;
+        // (The volume waits for the first key-on, unless the line starts with one.)
+        let keyon = !held && matches!(toks.get(first), Some(Tok::Note { .. }));
+        let mut later = String::new();
         for k in KINDS {
             let Some(c) = st.0.get(k) else { continue };
             let changed = entry.0.get(k) != Some(c);
@@ -183,22 +189,30 @@ impl Writer<'_> {
                 }
             }
             // (A line of rests only needn't restate anything: the next line does.)
-            else if (restate.contains(&k) && sounds) || changed { head += c }
+            else if changed { head += c }
+            else if restate.contains(&k) && sounds { if !keyon && matches!(k, "v" | "x") { later += c } else { head += c } }
         }
         head += &others;
         // Beat groups: (start tick within the piece, text), and the octave before and after each.
         let (mut groups, mut pend, mut t, mut oct): (Vec<(u64, String)>, String, u64, Option<usize>) = (vec![], String::new(), 0, None);
         let mut octs: Vec<(Option<usize>, Option<usize>)> = vec![];
+        let mut slurred = held;
         for tok in &toks[first..] {
             match tok {
                 Tok::Cmd(c) => match kind(c) {
                     Some(k) => {
-                        if st.0.get(k).map(String::as_str) != Some(c.as_str()) || k == "instr" { pend += c }
+                        if st.0.get(k).map(String::as_str) != Some(c.as_str()) || k == "instr" {
+                            pend += c;
+                            // (Set anew before the key-on: not restated as well.)
+                            if matches!(k, "v" | "x") && later.starts_with(k) { later.clear() }
+                        }
                         st.set(k, c);
                     }
                     None => pend += c,
                 },
                 Tok::Note { key, len, slur } => {
+                    if !slurred && !later.is_empty() { pend.insert_str(0, &std::mem::take(&mut later)) }
+                    slurred = *slur;
                     let o = *key as usize / 12;
                     octs.push((oct, Some(o)));
                     match oct {
@@ -216,6 +230,7 @@ impl Writer<'_> {
                     t += *len as u64;
                 }
                 Tok::Rest(len) => {
+                    slurred = false;
                     octs.push((oct, oct));
                     pend += &format!("r{}", len_text(*len, self.l, self.lens));
                     groups.push((t, std::mem::take(&mut pend)));
@@ -225,7 +240,8 @@ impl Writer<'_> {
         }
         if !pend.is_empty() { groups.push((t, pend)); octs.push((oct, oct)) }
         let body = join(&fold(&groups, &octs));
-        match (head.is_empty(), body.is_empty()) { (true, _) => body, (_, true) => head, _ => format!("{head} {body}") }
+        let text = match (head.is_empty(), body.is_empty()) { (true, _) => body, (_, true) => head, _ => format!("{head} {body}") };
+        (text, slurred)
     }
 }
 
@@ -370,9 +386,12 @@ pub fn write(title: &str, header: &[String], tracks: &[(String, &[Tok])], sectio
         let (pieces, lpi) = split(&rest, &bounds, &st, frame);
         let w = Writer { lens, l, names };
         // Sections by text and the tone they start with: equal, the same music.
+        let mut held = false;
         let keys: Vec<(String, String)> = pieces.iter().map(|p| {
             let tone: String = TONE.iter().filter_map(|k| st.0.get(k).cloned()).collect::<Vec<_>>().join("\0");
-            (w.piece(p, &mut st, &restate), tone)
+            let text;
+            (text, held) = w.piece(p, &mut st, &restate, held);
+            (text, tone)
         }).collect();
         let mut uniq_k: Vec<&(String, String)> = vec![];
         let ids: Vec<usize> = keys.iter().map(|t| uniq_k.iter().position(|u| *u == t).unwrap_or_else(|| { uniq_k.push(t); uniq_k.len() - 1 })).collect();

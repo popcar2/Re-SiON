@@ -98,7 +98,8 @@ fn unb64(dat: &[u8]) -> Vec<u8> {
 /// from `level` (0); the frames are the level / 128, frame 0 the starting level, so there is one more frame than
 /// bits. A channel plays it the way the console's channel does (the level holds between samples; see
 /// `Chan::dpcm`). `{=m}` instead of data: the bytes of DPCM sample `m` (an earlier `#PCMB`), so the same DPCM
-/// sample started from another level is stored once.
+/// sample started from another level is stored once. With flags 8 the data is SNES BRR blocks, decoded as the
+/// S-DSP decodes them (`brr`) and played with its Gaussian interpolation (`Sample::gauss`).
 fn pcm(bytes: &[u8], a: &[f32]) -> Sample {
     let flags = a.get(3).map_or(0, |f| *f as i32);
     let data = if flags & 4 != 0 {
@@ -112,10 +113,37 @@ fn pcm(bytes: &[u8], a: &[f32]) -> Sample {
             }
         }
         d
-    } else if flags & 1 != 0 { bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect() }
+    } else if flags & 8 != 0 { brr(bytes) } else if flags & 1 != 0 { bytes.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).collect() }
         else { bytes.iter().map(|&b| b as i8 as f32 / 128.0).collect() };
     let lp = a.get(2).filter(|l| **l >= 0.0).map(|l| *l as usize);
-    Sample { data, rate: a.first().copied().unwrap_or(RATE).max(0.0), key: a.get(1).map_or(60, |k| *k as i32), lp, bidi: flags & 2 != 0 }
+    Sample { data, rate: a.first().copied().unwrap_or(RATE).max(0.0), key: a.get(1).map_or(60, |k| *k as i32), lp, bidi: flags & 2 != 0, gauss: flags & 8 != 0 }
+}
+
+/// SNES BRR blocks as frames in -1..1 (see `decode_brr`).
+fn brr(bytes: &[u8]) -> Vec<f32> { decode_brr(bytes).into_iter().map(|s| s as f32 / 32768.0).collect() }
+
+/// SNES BRR blocks (9 bytes: a header with the shift and prediction filter, then 16 4-bit frames) decoded as the
+/// S-DSP decodes them, one block after another (the filter's history running on), kept to 15 bits: 16-bit frames.
+pub fn decode_brr(bytes: &[u8]) -> Vec<i16> {
+    let (mut out, mut p1, mut p2) = (Vec::with_capacity(bytes.len() / 9 * 16), 0i32, 0i32);
+    for b in bytes.chunks_exact(9) {
+        let (shift, filter) = (b[0] >> 4, b[0] >> 2 & 3);
+        for k in 0..16 {
+            let n = (((b[1 + k / 2] >> if k & 1 == 0 { 4 } else { 0 }) as i32) << 28) >> 28;
+            let mut s = if shift <= 12 { (n << shift) >> 1 } else if n < 0 { -2048 } else { 0 };
+            let q = p2 >> 1;
+            match filter {
+                1 => s += (p1 >> 1) + ((-p1) >> 5),
+                2 => s += p1 - q + (q >> 4) + ((p1 * -3) >> 6),
+                3 => s += p1 - q + ((p1 * -13) >> 7) + ((q * 3) >> 4),
+                _ => {}
+            }
+            let s = (s.clamp(-32768, 32767) * 2) as i16 as i32;
+            (p2, p1) = (p1, s);
+            out.push(s as i16);
+        }
+    }
+    out
 }
 
 /// Comma-separated arguments, each a number or left out (empty).
@@ -132,7 +160,7 @@ fn cut(s: &Sample, a: &[Option<f32>; 4]) -> Sample {
     let lp = match a[2] { None => s.lp, Some(l) if l >= 0.0 => Some(l as usize), Some(l) if l < -1.0 => Some(en.saturating_sub(-l as usize)), _ => None };
     let lp = lp.map(|l| l.max(st) - st).filter(|&l| l < en - st);
     let (key, rate) = match a[3] { Some(k) => { let f = M::floor(k); (f as i32, s.rate * M::exp2((f - k) / 12.0)) } None => (s.key, s.rate) };
-    Sample { data: s.data[st..en].to_vec(), rate, key, lp, bidi: s.bidi }
+    Sample { data: s.data[st..en].to_vec(), rate, key, lp, bidi: s.bidi, gauss: s.gauss }
 }
 
 /// Sample number for `#PCMWAVE` / `#SAMPLER` argument `id` (a `#PCMB` number) cut by `a` (see `cut`): the

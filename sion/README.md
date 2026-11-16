@@ -432,7 +432,8 @@ Additions:
 
 - `#PCMBn{data}rate,key,loop,flags,level` embeds a PCM sample in the MML text. `data` is base64url of signed
   little-endian samples: 8-bit, or 16-bit with flags 1. Flags 2 loops back and forth. Flags 4 decodes NES DPCM
-  starting from `level`. `{=m}` reuses the data of earlier DPCM sample `m`. Defaults: rate 44100, key 60, no loop.
+  starting from `level`. Flags 8 decodes SNES BRR blocks (9 bytes for 16 samples) as the S-DSP does, and plays
+  them with its 4-point Gaussian interpolation instead of straight lines between samples. `{=m}` reuses the data of earlier DPCM sample `m`. Defaults: rate 44100, key 60, no loop.
 - `@ph` on PCM modules takes a fractional or negative start frame and a play length.
 - `k` accepts fractions.
 

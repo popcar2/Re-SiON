@@ -61,7 +61,8 @@ const CYCLES: [u8; 256] = [
 
 const C: u8 = 1;
 const Z: u8 = 2;
-const I: u8 = 4;
+/// The IRQ mask flag.
+pub(crate) const I: u8 = 4;
 const D: u8 = 8;
 const B: u8 = 0x10;
 const U: u8 = 0x20;
@@ -74,6 +75,17 @@ impl Cpu {
     fn fetch(&mut self, bus: &mut impl Bus) -> u8 { let v = bus.read(self.pc); self.pc = self.pc.wrapping_add(1); v }
     fn fetch16(&mut self, bus: &mut impl Bus) -> u16 { let lo = self.fetch(bus) as u16; lo | (self.fetch(bus) as u16) << 8 }
     pub fn push(&mut self, bus: &mut impl Bus, v: u8) { bus.write(0x100 | self.s as u16, v, self.cycles); self.s = self.s.wrapping_sub(1) }
+    /// Take an interrupt (IRQ or NMI) through the vector at `vector`: the return address and flags pushed,
+    /// further IRQs masked.
+    pub fn interrupt(&mut self, bus: &mut impl Bus, vector: u16) {
+        self.push(bus, (self.pc >> 8) as u8);
+        self.push(bus, self.pc as u8);
+        self.push(bus, self.p & !B | U);
+        self.p |= I;
+        self.pc = bus.read(vector) as u16 | (bus.read(vector.wrapping_add(1)) as u16) << 8;
+        self.cycles += 7;
+    }
+    pub fn masked(&self) -> bool { self.p & I != 0 }
     fn pull(&mut self, bus: &mut impl Bus) -> u8 { self.s = self.s.wrapping_add(1); bus.read(0x100 | self.s as u16) }
     fn nz(&mut self, v: u8) -> u8 { self.p = (self.p & !(N | Z)) | (v & N) | if v == 0 { Z } else { 0 }; v }
     fn flag(&mut self, f: u8, on: bool) { if on { self.p |= f } else { self.p &= !f } }
@@ -220,15 +232,19 @@ impl Cpu {
     }
 }
 
+/// 64 KB of RAM, the whole bus: for the CPU tests.
+#[cfg(test)]
+pub(crate) struct Ram(pub Vec<u8>);
+#[cfg(test)]
+impl Bus for Ram {
+    fn read(&mut self, a: u16) -> u8 { self.0[a as usize] }
+    fn write(&mut self, a: u16, v: u8, _: u64) { self.0[a as usize] = v }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct Ram(Vec<u8>);
-    impl Bus for Ram {
-        fn read(&mut self, a: u16) -> u8 { self.0[a as usize] }
-        fn write(&mut self, a: u16, v: u8, _: u64) { self.0[a as usize] = v }
-    }
 
     /// Run code at $0200 until it reaches `stop`.
     fn run(code: &[u8], stop: u16) -> (Cpu, Ram) {
@@ -284,11 +300,6 @@ mod tests {
 #[cfg(test)]
 mod klaus {
     use super::*;
-    struct Ram(Vec<u8>);
-    impl Bus for Ram {
-        fn read(&mut self, a: u16) -> u8 { self.0[a as usize] }
-        fn write(&mut self, a: u16, v: u8, _: u64) { self.0[a as usize] = v }
-    }
     #[test]
     #[ignore]
     fn functional() {

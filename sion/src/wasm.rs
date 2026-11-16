@@ -184,5 +184,5 @@ pub unsafe extern "C" fn sion_loop_start(mml: *const u8, len: usize) -> f64 {
 pub unsafe extern "C" fn sion_song_set_sample(song: *mut Song, n: u32, data: *const f32, frames: usize, rate: f32, key: i32, loop_start: i32, bidi: i32) {
     let (Some(song), false) = (song.as_mut(), data.is_null()) else { return };
     let data = slice::from_raw_parts(data, frames).to_vec();
-    song.set_sample(n as usize, Sample { data, rate, key, lp: usize::try_from(loop_start).ok(), bidi: bidi != 0 });
+    song.set_sample(n as usize, Sample { data, rate, key, lp: usize::try_from(loop_start).ok(), bidi: bidi != 0, ..Default::default() });
 }

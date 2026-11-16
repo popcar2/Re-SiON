@@ -219,6 +219,12 @@ const DMC_UNIT: f32 = 0.00335 / 0.00752 * 2.0 / 15.0;
 
 const NES_LEN: [u8; 32] = [10, 254, 20, 2, 40, 4, 80, 6, 160, 8, 60, 10, 14, 12, 26, 14, 12, 16, 24, 18, 48, 20, 96, 22, 192, 24, 72, 26, 16, 28, 32, 30];
 
+/// The DMC's timer periods (CPU cycles a bit) by its rate index: NTSC, PAL.
+pub(crate) const DMC_PERIODS: [[u16; 16]; 2] = [
+    [428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54],
+    [398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50],
+];
+
 impl NesApu {
     pub fn new(clock: u32) -> Self {
         let dmc = Dmc { mem: vec![0; 0x10000], t: 0.0, level: 0, play: None, raw: Capture::new(1, 64.0, 1.0 / 128.0, 128.0 * DMC_UNIT), hits: vec![], cache: vec![], played: vec![], defn: vec![], stored: vec![], defined: vec![], pos: (0.0, 0.0, 1.0, 0, 0) };
@@ -234,9 +240,7 @@ impl NesApu {
     pub fn power_on(clock: u32) -> Self { let mut a = NesApu::new(clock); a.dmc.raw.start_at(0.0); a }
     /// DMC output rate (bits per second) for rate index `i`: NTSC or PAL timer periods, by the CPU clock.
     fn dmc_rate(&self, i: u8) -> f64 {
-        const NTSC: [u16; 16] = [428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54];
-        const PAL: [u16; 16] = [398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50];
-        self.cpu / if self.cpu < 1.7e6 { PAL } else { NTSC }[i as usize & 15] as f64
+        self.cpu / DMC_PERIODS[(self.cpu < 1.7e6) as usize][i as usize & 15] as f64
     }
     /// Bring the DMC up to now: a sample that has played out ends, leaving the level where it got to.
     fn dmc_settle(&mut self) {

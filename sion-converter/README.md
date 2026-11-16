@@ -1,7 +1,7 @@
 # sion-converter
 
 Converts other music formats to SiON MML: Standard MIDI Files, tracker modules (MOD, S3M, XM, IT),
-VGM/VGZ, GYM and S98 chip music logs, NSF/NSFE NES music and SPC SNES music. The format is recognized from the file's contents.
+VGM/VGZ, GYM and S98 chip music logs, NSF/NSFE/NSF2 NES music, GBS Game Boy music and SPC SNES music. The format is recognized from the file's contents.
 
 Based on [SiON by keim](https://github.com/keim/SiON) (MIT), while referencing [GDSiON by Yuri Sizov](https://github.com/YuriSizov/gdsion) (MIT) for correctness.
 
@@ -10,6 +10,7 @@ cargo run --release -- song.mid              # writes song.mml
 cargo run --release -- song.xm -o out.mml --verify
 cargo run --release -- song.vgz --wav out.wav
 cargo run --release -- game.nsfe --track 3
+cargo run --release -- game.gbs --track 2
 cargo run --release -- song.spc
 cargo run --release -- song.gym              # or .s98
 ```
@@ -17,7 +18,7 @@ cargo run --release -- song.gym              # or .s98
 Options: `-o FILE`, `--grid N` (snap timing to 1/N notes: smaller output, but no longer exact),
 `--wavetables` (tracker modules: approximate samples instead of embedding them; see below),
 `--exact` (tracker modules: tick-by-tick, minified, instead of written as by hand; see below),
-`--track N` (NSF/NSFE: which song of the file, from 1; default: the file's first song),
+`--track N` (NSF/NSFE/GBS: which song of the file, from 1; default: the file's first song),
 `--exact-pcm` (VGM and NSF: capture chip samples exactly, frame by frame; much larger, see below),
 `--gain G` (volume; default is automatic, so the busiest chord doesn't clip), `--plain` (write the plain MML, one
 command per event, instead),
@@ -120,6 +121,8 @@ $
 
 - One line per pattern, as the order list plays it. Each line starts with an absolute octave and restates the
   volume, pan and detune, so it means the same wherever it plays; the tone (`%`, `@n`) is written where it changes.
+  (A line that starts partway into a note, or with a rest, restates the volume just before its first key-on: set
+  while a note or its release is still sounding, it would set it there, where a volume table may have taken it.)
 - Patterns that follow each other again are loops (`[A B]`, `[A B|C]3`); a pattern heard again elsewhere is a
   macro, defined just before its track. Within a line: one default length per track, relative octaves, a space
   per beat, short repeated figures as loops, black keys as flats in flat keys.
@@ -308,14 +311,35 @@ the driver on a 6502 (`src/cpu.rs`: every documented instruction and the stable 
 counts, checked against Klaus Dormann's functional test) — INIT once with the song number, then PLAY at the
 file's rate — and logs every write to the sound chips at the CPU cycle it happens on. That log goes through the
 same chip models and frame sampling as a VGM's (above), so everything said there about the NES APU, DPCM and
-`$4011` samples applies. NSF (with bankswitching), NSFE and NSF2 (metadata after the program) files are read;
-NTSC unless the file is PAL-only.
+`$4011` samples applies. NSF (with bankswitching), NSFE and NSF2 files are read; NTSC unless the file is PAL-only
+or an NSFE/NSF2 `regn` chunk prefers PAL or Dendy (X = 2, the Dendy's 1.773 MHz clock).
+
+NSF2 (version 2, header byte `$7C`) adds to that:
+
+- Metadata: NSFE chunks after the program (`time`, `fade`, `tlbl`, `RATE`, `regn`...). A chunk whose name starts
+  with a capital is needed to play the file: an unknown one is an error (in an NSFE always, in an NSF2 when bit 7
+  of `$7C` says the metadata has one).
+- A non-returning INIT (bit 5): INIT is called with Y = `$80` (it returns), then again with Y = `$81` to run for
+  good; PLAY interrupts it as the player's NMI handler would (IRQs masked, its registers restored after). If the
+  second INIT returns, the player idles.
+- IRQs (bit 4): the IRQ vector at `$FFFE` is RAM, and the CPU takes IRQs (while its I flag is clear) from the
+  player's cycle timer (`$401B`/`$401C` reload, `$401D` start, stop and acknowledge), the APU frame counter (4-step
+  mode, `$4017` bit 6 clear; acknowledged by reading `$4015`) and the DMC (a sample ending with `$4010` bit 7 set).
+  IRQs also run between frames, while the player idles.
+- No PLAY (bit 6): only INIT runs (with a non-returning INIT or IRQs); the driver's frame rate is then found from
+  its writes, as for a VGM, rather than taken from the header.
+
+For an NSF2 the machine's state that has to come round includes the CPU's registers (INIT may be running) and the
+IRQ sources' timing, to 1/64 of a frame (a timer drifting a few cycles a loop against the frames still loops).
 
 An NSF holds several songs (`--track N`; the notes name the track and, in an NSFE, its title) and no song
 lengths, so the converter works out where each one ends:
 
 - The machine's state (RAM, work RAM, banks) comes round to a state it was in at the start of an earlier frame:
-  from there the driver can only do the same again, so the song loops exactly there.
+  from there the driver can only do the same again, so the song loops exactly there. If every frame of that loop
+  writes the same, the song has stopped (it ends there instead); and when the frames' writes repeat with a
+  period that divides the state's, from no later (a counter the music doesn't hear makes the state come round
+  only after many times through the music), the shorter loop is just as exact and is taken.
 - Otherwise (drivers that count frames), the frames' writes repeat to the end, at least twice, with a loop of at
   least a second: the song loops there.
 - The same writes every frame to the end, for a second or more: the song has stopped (or holds its last chord)
@@ -342,6 +366,24 @@ runs with them (FDS RAM, N163 sound RAM, the MMC5 multiplier and ExRAM are there
 
 Sizes: Shovel Knight's NSFE tracks (APU and VRC6) become 25-90 KB of MML; each takes a few seconds to convert.
 A FamiTracker NSF with DPCM drums (a 15 KB E1M1 cover) becomes 26 KB.
+
+## GBS
+
+A GBS is a Game Boy game's sound driver, played like an NSF (`src/gbs.rs`): on the Game Boy's CPU (`src/sm83.rs`,
+a Sharp SM83 with every instruction and its cycle count; Blargg's `cpu_instrs` tests pass (`BLARGG=dir cargo test --release --lib -- --ignored blargg`), the interrupt one aside:
+the player calls the driver itself, so interrupts aren't modelled), INIT once with the song number, then PLAY at
+the vertical blank's 59.73 Hz, or (TAC bit 2) at the timer's rate, `4096/262144/65536/16384 Hz / (256 - TMA)` as
+TAC and TMA are set at that moment (drivers change TMA for their tempo; TAC bit 7 is double speed). Its writes to
+the APU (`$FF10-$FF3F`) go through the same Game Boy chip model as a VGM's. As a GBS player does: the program is
+placed at its load address, `$4000-$7FFF` is the bank last selected with a write to `$2000-$3FFF` (bank 0 there
+is ignored), RST calls the load address plus the vector, RAM is at `$A000-$DFFF` (and its echo), and the APU starts
+as the boot ROM leaves it (powered, `NR50` = `$77`, `NR51` = `$F3`, its wave RAM pattern). The song ends and loops
+as an NSF's does (above); `--track N` picks the song, and `#TITLE` is the header's title and author.
+
+Checked against libgme on Tetris, Super Mario Land (timer-driven, 64 Hz), Link's Awakening (bankswitched) and
+Kirby's Dream Land: octave-band levels within about 1 dB above 100 Hz, and the notes on time (apart from the
+lead-in, up to a row, that lines the notes up with the rows; see VGM). Songs take about a second each to convert
+and become 4-18 KB of MML.
 
 ### `#PCMB`: samples in MML
 
@@ -380,24 +422,36 @@ its pitch, and its envelope (ADSR and the GAIN modes, with the hardware's rate c
 each key-on becomes a note on its voice's track. The voices whose bit is set in the snapshot's KON register are
 keyed on as it loads, as SPC players do (most snapshots are taken as a song starts, with its first notes there).
 
-- Samples: each one played is decoded from BRR as it was in RAM at its key-on and embedded (`#PCMB`, 16-bit, with
-  its loop), played with `%7`. The DSP's Gaussian interpolation is softer than SiON's linear one; the samples get
-  a gentle low-pass to match (on test songs, within 1-2 dB of libgme up to 10 kHz). A sample found with four
+- Samples: each one played is taken from RAM as it was at its key-on and embedded as its BRR blocks (`#PCMB` with
+  flags 8, about 3.5 times smaller than 16-bit frames, with its loop), which SiON decodes as the DSP does and plays
+  with the DSP's Gaussian interpolation, so a sample pitched far down keeps the DSP's dull top end instead of a
+  straight line's images (Donkey Kong Country's drums were up to 12 dB too bright at 4-8 kHz). A sample found with four
   different contents is a wave the driver rewrites as it plays (Chrono Trigger does): all its notes play the last
   version, so the voice keeps one tone and one track.
 - Pitch: each sample's key is found from its loop's period (the octave kept so its usual note is within o3..o7)
-  and its tuning from the pitches the driver plays it at, so the notes come out as whole notes. Pitch changes
-  during a note (vibrato, slides) are `k` slurs.
+  and its tuning from the pitches the driver plays it at, so the notes come out as whole notes. A driver's
+  vibrato (its pitch writes going round the same values, at least twice, a set time each round) is SiON's pitch
+  LFO: `@lfo` with a table in its exact shape from where it starts (the LFO stands still while its depth is 0,
+  and runs at the envelope clock), `mp` its depth there and `k` its centre; even a 2-cent one, which the DSP's
+  echo turns into a shimmer (it took Aquatic Ambiance's 50 ms loudness envelope from 0.90 to 0.99 correlation
+  with libgme). Other pitch changes during a note (slides) are a pitch table (`np`, a value a 1/60 s frame from the
+  key-on, to within a 64th of a semitone, written as `(from,to)count` runs where they lie on a line, its lowest
+  value the note's `k`), where that is shorter than writing them as `k` slurs; under a vibrato's LFO the table
+  moves its centre. (Aquatic Ambiance: 2,989 slurs to 489, 79 to 66 KB.) Sweeps wider than two octaves stay slurs.
 - Envelopes become SiON's own (`@n,ar,dr,sr,rr,sl`): attack matched at half level (the DSP's is linear), the
-  sustain level to 3 dB. The DSP's decay and sustain are not quite exponential (each step is -1, then -1/256 of
+  sustain level to 3 dB. A rise of 150 ms or more (a slow ADSR attack, a GAIN increase) is written as the DSP
+  makes it instead: SiON's attack is a curve that starts late and ends suddenly (a 1.5 s pad 24 dB quieter than
+  the DSP's at 0.2 s). The whole envelope, rise, decay and sustain, as long as the tone's notes last, is a volume
+  table (`na`, one value a 1/60 s frame), and SiON's own envelope holds still; on a track with such tones, the
+  others set the table back to full. The DSP's decay and sustain are not quite exponential (each step is -1, then -1/256 of
   the level, so they fall faster the lower they go, and below 1/8 of full scale linearly), while SiON's are
   straight lines in decibels: they are fitted to the DSP's own curve over how long the tone's notes usually last.
   The decay reaches SiON's sustain level when the DSP's reaches its own, and the sustain is the least-squares line
   on from there; with no decay stage (sustain level 7) SiON's decay is used as a second line, with the knee where
   the two come closest (a long note falling 34 dB stays within 0.5 dB of the DSP down to -15 dB, 1.5 dB down to
   -24 dB). SiON's rates are 19% apart: where some rate comes more than 3% closer for it, the tone also sets the
-  envelope clock (`@clock`, percent). SiON's rates rise with the key (`kc >> 5`), so each tone's are taken down
-  by that at its usual key. A key-off releases at the DSP's rate; a driver switching to a falling GAIN is a
+  envelope clock (`@clock`, percent). SiON's rates rise with the key (`kc >> 5`), so each note's are taken down
+  by that at its own key. A key-off releases at the DSP's rate; a driver switching to a falling GAIN is a
   release at that rate. A note whose envelope the driver changes otherwise as it plays is written with a flat
   envelope and volume steps.
 - Volume and pan from VOL × MVOL (in decibels, `#VMODE{%v1,1}`); echo as a delay on send 1 (`#EFFECT1{delay}`,
@@ -421,7 +475,9 @@ An SPC holds no song length either: the song loops where the driver's state (RAM
 settings) comes round to one it was in at an earlier timer tick, or else where its DSP writes repeat, or else
 where its key-ons (voice, sample, pitch) repeat; a state loop that is several times round the music (its tempo
 counter coming back into phase only then) is shortened to the key-ons' loop, from where it starts. The loop
-starts on a whole row. A loop of silence is the song having ended. Otherwise it plays the ID666 tag's time, or
+point moves on to the next bar line of the music (16 rows from the row the most of the notes' lengths start on),
+so the readable MML's lines are its bars; the loop's first notes, and any held across it, are played again after
+the end, where the loop now runs on. A loop of silence is the song having ended. Otherwise it plays the ID666 tag's time, or
 the first 10 minutes. The driver's writes and key-ons are checked for a loop every 20 s of the song as it runs,
 and it stops early once the same loop is found twice in a row and has been playing three times round and for at
 least 150 s (a section can repeat twice and go on, and an ambient piece can repeat a phrase for two minutes
@@ -471,7 +527,9 @@ convert.
 
 `cargo test --release` builds small NES, SN76489, Game Boy, YM2151, GYM, S98 and ProTracker files in code, NSF and NSFE
 files (hand-assembled drivers: a bankswitched one that loops and plays DPCM, one that stops, one playing the
-VRC6), and VGM files
+VRC6), NSF2 files (a non-returning INIT that PLAY interrupts, music on IRQs from the cycle timer and from the frame
+counter, mandatory metadata chunks), GBS files (a scale from a switched bank, at the vertical blank and on the
+timer), and VGM files
 that play YM2612 DAC samples (from the data bank, written directly, and by DAC stream), NES DPCM and `$4011`
 levels, and YM2610 ADPCM-A and -B, converts them (by default and with `--exact-pcm`, each checked against the
 chip's output), checks the notes and the Mega Drive's mix (PSG against FM, one-sided pan, feedback level, fast

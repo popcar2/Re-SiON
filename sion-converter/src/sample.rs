@@ -43,7 +43,7 @@ const PCM_KEY: i32 = 60;
 /// The sample as SiON plays it: data up to the loop end (frames after it are never heard), rate as an f32.
 pub fn as_sion(s: &Sample) -> sion::Sample {
     let end = s.lp.map_or(s.data.len(), |l| l.1.min(s.data.len()));
-    sion::Sample { data: s.data[..end].to_vec(), rate: s.c4 as f32, key: PCM_KEY, lp: s.lp.map(|l| l.0), bidi: s.lp.is_some_and(|l| l.2) }
+    sion::Sample { data: s.data[..end].to_vec(), rate: s.c4 as f32, key: PCM_KEY, lp: s.lp.map(|l| l.0), bidi: s.lp.is_some_and(|l| l.2), ..Default::default() }
 }
 
 /// The sample itself, as `#PCMB` (8-bit data stays 8-bit, so both are stored losslessly), or None when no PCM

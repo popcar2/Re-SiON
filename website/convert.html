@@ -1,5 +1,5 @@
 <!doctype html>
-<!-- MML converter: drop a MIDI, tracker module, VGM/VGZ, GYM, S98, NSF/NSFE or SPC file to convert it to SiON MML, then
+<!-- MML converter: drop a MIDI, tracker module, VGM/VGZ, GYM, S98, NSF/NSFE, GBS or SPC file to convert it to SiON MML, then
      download or play the result. Runs wasm/convert.wasm in a worker (js/convert-worker.js, js/convert.js); plays through
      the same player bar as the other pages (js/player.js and the rest). -->
 <html lang="en">
@@ -76,7 +76,7 @@
   <label class="drop" id="drop" tabindex="0">
     <svg viewBox="0 0 16 16"><path d="M7 13.5V5.3L4.7 7.6 3.3 6.2 8 1.5l4.7 4.7-1.4 1.4L9 5.3v8.2zM2 14h12v1.5H2z"/></svg>
     <div><b>Drop a file here</b> or <u>browse</u></div>
-    <small>MIDI · MOD, S3M, XM, IT · VGM, VGZ, GYM, S98 · NSF, NSFE · SPC</small>
+    <small>MIDI · MOD, S3M, XM, IT · VGM, VGZ, GYM, S98 · NSF, NSFE · GBS · SPC</small>
     <input type="file" id="file" hidden>
   </label>
 
@@ -95,7 +95,7 @@
       <label>Volume
         <input type="number" id="gain" min="0.05" max="8" step="0.05" placeholder="Automatic">
       </label>
-      <label>Track (NSF)
+      <label>Track (NSF, GBS)
         <input type="number" id="track" min="1" step="1" placeholder="The file's first">
       </label>
       <label class="check"><input type="checkbox" id="exact">
@@ -156,7 +156,7 @@ for (const id of ["grid", "gain", "track", "exact", "wavetables", "exactPcm"]) $
 // ---- Converting ----
 let current = null; // {name, bytes}
 let output = null;  // {mml, file, title}
-const FORMATS = { Midi: "MIDI", Module: "Tracker module", Vgm: "VGM", Nsf: "NSF", Spc: "SPC" };
+const FORMATS = { Midi: "MIDI", Module: "Tracker module", Vgm: "VGM", Nsf: "NSF", Gbs: "GBS", Spc: "SPC" };
 const time = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 const size = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`;
 

@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::f64::consts::PI;
 
+use crate::bytes;
 use crate::nsf::mix;
 use crate::pcm::pcmb;
 use crate::score::{env_inc, hz_key, noise_key, noise_level, Defs, Note, Score};
@@ -59,7 +60,7 @@ struct Tags { title: String, game: String, artist: String, secs: Option<f64> }
 
 fn tags(d: &[u8]) -> Tags {
     if d.get(0x23) != Some(&26) || d.len() < 0x100 { return Tags::default() }
-    let text = |a: usize, n: usize| String::from_utf8_lossy(&d[a..a + n]).split('\0').next().unwrap_or("").trim().to_string();
+    let text = |a: usize, n: usize| bytes::text(d, a, n);
     // Text and binary tags differ in where the play time and artist are; a text tag's times are digits.
     let digits = |a: usize, n: usize| d[a..a + n].iter().all(|&c| c == 0 || c == b' ' || c.is_ascii_digit());
     let (secs, fade, artist) = if digits(0xa9, 3) && digits(0xac, 5) {
@@ -96,9 +97,9 @@ const RELEASE: u8 = 3;
 #[derive(Clone, Copy, Default)]
 struct Voice { delay: u8, mode: u8, env: i32, hidden: i32, addr: u16, chunk: u8, interp: u32, header: u8 }
 
-/// A decoded sample: its frames (16-bit), the frame its loop starts on, and where it is in RAM (start and loop
-/// addresses).
-struct Brr { data: Vec<i16>, lp: Option<usize>, at: (u16, u16) }
+/// A decoded sample: its BRR blocks, their frames (16-bit), the frame its loop starts on, and where it is in RAM
+/// (start and loop addresses).
+struct Brr { blocks: Vec<[u8; 9]>, data: Vec<i16>, lp: Option<usize>, at: (u16, u16) }
 
 /// A sample found this many times with different contents is a wave the driver rewrites as it plays: its later
 /// key-ons play the last version decoded, and so do the earlier ones (`Dsp::canon`), so the voice keeps one tone.
@@ -173,7 +174,7 @@ impl Dsp {
         if vs.len() >= VERSIONS { return *vs.last().unwrap() }
         let i = self.samples.len();
         vs.push(i);
-        self.samples.push(Brr { data: decode(&blocks), lp: at.map(|i| i * 16), at: (start, lp) });
+        self.samples.push(Brr { data: sion::decode_brr(blocks.as_flattened()), blocks, lp: at.map(|i| i * 16), at: (start, lp) });
         self.cache.insert((start, lp, h), i);
         i
     }
@@ -305,31 +306,6 @@ fn chain(ram: &[u8], start: u16, lp: u16) -> (Vec<[u8; 9]>, Option<usize>) {
     if blocks.last().is_some_and(|b| b[0] & 3 == 1) { blocks.pop(); }
     let looped = blocks.len() > at;
     (blocks, looped.then_some(at))
-}
-
-/// BRR blocks → 16-bit frames, as the DSP decodes them (4-bit samples, a shift and one of four prediction
-/// filters, kept to 15 bits).
-fn decode(blocks: &[[u8; 9]]) -> Vec<i16> {
-    let (mut out, mut p1, mut p2) = (Vec::with_capacity(blocks.len() * 16), 0i32, 0i32);
-    for b in blocks {
-        let (shift, filter) = (b[0] >> 4, b[0] >> 2 & 3);
-        for k in 0..16 {
-            let nib = (b[1 + k / 2] >> if k & 1 == 0 { 4 } else { 0 }) & 15;
-            let n = ((nib as i32) << 28) >> 28;
-            let mut s = if shift <= 12 { (n << shift) >> 1 } else if n < 0 { -2048 } else { 0 };
-            let q = p2 >> 1;
-            match filter {
-                1 => s += (p1 >> 1) + ((-p1) >> 5),
-                2 => s += p1 - q + (q >> 4) + ((p1 * -3) >> 6),
-                3 => s += p1 - q + ((p1 * -13) >> 7) + ((q * 3) >> 4),
-                _ => {}
-            }
-            let s = (s.clamp(-32768, 32767) * 2) as i16 as i32;
-            (p2, p1) = (p1, s);
-            out.push(s as i16);
-        }
-    }
-    out
 }
 
 /// The sound unit as the driver sees it: RAM, the timers, the I/O ports, the DSP.
@@ -668,6 +644,72 @@ fn release_fit(p: u32) -> f64 {
     db_inc(40.0, (k * p as u64) as f64)
 }
 
+/// A rise this long (DSP samples) or longer is written as the DSP makes it (`env_table`): SiON's attack is a
+/// curve, late and then sudden, against the DSP's straight line up, which is plain to hear on a slow one.
+const SLOW_RISE: usize = (0.15 * RATE) as usize;
+
+/// The DSP's envelope (0..2047) from a key-on, every sample, for up to `len` samples (or until it is 40 dB down,
+/// or holds still), for an envelope that rises (an ADSR attack, or a GAIN increase; empty for others); and how
+/// long the rise (and an ADSR's decay to its sustain level) takes.
+fn env_curve(env: Env, len: usize) -> (Vec<i32>, usize) {
+    let (mut e, mut hidden, mut mode, mut counter, mut out, mut rise) = (0i32, 0i32, ATTACK, 0u32, vec![], None);
+    while out.len() < len.max(1) || rise.is_none() {
+        counter = if counter == 0 { 0x77ff } else { counter - 1 };
+        let mut x = e;
+        let rate = match env {
+            Env::Adsr(a, d, s, sr) => {
+                let rate = match mode {
+                    ATTACK => { x += if a < 15 { 0x20 } else { 0x400 }; a as usize * 2 + 1 }
+                    DECAY => { x = fall(x); d as usize * 2 + 16 }
+                    _ => { x = fall(x); sr as usize }
+                };
+                if x >> 8 == s as i32 && mode == DECAY { mode = SUSTAIN }
+                rate
+            }
+            Env::Slope(m @ (6 | 7), r) => { x += if m == 7 && hidden as u32 >= 0x600 { 0x8 } else { 0x20 }; r as usize }
+            _ => return (vec![], 0),
+        };
+        hidden = x;
+        if x as u32 > 0x7ff { x = if x < 0 { 0 } else { 0x7ff }; if mode == ATTACK { mode = DECAY } }
+        if RATES[rate] != 0 && (counter + OFFSETS[rate]) % RATES[rate] == 0 { e = x }
+        out.push(e);
+        let risen = mode == SUSTAIN || (matches!(env, Env::Slope(..)) && e == 0x7ff);
+        if risen && rise.is_none() { rise = Some(out.len()) }
+        // (Holding still, or nearly gone, or a rise that never ends.)
+        if (risen && (RATES[rate] == 0 || e == 0x7ff && matches!(env, Env::Slope(..)) || e < 21)) || RATES[rate] == 0 || out.len() >= (60.0 * RATE) as usize { break }
+    }
+    let rise = rise.unwrap_or(out.len());
+    (out, rise)
+}
+
+/// The DSP's envelope (`env_curve`) as the expression (`na`: x, 0..128, a value a 1/60 s frame, the middle of
+/// it), for a note whose SiON envelope holds still at full.
+fn env_table(curve: &[i32]) -> Vec<i32> {
+    let n = (curve.len() as f64 / (RATE / 60.0)).ceil().max(1.0) as usize;
+    let at = |t: f64| curve[((t * RATE) as usize).min(curve.len() - 1)] as f64 / 2047.0;
+    let mut v: Vec<i32> = (0..n).map(|k| (128.0 * at((k as f64 + 0.5) / 60.0)).round() as i32).collect();
+    v.push((128.0 * at(curve.len() as f64 / RATE)).round() as i32);
+    trim_held(&mut v);
+    v
+}
+
+/// A table's last values held: written once.
+fn trim_held(v: &mut Vec<i32>) { while v.len() > 1 && v[v.len() - 2] == v[v.len() - 1] { v.pop(); } }
+
+/// A table's values as `#TABLE` text: runs that lie on a line (to within one) as `(from,to)count`.
+fn table_text(v: &[i32]) -> String {
+    let (mut out, mut i) = (vec![], 0);
+    while i < v.len() {
+        // (The longest run from `i` that `(v[i],v[j])` with j - i values gives back.)
+        let fits = |j: usize| (0..j - i).all(|k| { let x = v[i] as f64 + (v[j] - v[i]) as f64 * k as f64 / (j - i) as f64; ((x + 0.5).trunc() as i32 - v[i + k]).abs() <= 1 });
+        match (i + 3..v.len()).take_while(|&j| fits(j)).last() {
+            Some(j) => { out.push(format!("({},{}){}", v[i], v[j], j - i)); i = j }
+            None => { out.push(v[i].to_string()); i += 1 }
+        }
+    }
+    out.join(",")
+}
+
 /// SiON rates for envelope stages (steps as above, each with how much its accuracy counts), and the envelope clock
 /// (`@clock`, percent) that brings them closest: SiON's rates are 19% apart, so a long decay could otherwise end
 /// up a decibel or two off. (The clock only where some rate is more than 3% closer for it.)
@@ -765,8 +807,9 @@ fn grid(times: &[f64]) -> (f64, f64) {
         if (b / per - 1.0).abs() > 0.02 { break }
         (per, ph) = (b, my - b * mx);
     }
-    // (Moved back by whole rows to the first key-on, so every note is at or after it.)
-    (per, ph - per * ((ph - t[0]) / per).ceil())
+    // (Moved back by whole rows to the first key-on, so every note is at or after it, give or take the timing
+    // jitter the key-ons snap by: a first key-on just before a row is on it.)
+    (per, ph - per * ((ph - t[0]) / per - 1.0 / 6.0).ceil())
 }
 
 /// The key a sample plays at P = $1000 (32 kHz): the whole part from its pitch (the period of its loop, or of its
@@ -786,41 +829,103 @@ fn base_key(b: &Brr, ps: &[u32]) -> f64 {
     (k - frac).round() + frac
 }
 
-/// The DSP's Gaussian interpolation, as far as it differs from SiON's linear one: a gentle low-pass in the
-/// sample's own frames (`GAUSS` either side; a loop's frames wrap round to its start).
+/// The DSP's Gaussian interpolation, as far as it differs from SiON's linear one, for the wavetables (PMON):
+/// a gentle low-pass in the sample's own frames (`GAUSS` either side). (Samples themselves are played with the
+/// real thing: SiON has it for BRR.)
 const GAUSS: f64 = 0.15;
-fn soften(d: &[i16], lp: Option<usize>) -> Vec<i16> {
-    let n = d.len();
-    let at = |i: isize| -> f64 {
-        if i < 0 { return 0.0 }
-        let i = i as usize;
-        match lp { _ if i < n => d[i] as f64, Some(l) if n > l => d[l + (i - n) % (n - l)] as f64, _ => 0.0 }
-    };
-    (0..n as isize).map(|i| (GAUSS * at(i - 1) + (1.0 - 2.0 * GAUSS) * at(i) + GAUSS * at(i + 1)).round().clamp(-32768.0, 32767.0) as i16).collect()
+
+/// How long an `@lfo` frame lasts (seconds) under envelope clock `clock` (`@clock`, percent): SiON's LFO counts
+/// 255 steps a 1/60 s frame (256 a round), at the envelope's clock.
+fn lfo_frame(clock: u32) -> f64 { 256.0 / 255.0 / 60.0 / (clock.max(1) as f64 / 100.0) }
+
+/// A 256-step LFO table for a round of `secs`: how many rounds it holds (1 to 8: the fewest that bring the rate
+/// within 0.5% with a whole number of LFO frames, else the closest) and its LFO frames.
+fn lfo_fit(secs: f64, clock: u32) -> (usize, f64) {
+    crate::score::lfo_rounds(secs / lfo_frame(clock))
 }
 
 /// Below this rate (Hz) a pitch-modulating voice is a vibrato, played as SiON's pitch LFO (`@lfo`, `mp`).
 const LFO_HZ: f64 = 20.0;
 
 /// SiON's pitch LFO for a modulator `m` playing sample `b` at up to `env` (envelope, full scale 1): `@lfo` with the
-/// loop's shape (`#TABLE`, 256 steps: several cycles of it when that brings the rate, a whole number of 1/60 s
-/// frames, within 0.5%), and its depth (`mp`, 1/64 semitones) at that envelope. The DSP's modulation is in
+/// loop's shape (`#TABLE`, 256 steps: several cycles of it when that brings the rate, a whole number of LFO
+/// frames (`lfo_frame`, under the note's envelope clock), within 0.5%), and its depth (`mp`, 1/64 semitones) at that envelope. The DSP's modulation is in
 /// frequency, × (1 + level), SiON's in pitch: the table is the level's log (1 + level) at that envelope, so a deep
 /// one rises less than it falls, as on the DSP; lower envelopes scale it down.
-fn vibrato(m: &Raw, b: &Brr, env: f64, defs: &mut Defs) -> Option<(String, f64)> {
+fn vibrato(m: &Raw, b: &Brr, env: f64, clock: u32, defs: &mut Defs) -> Option<(String, f64)> {
     let lp = loop_of(b)?;
     let hz = loop_hz(m.p0, lp.len());
-    let frames = 60.0 / hz;
-    let err = |k: usize| { let n = (frames * k as f64).round().max(1.0); (n, (n / k as f64 / frames - 1.0).abs()) };
-    let k = (1..=8).find(|&k| err(k).1 < 0.005).unwrap_or_else(|| (1..=8).min_by(|&a, &c| err(a).1.total_cmp(&err(c).1)).unwrap());
-    if env <= 0.0 || err(k).0 > 32767.0 { return None }
+    let (k, nf) = lfo_fit(1.0 / hz, clock);
+    if env <= 0.0 || nf > 32767.0 { return None }
     let at = |p: f64| { let p = p * lp.len() as f64; let (i, f) = (p as usize % lp.len(), p.fract()); lp[i] as f64 * (1.0 - f) + lp[(i + 1) % lp.len()] as f64 * f };
     // (The pitch can't go below zero: down to 6 octaves.)
     let semis: Vec<f64> = (0..256).map(|i| 12.0 * (1.0 + env * at((i * k) as f64 / 256.0 % 1.0)).max(1.0 / 64.0).log2()).collect();
     let top = semis.iter().fold(0f64, |p, v| p.max(v.abs()));
     if top <= 0.0 { return None }
-    let body: Vec<String> = semis.iter().map(|v| ((128.0 + 127.0 * v / top).round().clamp(0.0, 255.0) as i32).to_string()).collect();
-    Some((format!("@lfo{},{}", err(k).0, defs.table(&body.join(","))), top * 64.0))
+    Some((lfo_cmd(nf, semis.iter().map(|v| 128.0 + 127.0 * v / top), defs), top * 64.0))
+}
+
+/// `@lfo` of `nf` frames a round, its shape a table of the values (0-255, rounded).
+fn lfo_cmd(nf: f64, vals: impl Iterator<Item = f64>, defs: &mut Defs) -> String {
+    let body: Vec<String> = vals.map(|v| (v.round().clamp(0.0, 255.0) as i32).to_string()).collect();
+    format!("@lfo{nf},{}", defs.table(&body.join(",")))
+}
+
+/// A driver's vibrato: where a note's pitch writes go round the same values, write after write (at least twice
+/// round, a set time each round; the longest such run): SiON's pitch LFO there. (DSP samples it starts and
+/// stops at, samples a round, and the pitch at any time in it; the writes after it, such as the next note's pitch
+/// set just before its key-on, stay as they are.)
+struct DriverVib { at: u64, until: u64, period: f64, seq: Vec<(u64, u32)> }
+
+impl DriverVib {
+    fn find(start: u64, end: u64, p0: u32, pitch: &[(u64, u32)]) -> Option<DriverVib> {
+        // (A pitch written a byte at a time passes through a value it never meant: the one a moment later counts.)
+        let mut seq = vec![(start, p0)];
+        for (k, &(t, p)) in pitch.iter().enumerate() {
+            if pitch.get(k + 1).is_some_and(|n| n.0 - t < 16) { continue }
+            if seq.last().is_some_and(|l| l.1 == p) { continue }
+            seq.push((t, p));
+        }
+        let n = seq.len();
+        for m in 2..=48.min(n / 2) {
+            // The longest run that repeats every `m` writes: writes j..e (e - m of them match the one m on).
+            let (mut best, mut i) = ((0, 0), 0);
+            while i + m < n {
+                let j = i;
+                while i + m < n && seq[i].1 == seq[i + m].1 { i += 1 }
+                if i - j > best.1 - best.0 { best = (j, i) }
+                i += 1;
+            }
+            let (mut j, e) = (best.0, best.1 + m);
+            if e - j < 2 * m + 1 { continue }
+            // (Each round's time, against the usual one: the vibrato starts with the first write on the driver's
+            // beat, not at the key-on.)
+            let all: Vec<u64> = (j..e - m).map(|i| seq[i + m].0 - seq[i].0).collect();
+            let mut sorted = all.clone();
+            sorted.sort_unstable();
+            let usual = sorted[sorted.len() / 2];
+            let j0 = j;
+            let tol = (usual / 50).max(64);
+            while j + 2 * m < e && seq[j + m].0 - seq[j].0 > usual + tol || seq[j + m].0 - seq[j].0 + tol < usual { j += 1 }
+            if e - j < 2 * m + 1 { continue }
+            let until = seq.get(e).map_or(end, |x| x.0);
+            let rounds = &all[j - j0..];
+            let (lo, hi) = (*rounds.iter().min()?, *rounds.iter().max()?);
+            let period = rounds.iter().sum::<u64>() as f64 / rounds.len() as f64;
+            let (pmin, pmax) = (seq[j..j + m].iter().map(|x| x.1).min()?, seq[j..j + m].iter().map(|x| x.1).max()?);
+            if pmin == pmax || (hi - lo) as f64 > (0.02 * period).max(64.0) || period < RATE * 0.03 || period > RATE * 2.0 { continue }
+            seq.truncate(e);
+            return Some(DriverVib { at: seq[j].0, until, period, seq });
+        }
+        None
+    }
+
+    /// The pitch `t` DSP samples into the vibrato (as its first round goes).
+    fn at(&self, t: f64) -> u32 {
+        let t = self.at as f64 + t.rem_euclid(self.period);
+        let i = self.seq.partition_point(|x| (x.0 as f64) <= t);
+        self.seq[i.max(1) - 1].1
+    }
 }
 
 /// A sample's loop (frames, full scale 1), if it has one.
@@ -844,7 +949,10 @@ fn loop_wave(b: &Brr, integrate: bool, defs: &mut Defs) -> Option<(usize, f32, u
 
 /// A key's detune from the note's `key` in 1/64 semitones. (Detunes of a few 64ths are the drivers' pitch tables
 /// rounding: inaudible.)
-fn detune(k: f64, key: f64) -> i32 { let k = ((k - key) * 64.0).round() as i32; if k.abs() <= 3 { 0 } else { k } }
+fn detune(k: f64, key: f64) -> i32 { rounded_detune((k - key) * 64.0) }
+
+/// A detune in 1/64 semitones, rounded (a few 64ths either way: none).
+fn rounded_detune(d: f64) -> i32 { let d = d.round() as i32; if d.abs() <= 3 { 0 } else { d } }
 
 /// The value at `t` of a sorted list of changes (`before` the first).
 fn step_at<T: Copy>(xs: &[(u64, T)], t: u64, before: T) -> T { let i = xs.partition_point(|x| x.0 <= t); if i == 0 { before } else { xs[i - 1].1 } }
@@ -1006,22 +1114,20 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         header.push(format!("#EFFECT1{{delay{},{},0,100}}", e[0] as u32 * 16, fb.round()));
     }
 
-    // Tones: the sample and its envelope, with its falls fitted over how long its notes usually last (the median);
-    // SiON's rates go up with the key (by `kc >> 5`), so each tone's are taken down by that at its usual key.
+    // Tones: the sample and its envelope, with its falls fitted over how long its notes usually last (the median).
     let mut defs = Defs::default();
     let mut pcm: HashMap<usize, Option<usize>> = HashMap::new();
     let tone_of = |r: &Raw| (r.smp, r.env, r.noise.is_some());
-    let mut usual: HashMap<(usize, Env, bool), (Vec<f64>, Vec<u64>)> = HashMap::new();
-    for r in &raws { let u = usual.entry(tone_of(r)).or_default(); u.0.push(key_of(r, r.p0)); u.1.push(r.end - r.start) }
-    // (Per tone: the rate scaling at its median key, and its median length.)
-    let usual: HashMap<(usize, Env, bool), (i32, u64)> = usual.into_iter().map(|(k, (mut keys, mut lens))| {
-        keys.sort_by(f64::total_cmp);
-        lens.sort();
-        (k, (((keys[keys.len() / 2].round() as i32 - 16).clamp(0, 127)) >> 5, lens[lens.len() / 2]))
-    }).collect();
+    let mut lens: HashMap<(usize, Env, bool), Vec<u64>> = HashMap::new();
+    for r in &raws { lens.entry(tone_of(r)).or_default().push(r.end - r.start) }
+    // (Per tone: its median length, and its longest.)
+    let usual: HashMap<(usize, Env, bool), (u64, u64)> = lens.into_iter().map(|(k, mut l)| { l.sort(); (k, (l[l.len() / 2], l[l.len() - 1])) }).collect();
     // (Envelope fits, per (decay, sustain level, sustain rate, length) and release: the same for every note of a tone.)
     let mut adsr_fits: HashMap<(u8, u8, u8, u64), (f64, f64, i32)> = HashMap::new();
     let mut release_fits: HashMap<u32, f64> = HashMap::new();
+    // (Per envelope: whether it rises slowly; per envelope and length, its rise as `na` with its table.)
+    let mut slow_rise: HashMap<Env, bool> = HashMap::new();
+    let mut rises: HashMap<(Env, usize), String> = HashMap::new();
     let mut notes = vec![];
     let mut full = false;
     // Each note's next key-on on the same voice.
@@ -1061,7 +1167,7 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
     let mut vib_done = vec![false; raws.len()];
     // (Per modulator sample and pitch.)
     let mut quiet_env = vec![String::new(); raws.len()];
-    let mut lfo_of: HashMap<(usize, u32), Option<(String, f64)>> = HashMap::new();
+    let mut lfo_of: HashMap<(usize, u32, u32), Option<(String, f64)>> = HashMap::new();
     for (ri, r) in raws.iter().enumerate() {
         let Some(m) = slow[ri] else { continue };
         let e = &dsp.envs[r.voice - 1];
@@ -1079,8 +1185,8 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
                 let bk = base[&r.smp];
                 let key = bk.round();
                 let rate = (RATE * 2f64.powf((key - bk) / 12.0) * 1000.0).round() / 1000.0;
-                let bytes: Vec<u8> = soften(&b.data, b.lp).iter().flat_map(|v| v.to_le_bytes()).collect();
-                defs.pcm(pcmb(&bytes, rate, key, b.lp, 1))
+                // (As BRR, which SiON decodes and plays as the DSP does, with its Gaussian interpolation.)
+                defs.pcm(pcmb(b.blocks.as_flattened(), rate, key, b.lp, 8))
             }) else { full = true; continue };
             format!("%7@{n}")
         };
@@ -1090,7 +1196,7 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
             (true, _) => ((f64::INFINITY, 0.0, 0.0), 0),
             (_, Env::Adsr(a, d, s, sr)) => {
                 let a = if a == 15 { f64::INFINITY } else { rise_inc(RATES[a as usize * 2 + 1]) };
-                let len = usual[&tone_of(r)].1;
+                let len = usual[&tone_of(r)].0;
                 let (di, si, sl) = *adsr_fits.entry((d, s, sr, len)).or_insert_with(|| adsr_fit(d, s, sr, len));
                 ((a, di, si), sl)
             }
@@ -1106,10 +1212,20 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         let key_at = |p: u32| match wav { Some((_, _, n)) => hz_key(loop_hz(p, n)) as f64, None => key_of(r, p) };
         let k0 = key_at(r.p0);
         let key = k0.round().clamp(0.0, 127.0);
-        let ks = if wav.is_some() { ((key as i32 - 16).clamp(0, 127)) >> 5 } else { usual[&tone_of(r)].0 };
+        // (SiON's rates go up with the key: taken down by as much at this note's.)
+        let ks = ((key as i32 - 16).clamp(0, 127)) >> 5;
         if let Some((_, peak, _)) = wav { amp *= peak }
         let adj = |x: i32| if x == 0 || x >= 63 { x } else { (x - ks).clamp(1, 62) };
-        let [ar, dr, sr, rr] = [adj(rates[0]), adj(rates[1]), adj(rates[2]), adj(rates[3])];
+        let [mut ar, mut dr, mut sr, rr] = [adj(rates[0]), adj(rates[1]), adj(rates[2]), adj(rates[3])];
+        let mut sl = sl;
+        // A slow rise: the DSP's envelope as a table of the expression (as long as the tone's notes last), and
+        // SiON's held at full.
+        let mut rise = String::new();
+        if r.manual.is_none() && *slow_rise.entry(r.env).or_insert_with(|| env_curve(r.env, 0).1 >= SLOW_RISE) {
+            let len = usual[&tone_of(r)].1 as usize;
+            rise = rises.entry((r.env, len)).or_insert_with(|| format!("na{}", defs.table(&table_text(&env_table(&env_curve(r.env, len).0))))).clone();
+            (ar, dr, sr, sl) = (63, 0, 0, 0);
+        }
         let tone = if r.noise.is_some() { 1 } else { instr[3..].parse().unwrap() };
         let send = if echo_on { format!("@v64,{}", if r.echo { send } else { 0 }) } else { String::new() };
         // Key-offs: a gap before the voice's next key-on (drivers key off a set time, or a fraction of the note,
@@ -1128,12 +1244,12 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         let level = r.noise.map_or(1.0, |hz| noise_level(hz));
         let mut n = Note::new(r.voice as u32, start, stop, key as u8, amp * level, instr[..2].to_string());
         let clk = if clock == 100 { String::new() } else { format!("@clock{clock}") };
-        n.env = format!("@{tone},{ar},{dr},{sr},{rr},{sl}{send}{clk}");
+        n.env = format!("@{tone},{ar},{dr},{sr},{rr},{sl}{send}{clk}{rise}");
         // (Without the echo send, for a copy into a pipe: it is not heard.)
-        quiet_env[ri] = format!("{ar},{dr},{sr},{rr},{sl}{clk}");
+        quiet_env[ri] = format!("{ar},{dr},{sr},{rr},{sl}{clk}{rise}");
         if let Some(m) = slow[ri] {
             let top = vib_env[&raws[m].smp];
-            let lfo = lfo_of.entry((raws[m].smp, raws[m].p0)).or_insert_with(|| vibrato(&raws[m], &dsp.samples[raws[m].smp], top, &mut defs));
+            let lfo = lfo_of.entry((raws[m].smp, raws[m].p0, clock)).or_insert_with(|| vibrato(&raws[m], &dsp.samples[raws[m].smp], top, clock, &mut defs));
             if let Some((cmd, full)) = lfo.clone() {
                 n.env.push_str(&cmd);
                 // The depth as the modulator's envelope goes (its VOL doesn't count), on each tick it changes.
@@ -1146,8 +1262,51 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
             }
         }
         n.pan = r.vol0.1;
-        n.k0 = detune(k0, key);
-        for &(t, p) in &r.pitch { n.bends.push((tick(t), detune(key_at(p), key))) }
+        // A vibrato the driver makes (and not PMON's) as SiON's LFO, in its shape: `@lfo` with a table of 256 steps
+        // (one or several rounds, for a whole number of LFO frames to the table), from where it starts (the LFO
+        // starts again at each key-on, and stands still while its depth is 0); `mp` its depth, from there, and `k`
+        // its centre.
+        let vib = if slow[ri].is_none() && r.noise.is_none() { DriverVib::find(r.start, r.end, r.p0, &r.pitch) } else { None };
+        let (bent, unbent) = vib.as_ref().map_or((u64::MAX, u64::MAX), |v| (v.at, v.until));
+        // The detune as it goes, exactly (1/64 semitones; DSP sample, value), from `dev0` at the key-on.
+        let dev_of = |p: u32| (key_at(p) - key) * 64.0;
+        let (mut dev0, mut kb, mut after) = (dev_of(r.p0), vec![], vec![]);
+        for &(t, p) in &r.pitch {
+            if t < bent { kb.push((t, dev_of(p))) } else if t >= unbent { after.push((t, dev_of(p))) }
+        }
+        if let Some(v) = &vib {
+            let (_, nf) = lfo_fit(v.period / RATE, clock);
+            let span = nf * lfo_frame(clock) * RATE; // (the table, DSP samples)
+            let dev: Vec<f64> = (0..256).map(|i| dev_of(v.at((i as f64 + 0.5) / 256.0 * span))).collect();
+            let (lo, hi) = dev.iter().fold((f64::MAX, f64::MIN), |a, &d| (a.0.min(d), a.1.max(d)));
+            let (centre, depth) = ((hi + lo) / 2.0, (hi - lo) / 2.0);
+            n.env.push_str(&lfo_cmd(nf, dev.iter().map(|d| 127.5 + 127.5 * (d - centre) / depth), &mut defs));
+            let mp = depth.round().max(1.0) as i32;
+            if tick(v.at) > n.start {
+                kb.push((v.at, centre));
+                n.lfos.push((tick(v.at), (mp, 0)));
+            } else { (dev0, n.lfo0) = (centre, (mp, 0)) }
+            if let Some(&(t, _)) = after.first() { if tick(t) > n.start { n.lfos.push((tick(t), (0, 0))) } }
+            kb.extend(after);
+        }
+        // Written as `k` steps (a few 64ths either way are the drivers' pitch tables rounding: none)...
+        n.k0 = rounded_detune(dev0);
+        n.bends = kb.iter().map(|&(t, d)| (tick(t), rounded_detune(d))).collect();
+        // ...or, a slide, as a pitch table (`np`, a value a 1/60 s frame from the key-on, to within a 64th, in
+        // runs that lie on a line), where that is shorter: its lowest value the note's detune, so none is
+        // negative. (Under the vibrato's LFO, the table moves its centre.)
+        let slurs: usize = n.bends.windows(2).filter(|w| w[0].1 != w[1].1).count() + 1;
+        if kb.len() >= 3 && slurs * 8 > 12 && defs.room() {
+            let frame = RATE / 60.0;
+            let vals: Vec<f64> = (0..((r.end - r.start) as f64 / frame).ceil().max(1.0) as usize).map(|i| step_at(&kb, (r.start as f64 + (i as f64 + 0.5) * frame) as u64, dev0)).collect();
+            let base = vals.iter().fold(f64::MAX, |a, &v| a.min(v)).round();
+            let top = vals.iter().fold(f64::MIN, |a, &v| a.max(v));
+            let mut ints: Vec<i32> = vals.iter().map(|v| (v - base).round().max(0.0) as i32).collect();
+            trim_held(&mut ints);
+            let text = table_text(&ints);
+            // (Within two octaves: a sweep down to nothing stays as it was.)
+            if top - base <= 24.0 * 64.0 && text.len() + 12 < slurs * 8 { (n.k0, n.ptab) = (base as i32, Some(defs.table(&text) as u8)); n.bends.clear() }
+        }
         // Volume: VOL × MVOL, times the envelope where it's followed step by step.
         let env_at = |t: u64| r.manual.as_ref().map_or(1.0, |m| step_at(m, t, 0.0));
         let vol_at = |t: u64| step_at(&r.vols, t, r.vol0);
@@ -1225,7 +1384,7 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
             n.key = k0.round().clamp(0.0, 127.0) as u8;
             let key = n.key as f64;
             n.k0 = detune(k0, key);
-            n.bends = rm.pitch.iter().map(|&(t, p)| (tick(t), detune(key_at(p), key))).collect();
+            (n.bends, n.ptab) = (rm.pitch.iter().map(|&(t, p)| (tick(t), detune(key_at(p), key))).collect(), None);
             (n.instr, n.env) = ("%4".into(), format!("@{w},{rest}@o1,{pipe}"));
         } else {
             n.env = format!("@1,{rest}@o1,{pipe}");
@@ -1277,6 +1436,13 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
     // (A tone's `@n` leaves the envelope clock as it was: a track that sets it anywhere sets it with every tone.)
     let clocked: HashSet<u32> = notes.iter().filter(|n| n.env.contains("@clock")).map(|n| n.ch).collect();
     for n in notes.iter_mut().filter(|n| clocked.contains(&n.ch) && !n.env.contains("@clock")) { n.env.push_str("@clock100") }
+    // (Nor does it end a rise's table, which holds the expression where it got to: on a track that has them, the
+    // other tones set it back to full.)
+    let risen: HashSet<u32> = notes.iter().filter(|n| n.env.contains("na")).map(|n| n.ch).collect();
+    if !risen.is_empty() {
+        let full = format!("na{}", defs.table("128"));
+        for n in notes.iter_mut().filter(|n| risen.contains(&n.ch) && !n.env.contains("na")) { n.env.push_str(&full) }
+    }
     // Each sample with its envelope and settings is an instrument (`#PCMWAVE`, `#PCMVOICE`): a note changing to it
     // chooses it by number (`@n`), not with all of it again. (Over 256 of them, the notes keep them in full.)
     let tones: HashSet<&str> = notes.iter().filter(|n| n.instr == "%7").map(|n| n.env.as_str()).collect();
@@ -1299,11 +1465,27 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
 
     let title = [tags.game.as_str(), tags.title.as_str()].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" - ");
     let title = if tags.artist.is_empty() { title } else { format!("{title} ({})", tags.artist) };
-    // The loop point on the next whole row, so the song's bars line up with it (the end moves with it, keeping
-    // the loop's length).
+    // The loop point moved on to the next bar line of the music (16 rows, from the row the most of the notes'
+    // lengths start on), so the lines it is written in are its bars: the end moves with it, keeping the loop's
+    // length, and the notes of the loop's first part are played again after the end, where the loop now runs on.
     let (mut end_t, mut lp_t) = (tick(end), lp.map(tick));
     if let Some(l) = &mut lp_t {
-        let d = (12 - *l % 12) % 12;
+        const BAR: u64 = 192;
+        let mut on: HashMap<u64, u64> = HashMap::new();
+        for n in &notes { *on.entry(n.start % BAR).or_default() += n.end - n.start }
+        let phase = (0..16).map(|r| r * 12).max_by_key(|p| (on.get(p).copied().unwrap_or(0), std::cmp::Reverse(*p))).unwrap();
+        let d = (BAR + phase - *l % BAR) % BAR;
+        let span = end_t - *l;
+        // (A note held across the loop point is the one a loop later, cut short at the end: it goes on instead.)
+        let again: Vec<Note> = notes.iter().filter(|n| n.start < *l + d && n.end > *l).map(|n| {
+            let mut n = n.clone();
+            n.map_times(|t| t + span);
+            if n.end > end_t + d { n.clip(end_t + d) }
+            n
+        }).collect();
+        notes.retain(|m| !again.iter().any(|n| n.start < end_t && n.ch == m.ch && n.key == m.key && n.start.abs_diff(m.start) <= 3));
+        notes.extend(again);
+        crate::score::monophonic(&mut notes);
         *l += d;
         end_t += d;
     }

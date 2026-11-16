@@ -99,11 +99,11 @@ fn set_sample_replaces_the_cuts_too() {
     let mml = "#PCMB0{AAAA}; #PCMWAVE1{0,,,,,100}; %7@1 o5c1;";
     let data: Vec<f32> = (0..2000).map(|i| (i % 50) as f32 / 50.0 - 0.5).collect();
     let mut song = Song::new(mml);
-    song.set_sample(0, Sample { data: data.clone(), rate: 22050.0, key: 60, lp: None, bidi: false });
+    song.set_sample(0, Sample { data: data.clone(), rate: 22050.0, key: 60, lp: None, ..Default::default() });
     let mut a = vec![0f32; 8192 * 2];
     song.render(&mut a);
     let mut song = Song::new("%7@0 o5c1;");
-    song.set_sample(0, Sample { data: data[100..].to_vec(), rate: 22050.0, key: 60, lp: None, bidi: false });
+    song.set_sample(0, Sample { data: data[100..].to_vec(), rate: 22050.0, key: 60, lp: None, ..Default::default() });
     let mut b = vec![0f32; 8192 * 2];
     song.render(&mut b);
     assert!(energy(&a) > 0.1);

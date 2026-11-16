@@ -1,4 +1,4 @@
-//! sion-convert: MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ, GYM, S98, NSF/NSFE and SPC → SiON MML, written as by hand.
+//! sion-convert: MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ, GYM, S98, NSF/NSFE/NSF2, GBS and SPC → SiON MML, written as by hand.
 //!
 //! Usage: sion-convert <input> [-o output.mml] [--grid N] [--gain G] [--wavetables] [--exact] [--exact-pcm] [--track N] [--plain] [--verify] [--wav FILE]
 
@@ -8,7 +8,7 @@ const HELP: &str = "usage: sion-convert <input> [options]
        sion-convert <song.mml> --wav FILE   (render an MML file)
 
   input: Standard MIDI (.mid), tracker module (.mod .s3m .xm .it), chip log (.vgm .vgz .gym .s98) or NES music
-         (.nsf .nsfe) or SNES music (.spc);
+         (.nsf .nsfe), Game Boy music (.gbs) or SNES music (.spc);
          the format is recognized from the file's contents
 
   -o, --output FILE  where to write the MML (default: input name with .mml)
@@ -19,7 +19,7 @@ const HELP: &str = "usage: sion-convert <input> [options]
   --exact            tracker modules: convert tick by tick, exactly (every volume, pan and pitch step, sample
                      positions), minified; by default the song is written as by hand: per row, laid out by
                      its patterns, repeats as loops and macros
-  --track N          NSF/NSFE: which song of the file to convert (from 1; default: the file's first song)
+  --track N          NSF/NSFE/GBS: which song of the file to convert (from 1; default: the file's first song)
   --exact-pcm        VGM/NSF: capture samples exactly as the chips output them (timing jitter and all) instead of
                      storing each sound once (many times larger)
   --plain            write the plain MML (one command per event) instead

@@ -9,7 +9,7 @@
 
 use crate::chips::{Ay8910, Chip};
 use crate::pcm::{adpcm_a, adpcm_b, def, small, Bank, Capture, Hit};
-use crate::score::{hz_key, Defs, Frame, Stream};
+use crate::score::{hz_key, lfo_rounds, Defs, Frame, Stream};
 
 /// One FM channel's registers, operators in SiON's order (S1, S2, S3, S4: the modulation chain of algorithm 0).
 #[derive(Clone, Default)]
@@ -95,12 +95,9 @@ impl Ch {
 /// rounds badly becomes several cycles of SiON's triangle in one custom waveform (`#TABLE`, 256 steps) over a whole
 /// number of frames (within 0.5%).
 fn lfo_cmd(defs: &mut Defs, frames: f64) -> String {
-    let err = |k: f64| { let n = (frames * k).round().max(1.0); (n, (n / k / frames - 1.0).abs()) };
-    if err(1.0).1 < 0.005 { return format!("@lfo{}", err(1.0).0) }
     // (At most 8 cycles: at least 32 steps each, as many as the chip's vibrato has.)
-    let k = (1..=8).find(|&k| err(k as f64).1 < 0.005)
-        .unwrap_or_else(|| (1..=8).min_by(|&a, &b| err(a as f64).1.total_cmp(&err(b as f64).1)).unwrap_or(1));
-    let (n, _) = err(k as f64);
+    let (k, n) = lfo_rounds(frames);
+    if k == 1 && (n / frames - 1.0).abs() < 0.005 { return format!("@lfo{n}") }
     // Each cycle: from the middle up to the top, down to the bottom, back to the middle, as SiON's triangle.
     let mut body = vec![];
     for j in 0..k {

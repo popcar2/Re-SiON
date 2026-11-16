@@ -575,6 +575,19 @@ fn scale_periods() -> ([u8; 5], [u8; 5]) {
     (std::array::from_fn(|k| t[k] as u8), std::array::from_fn(|k| (t[k] >> 8) as u8 | 0xf8))
 }
 
+/// One frame of a driver that plays the scale on pulse 1 (a note every 12 frames, from the tables at $9040 and
+/// $9048), its frame counter in $00 and note in $01.
+const SCALE_TICK: &[u8] = &[
+    0xa5, 0x00, 0xd0, 0x1c, // LDA $00; BNE skip
+    0xa6, 0x01, 0xa9, 0xbf, 0x8d, 0x00, 0x40, // LDX $01; LDA #$BF; STA $4000
+    0xbd, 0x40, 0x90, 0x8d, 0x02, 0x40, // LDA $9040,X; STA $4002
+    0xbd, 0x48, 0x90, 0x8d, 0x03, 0x40, // LDA $9048,X; STA $4003
+    0xe8, 0xe0, 0x05, 0xd0, 0x02, 0xa2, 0x00, // INX; CPX #5; BNE ok; LDX #0
+    0x86, 0x01, // ok: STX $01
+    0xe6, 0x00, 0xa5, 0x00, 0xc9, 0x0c, 0xd0, 0x04, 0xa9, 0x00, 0x85, 0x00, // skip: INC $00; LDA $00; CMP #12; BNE done; LDA #0; STA $00
+    0x60, // done: RTS
+];
+
 /// A driver that plays the scale on pulse 1, a note every 12 frames, and starts over after the fifth: its
 /// state (frame counter $00, note $01) comes round after 60 frames, so the song loops.
 /// Bankswitched: the code is in bank 0 at $8000, the note tables in bank 2 at $9000 (bank 1 is filler), and a
@@ -586,16 +599,7 @@ fn looping_scale() -> Vec<u8> {
         0xa9, 0x00, 0x85, 0x00, 0x85, 0x01, // LDA #0; STA $00; STA $01
         0x4c, 0x00, 0x81, // JMP $8100 (DPCM)
     ]);
-    put(&mut p, 0x8010, &[
-        0xa5, 0x00, 0xd0, 0x1c, // LDA $00; BNE skip
-        0xa6, 0x01, 0xa9, 0xbf, 0x8d, 0x00, 0x40, // LDX $01; LDA #$BF; STA $4000
-        0xbd, 0x40, 0x90, 0x8d, 0x02, 0x40, // LDA $9040,X; STA $4002
-        0xbd, 0x48, 0x90, 0x8d, 0x03, 0x40, // LDA $9048,X; STA $4003
-        0xe8, 0xe0, 0x05, 0xd0, 0x02, 0xa2, 0x00, // INX; CPX #5; BNE ok; LDX #0
-        0x86, 0x01, // ok: STX $01
-        0xe6, 0x00, 0xa5, 0x00, 0xc9, 0x0c, 0xd0, 0x04, 0xa9, 0x00, 0x85, 0x00, // skip: INC $00; LDA $00; CMP #12; BNE done; LDA #0; STA $00
-        0x60, // done: RTS
-    ]);
+    put(&mut p, 0x8010, SCALE_TICK);
     // DPCM: $C000, 17 bytes, the top rate, from level 64.
     put(&mut p, 0x8100, &[0xa9, 64, 0x8d, 0x11, 0x40, 0xa9, 0x00, 0x8d, 0x12, 0x40, 0xa9, 0x01, 0x8d, 0x13, 0x40, 0xa9, 0x0f, 0x8d, 0x10, 0x40, 0xa9, 0x1f, 0x8d, 0x15, 0x40, 0x60]);
     p.resize(0x1000, 0);
@@ -732,6 +736,161 @@ fn nsfe_chunks_and_tracks() {
     let second = convert(&f, &Options { track: Some(2), ..Options::default() }).unwrap();
     assert!(second.warnings.iter().any(|w| w.contains("track 2 of 2 (Second)")));
     assert!(convert(&f, &Options { track: Some(3), ..Options::default() }).is_err());
+}
+
+/// An NSF2 (`flags`: header byte $7C) of an unbanked program, with the scale's tables at $9040 and $9048, INIT
+/// at `init` and PLAY at `play`, played at `us` microseconds a frame; `meta`: NSFE chunks after the program.
+fn nsf2(flags: u8, init: u16, play: u16, us: u16, prog: &mut Vec<u8>, meta: &[u8]) -> Vec<u8> {
+    let (lo, hi) = scale_periods();
+    put(prog, 0x9040, &lo);
+    put(prog, 0x9048, &hi);
+    let mut f = nsf(1, [0; 8], 0, prog);
+    (f[5], f[0x7c]) = (2, flags);
+    for (o, v) in [(0x0a, init), (0x0c, play), (0x6e, us)] { f[o..o + 2].copy_from_slice(&v.to_le_bytes()) }
+    if !meta.is_empty() {
+        let n = prog.len() as u32;
+        f[0x7d..0x80].copy_from_slice(&n.to_le_bytes()[..3]);
+        f.extend_from_slice(meta);
+    }
+    f
+}
+
+/// A non-returning INIT: the first call (Y = $80) sets up and returns; the second (Y = $81) loops for good,
+/// playing a frame of the scale whenever PLAY (an NMI, at $8080) has set the flag in $05.
+fn nsf2_non_returning(meta: &[u8], flags: u8) -> Vec<u8> {
+    let mut p = vec![];
+    put(&mut p, 0x8000, &[
+        0xc0, 0x81, 0xf0, 0x5c, // CPY #$81; BEQ $8060
+        0xa9, 0x0f, 0x8d, 0x15, 0x40, // LDA #$0F; STA $4015
+        0xa9, 0x00, 0x85, 0x00, 0x85, 0x01, 0x85, 0x05, // LDA #0; STA $00; STA $01; STA $05
+        0x60, // RTS
+    ]);
+    put(&mut p, 0x8020, SCALE_TICK);
+    put(&mut p, 0x8060, &[
+        0xa5, 0x05, 0xf0, 0xfc, // wait: LDA $05; BEQ wait
+        0xa9, 0x00, 0x85, 0x05, // LDA #0; STA $05
+        0x20, 0x20, 0x80, 0x4c, 0x60, 0x80, // JSR tick; JMP wait
+    ]);
+    put(&mut p, 0x8080, &[0xa9, 0x01, 0x85, 0x05, 0x60]); // PLAY: LDA #1; STA $05; RTS
+    nsf2(0x20 | flags, 0x8000, 0x8080, 16639, &mut p, meta)
+}
+
+#[test]
+fn nsf2_non_returning_init() {
+    let out = check(&nsf2_non_returning(&[], 0));
+    assert_eq!(notes(&out.plain, 0), ["5c", "5e", "5g", "5a", "6c"]);
+    let lp = out.loop_secs.expect("a loop");
+    assert!((lp - 60.0 * 16639e-6).abs() < 0.01, "the loop is the 60 frames: {lp}");
+}
+
+#[test]
+fn nsf2_mandatory_chunks() {
+    let chunk = |id: &[u8]| { let mut c = 1u32.to_le_bytes().to_vec(); c.extend(id); c.push(0); c };
+    let end = [0u8, 0, 0, 0, b'N', b'E', b'N', b'D'];
+    // An unknown chunk named in lower case can be skipped; in capitals it is needed to play the file, when the
+    // header says the metadata has one (bit 7 of $7C).
+    let ok = [chunk(b"abcd"), end.to_vec()].concat();
+    let needed = [chunk(b"ABCD"), end.to_vec()].concat();
+    check(&nsf2_non_returning(&ok, 0x80));
+    check(&nsf2_non_returning(&needed, 0));
+    let e = convert(&nsf2_non_returning(&needed, 0x80), &Options::default()).err().expect("an error");
+    assert!(e.contains("'ABCD'"), "{e}");
+}
+
+/// PLAY suppressed: the music runs on IRQs, from the cycle timer (`timer`, every 29830 cycles) or the APU frame
+/// counter (4-step mode); the handler (at $8180, through the vector INIT writes to $FFFE) acknowledges the IRQ
+/// and plays a frame of the scale.
+fn nsf2_irq(timer: bool) -> Vec<u8> {
+    let mut p = vec![];
+    let n = 29830u16 - 1;
+    let source: Vec<u8> = if timer {
+        vec![0xa9, n as u8, 0x8d, 0x1b, 0x40, 0xa9, (n >> 8) as u8, 0x8d, 0x1c, 0x40, 0xa9, 0x01, 0x8d, 0x1d, 0x40] // reload; start
+    } else {
+        [vec![0xa9, 0x00, 0x8d, 0x17, 0x40], vec![0xea; 10]].concat() // LDA #0; STA $4017 (IRQs on); NOPs
+    };
+    put(&mut p, 0x8100, &[
+        &[0xa9, 0x0f, 0x8d, 0x15, 0x40][..], // LDA #$0F; STA $4015
+        &[0xa9, 0x00, 0x85, 0x00, 0x85, 0x01], // LDA #0; STA $00; STA $01
+        &[0xa9, 0x80, 0x8d, 0xfe, 0xff, 0xa9, 0x81, 0x8d, 0xff, 0xff], // the IRQ vector: $8180
+        &source,
+        &[0x58, 0x60], // CLI; RTS
+    ].concat());
+    put(&mut p, 0x8020, SCALE_TICK);
+    let ack: &[u8] = if timer { &[0xad, 0x1d, 0x40] } else { &[0xad, 0x15, 0x40] }; // LDA $401D / LDA $4015
+    put(&mut p, 0x8180, &[&[0x48, 0x8a, 0x48][..], ack, &[0x20, 0x20, 0x80, 0x68, 0xaa, 0x68, 0x40]].concat()); // PHA; TXA; PHA; ack; JSR tick; PLA; TAX; PLA; RTI
+    nsf2(0x10 | 0x40, 0x8100, 0x8000, 16667, &mut p, &[])
+}
+
+#[test]
+fn nsf2_irqs() {
+    for timer in [true, false] {
+        let out = check(&nsf2_irq(timer));
+        // (The IRQs come a little after the frames start: the loop, at a frame's start, falls just before the
+        // first note's key-on, which then starts the loop's last note and plays on into it.)
+        let n = notes(&out.plain, 0);
+        assert!(n.windows(5).any(|w| w == ["5c", "5e", "5g", "5a", "6c"]) && n.len() <= 7, "timer: {timer}: {n:?}");
+        let lp = out.loop_secs.expect("a loop");
+        assert!((lp - 60.0 * 29830.0 / 1789773.0).abs() < 0.02, "the loop is the 60 IRQs: {lp} (timer: {timer})");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// GBS: a small sound driver, hand-assembled, that the converter runs on its SM83.
+
+/// A GBS loaded at $0400 (INIT there, PLAY at $0420) that plays the scale on pulse 1, a note every 12 frames
+/// (frame counter at $C000, note at $C001), from tables in bank 2 at $4080 and $4088 (bank 1 holds others).
+fn gbs_scale(tma: u8, tac: u8) -> Vec<u8> {
+    let mut h = vec![0u8; 0x70];
+    h[..4].copy_from_slice(b"GBS\x01");
+    (h[4], h[5]) = (1, 1);
+    for (o, v) in [(6, 0x0400u16), (8, 0x0400), (0x0a, 0x0420), (0x0c, 0xfffe)] { h[o..o + 2].copy_from_slice(&v.to_le_bytes()) }
+    (h[0x0e], h[0x0f]) = (tma, tac);
+    h[0x10..0x15].copy_from_slice(b"Scale");
+    let mut d = vec![0u8; 0x8000 + 0x100 - 0x400];
+    let at = |a: usize| a - 0x400;
+    let init: &[u8] = &[
+        0xaf, 0xea, 0x00, 0xc0, 0xea, 0x01, 0xc0, // XOR A; LD ($C000),A; LD ($C001),A
+        0x3e, 0x80, 0xe0, 0x26, 0x3e, 0x77, 0xe0, 0x24, 0x3e, 0x11, 0xe0, 0x25, // NR52 on; NR50; NR51: pulse 1 both sides
+        0x3e, 0x02, 0xea, 0x00, 0x20, // LD A,2; LD ($2000),A (bank 2)
+        0xc9, // RET
+    ];
+    let play: &[u8] = &[
+        0xfa, 0x00, 0xc0, 0xa7, 0x20, 0x28, // LD A,($C000); AND A; JR NZ,skip
+        0x3e, 0x80, 0xe0, 0x11, 0x3e, 0xf0, 0xe0, 0x12, // NR11: 50% duty; NR12: volume 15
+        0xfa, 0x01, 0xc0, 0x5f, 0x16, 0x00, // LD A,($C001); LD E,A; LD D,0
+        0x21, 0x80, 0x40, 0x19, 0x7e, 0xe0, 0x13, // LD HL,$4080; ADD HL,DE; LD A,(HL); LDH ($13),A
+        0x21, 0x88, 0x40, 0x19, 0x7e, 0xf6, 0x80, 0xe0, 0x14, // LD HL,$4088; ADD HL,DE; LD A,(HL); OR $80; LDH ($14),A
+        0x7b, 0x3c, 0xfe, 0x05, 0x20, 0x01, 0xaf, 0xea, 0x01, 0xc0, // LD A,E; INC A; CP 5; JR NZ,+1; XOR A; LD ($C001),A
+        0xfa, 0x00, 0xc0, 0x3c, 0xfe, 0x0c, 0x20, 0x01, 0xaf, 0xea, 0x00, 0xc0, // skip: frame counter, 0-11
+        0xc9, // RET
+    ];
+    d[at(0x400)..at(0x400) + init.len()].copy_from_slice(init);
+    d[at(0x420)..at(0x420) + play.len()].copy_from_slice(play);
+    let x: Vec<u16> = SCALE.iter().map(|f| (2048.0 - 131072.0 / f).round() as u16).collect();
+    for (bank, (lo, hi)) in [(1, (0xff, 0xff)), (2, (0, 0))] {
+        let base = at(bank * 0x4000 + 0x80);
+        for k in 0..5 {
+            d[base + k] = if bank == 2 { x[k] as u8 } else { lo };
+            d[base + 8 + k] = if bank == 2 { (x[k] >> 8) as u8 } else { hi };
+        }
+    }
+    h.extend(d);
+    h
+}
+
+#[test]
+fn gbs_vblank_and_timer() {
+    // The vertical blank (59.73 Hz), and the timer at 4096 Hz / (256 - 192) = 64 Hz.
+    for (tma, tac, fps) in [(0, 0, 4194304.0 / 70224.0), (192, 4, 64.0)] {
+        let out = check(&gbs_scale(tma, tac));
+        assert_eq!(notes(&out.plain, 0), ["5c", "5e", "5g", "5a", "6c"], "TAC {tac}");
+        assert!(out.plain.contains("%1@4"), "50% pulse");
+        let lp = out.loop_secs.expect("a loop");
+        assert!((lp - 60.0 / fps).abs() < 0.01, "the loop is the 60 frames: {lp} (TAC {tac})");
+    }
+    let f = gbs_scale(0, 0);
+    let second = convert(&f, &Options { track: Some(2), ..Options::default() });
+    assert!(second.is_err(), "one track");
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1082,3 +1241,5 @@ fn s98_opna_adpcm_from_memory_writes() {
     assert!(out.plain.contains("%7"));
     assert!((out.secs - 0.31).abs() < 0.02, "{}", out.secs);
 }
+
+

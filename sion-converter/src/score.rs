@@ -319,6 +319,14 @@ impl Stream {
     }
 }
 
+/// SiON's LFO cycle is a whole number of frames: a table of `k` rounds of a cycle `frames` long (1 to 8: the
+/// fewest that bring it within 0.5% of a whole number of frames, else the closest). (k, its frames.)
+pub fn lfo_rounds(frames: f64) -> (usize, f64) {
+    let err = |k: usize| { let n = (frames * k as f64).round().max(1.0); (n, (n / k as f64 / frames - 1.0).abs()) };
+    let k = (1..=8).find(|&k| err(k).1 < 0.005).unwrap_or_else(|| (1..=8).min_by(|&a, &c| err(a).1.total_cmp(&err(c).1)).unwrap());
+    (k, err(k).0)
+}
+
 /// Frequency in Hz as a key number (69 = A 440 Hz).
 pub fn hz_key(hz: f64) -> f32 { (69.0 + 12.0 * (hz / 440.0).log2()) as f32 }
 
@@ -376,6 +384,9 @@ impl Defs {
         self.ids.insert(key, self.voices.len() - 1);
         self.voices.len() - 1
     }
+
+    /// Whether there are table numbers left for more than the essentials (tables count down from 254).
+    pub fn room(&self) -> bool { self.tables.len() < 200 }
 
     /// Number of a `#TABLE` with this body.
     pub fn table(&mut self, body: &str) -> usize {
