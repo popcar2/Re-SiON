@@ -8,7 +8,9 @@
 // they're enabled; idle() — play pressed with nothing loaded; idleText — shown under "Nothing playing";
 // show(song) — after the bar updates (song: the meta passed to play, null when stopped); ended() — the song played out (default: stop);
 // notes(offsets) — follow playback: called with the UTF-8 byte offsets in the MML of the notes playing, as they
-// are heard ([] once nothing is).
+// are heard ([] once nothing is); heatmap: true — show the song's spectrum rising from the bar (heatmap.js).
+
+import { heatmap } from "./heatmap.js";
 
 const RATE = 44100;
 const PLAY = "M4 2.5v11L13.5 8z", PAUSE = "M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z";
@@ -32,12 +34,13 @@ const BAR = `<footer>
 
 export function createPlayer(hooks = {}) {
   document.body.insertAdjacentHTML("beforeend", BAR);
+  const footer = document.body.lastElementChild;
   const $ = (id) => document.getElementById(id);
   $("prev").hidden = !hooks.prev;
   $("next").hidden = !hooks.next;
   const idleText = $("artist").textContent = hooks.idleText ?? "";
 
-  let ctx, node, ready, song = null, id = 0; // song: what's loaded ({title, artist}); id: bumped per song
+  let ctx, node, heat, ready, song = null, id = 0; // song: what's loaded ({title, artist}); id: bumped per song
   let text = null; // the MML of the song loaded, once it has arrived (for the download button)
   // Songs are rendered ahead in a worker (render.js) and handed to the audio worklet, which only copies samples.
   const renderer = new Worker(new URL("render.js", import.meta.url), { type: "module" });
@@ -66,6 +69,7 @@ export function createPlayer(hooks = {}) {
       await ctx.audioWorklet.addModule(new URL("worklet.js", import.meta.url));
       node = new AudioWorkletNode(ctx, "sion", { numberOfInputs: 0, outputChannelCount: [2] });
       node.connect(ctx.destination);
+      if (hooks.heatmap) heat = heatmap(ctx, node, footer, playing);
       const { port1, port2 } = new MessageChannel();
       node.port.postMessage({ port: port1 }, [port1]);
       renderer.postMessage({ port: port2 }, [port2]);
@@ -122,6 +126,7 @@ export function createPlayer(hooks = {}) {
 
   function show() {
     document.body.classList.toggle("playing", playing());
+    if (playing()) heat?.wake();
     $("title").textContent = song ? song.title : "Nothing playing";
     $("artist").textContent = song ? song.artist || " " : idleText;
     $("icon").setAttribute("d", playing() ? PAUSE : PLAY);

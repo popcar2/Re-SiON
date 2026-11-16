@@ -47,6 +47,7 @@ const rows = songs.map((s) => {
 // ---- Player ----
 const player = createPlayer({
   idleText: "Pick a song",
+  heatmap: true,
   idle: () => play(0),
   prev: () => current() > 0 && play(current() - 1),
   next: () => current() >= 0 && current() + 1 < songs.length && play(current() + 1),

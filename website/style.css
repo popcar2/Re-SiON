@@ -91,3 +91,7 @@ footer button:disabled { opacity: 0.35; cursor: default; }
 footer button.main { background: var(--fg); color: var(--bg); border-color: var(--fg); width: 40px; height: 40px; }
 footer button.main:hover:not(:disabled) { background: var(--fg); opacity: 0.85; }
 svg { width: 14px; height: 14px; fill: currentColor; }
+
+/* The spectrum heatmap (js/heatmap.js): inside the player bar, rising from the bottom of the window under its controls. */
+footer canvas.heatmap { position: absolute; left: 0; bottom: 0; width: 100%; height: min(64px, 12vh); pointer-events: none; }
+footer div.bar { position: relative; }
