@@ -20,6 +20,7 @@ Options: `-o FILE`, `--grid N` (snap timing to 1/N notes: smaller output, but no
 `--exact` (tracker modules: tick-by-tick, minified, instead of written as by hand; see below),
 `--track N` (NSF/NSFE/GBS: which song of the file, from 1; default: the file's first song),
 `--exact-pcm` (VGM and NSF: capture chip samples exactly, frame by frame; much larger, see below),
+`--exact-rate` (NSF and GBS: keep the console's own frame rate instead of rounding it to 60 Hz; larger, see NSF),
 `--gain G` (volume; default is automatic, so the busiest chord doesn't clip), `--plain` (write the plain MML, one
 command per event, instead),
 `--verify` (render the plain and the written MML with the `sion` crate and check that every sample is identical;
@@ -43,21 +44,25 @@ which is where the driver changed the chip. Notes share a table when it plays th
 sound, a run that settles into a repeating figure (a vibrato) loops it (`|`), and a note keeps the table before it
 when that one plays its values too. A pitch table is used only where it is shorter to write than its slurs, and
 the tables used by the most notes get the shortest numbers. The frame is the one most notes' changes fall on. A note
-keeps its slurs where a table would play otherwise: one sounding through the loop point (going back, it is keyed
-on afresh there, and its table would start over), one whose other changes split it between frames (a slurred
-note starts from its own pitch until the next frame), and a sample keyed on between two output frames.
+sounding through the loop point has a second table, for its part from there, set after the `$`: going back it is
+keyed on afresh there, and a table only takes effect at a key-on, so the first time through it plays on from its
+own. A note keeps its slurs where a table would play otherwise: one whose other changes split it between frames
+(a slurred note starts from its own pitch until the next frame), a sample keyed on between two output frames, and
+one with more than 256 levels.
 
 - Volume tables set `x`, which multiplies with `v` (or adds, in decibels): a track with them has its master volume
   as its one `v` and the notes' levels in its tables, the same product (in decibels with `#VMODE{%x1}`, so `x`
   steps as `v` does). A release the driver silences is a key-off table (`_na`: the level held, then 0, however
   long the release), so `v`
-  never changes under a releasing note. A track gets volume tables only if all its notes can (levels up to 128,
-  none sounding through the loop point or silenced across it), and `x` is in decibels only for a song with one.
+  never changes under a releasing note. A track gets volume tables if its levels fit `x` (up to 128) and no release
+  is silenced across the loop point; a note of it that can't have one has its levels as `x` slurs (`sion` starts a key-on
+  without tables from `x`, not from the level a table before it left the channel at, so that note needs no `x`
+  of its own when its level is the one `x` holds). `x` is in decibels only for a song with volume tables.
 - `--verify` checks the tables against the plain MML, which plays the same runs as slurs (with the levels in `x`).
 - VGM songs whose driver runs on the 60 Hz frame get them, and on the 50 Hz one unless they have release pitch
   sweeps (`_np` tables, which step at 1/60 s); tracker modules that keep one tempo get pitch tables on their ticks
-  (`#FPS{50}` at 125 BPM). NSF (the NES frame is 733.8 samples), SPC, MIDI and songs timed by the YM2612's timers
-  don't (their frames aren't whole samples), and keep the slurs.
+  (`#FPS{50}` at 125 BPM), and so do NSF and GBS songs (played at 60 or 50 Hz, below). SPC, MIDI and songs timed by the
+  YM2612's timers don't (their frames aren't whole samples), and keep the slurs.
 
 ## WebAssembly
 
@@ -314,6 +319,15 @@ same chip models and frame sampling as a VGM's (above), so everything said there
 `$4011` samples applies. NSF (with bankswitching), NSFE and NSF2 files are read; NTSC unless the file is PAL-only
 or an NSFE/NSF2 `regn` chunk prefers PAL or Dendy (X = 2, the Dendy's 1.773 MHz clock).
 
+The driver's frame is played as a whole number of samples: the NES's 60.1 Hz (733.8 samples) at 60 Hz, PAL's
+50.007 Hz at 50, the song 0.16% slower (pitch unchanged), so that its per-frame volume and pitch changes can be
+envelope tables (above) instead of a slur per frame: about half the size. `--exact-rate` keeps the console's rate
+(and the slurs).
+
+A driver's legato, a new note without a key-on whose level starts over (its envelope restarts), is a new note in
+the MML too, keyed on without restarting the waveform (`@ph255`, the same sound as the slur): its levels can then
+share a table with the notes like it, instead of the whole phrase being one long slurred note.
+
 NSF2 (version 2, header byte `$7C`) adds to that:
 
 - Metadata: NSFE chunks after the program (`time`, `fade`, `tlbl`, `RATE`, `regn`...). A chunk whose name starts
@@ -364,7 +378,8 @@ The 5B's level against the APU is not measured (the cartridge amplifies it). Not
 VRC7, Famicom Disk System and Namco 163 sound, MMC5 PCM, and the VRC6 pulses' digitized mode. The driver still
 runs with them (FDS RAM, N163 sound RAM, the MMC5 multiplier and ExRAM are there), so the APU part converts.
 
-Sizes: Shovel Knight's NSFE tracks (APU and VRC6) become 25-90 KB of MML; each takes a few seconds to convert.
+Sizes: Shovel Knight's NSFE tracks (APU and VRC6) become 6-120 KB of MML (2.2 MB for all 40, from 3.9 MB before
+tables); each takes a few seconds to convert.
 A FamiTracker NSF with DPCM drums (a 15 KB E1M1 cover) becomes 26 KB.
 
 ## GBS
@@ -378,7 +393,10 @@ the APU (`$FF10-$FF3F`) go through the same Game Boy chip model as a VGM's. As a
 placed at its load address, `$4000-$7FFF` is the bank last selected with a write to `$2000-$3FFF` (bank 0 there
 is ignored), RST calls the load address plus the vector, RAM is at `$A000-$DFFF` (and its echo), and the APU starts
 as the boot ROM leaves it (powered, `NR50` = `$77`, `NR51` = `$F3`, its wave RAM pattern). The song ends and loops
-as an NSF's does (above); `--track N` picks the song, and `#TITLE` is the header's title and author.
+as an NSF's does (above); `--track N` picks the song, and `#TITLE` is the header's title and author. As an NSF's,
+the frame is played as a whole number of samples where it is close to one (within 0.5%): the vertical blank's
+59.73 Hz at 60 Hz, the song 0.45% faster, so its envelopes can be tables; `--exact-rate` keeps 59.73 Hz. (Timer
+rates such as Super Mario Land's 64 Hz are no whole number of samples, and are kept.)
 
 Checked against libgme on Tetris, Super Mario Land (timer-driven, 64 Hz), Link's Awakening (bankswitched) and
 Kirby's Dream Land: octave-band levels within about 1 dB above 100 Hz, and the notes on time (apart from the

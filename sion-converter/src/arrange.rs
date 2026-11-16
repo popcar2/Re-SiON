@@ -1,7 +1,7 @@
 //! A `Score` → monophonic SiON tracks: tick scaling, tempo, volume, voice allocation; then each track as a
 //! token stream.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::mml::{Lengths, Tok};
 use crate::score::Score;
@@ -20,6 +20,9 @@ pub struct Options {
     /// VGM: capture samples exactly as the chips output them, frame by frame, instead of storing each once at its
     /// own rate (much larger).
     pub exact_pcm: bool,
+    /// NSF / GBS: keep the console's own frame rate (the NES's 60.1 Hz, the Game Boy's 59.73 Hz) instead of
+    /// rounding the frame to a whole number of samples (60 Hz; smaller output, the song 0.16% / 0.45% off speed).
+    pub exact_rate: bool,
     /// NSF / NSFE: which song of the file to convert (from 1). `None`: the one the file starts with.
     pub track: Option<usize>,
 }
@@ -70,19 +73,26 @@ impl Track {
         self.notes.get(i + 1).map_or(c <= self.end, |n| c < n.start).then_some(c)
     }
 
+    /// The loop point, when note `n` sounds through it.
+    fn through(&self, n: &Note) -> Option<u64> { self.lp.filter(|&l| n.start < l && l < n.end) }
+
     /// The loop point (`$`) falls in `a..=b`.
     fn lp_in(&self, a: u64, b: u64) -> bool { self.lp.is_some_and(|l| a <= l && l <= b) }
 
-    /// Its notes' levels can all be volume tables stepping every `f` ticks (see `Envelopes`): levels `x` can hold,
-    /// changes and release cuts on that grid from each key-on, and nothing that the loop point (`$`) plays
-    /// differently on the way back: a note sounding through it (keyed on afresh there, its table would start
-    /// over) or a release silenced across it (the `x0` after the `$` would cut whatever releases then).
-    fn vol_tables(&self, f: u64) -> bool {
-        let lp = |a, b| self.lp_in(a, b);
+    /// Its notes' levels can be in `x` (see `Envelopes`), as volume tables where they fit: levels `x` can hold,
+    /// and no release silenced across the loop point (`$`: the `x0` after it would cut whatever releases there on
+    /// the way back).
+    fn vol_tables(&self) -> bool {
         self.drum.is_none() && !self.piped && self.notes.iter().any(|n| !n.vols.is_empty()) && self.notes.iter().enumerate().all(|(i, n)| {
-            n.v <= 128 && n.vols.iter().all(|v| v.1 <= 128 && (v.0 - n.start) % f == 0) && !lp(n.start + 1, n.end - 1)
-                && self.cut(i).is_none_or(|c| (c - n.end) % f == 0 && !lp(n.end, c))
+            n.v <= 128 && n.vols.iter().all(|v| v.1 <= 128) && self.cut(i).is_none_or(|c| !self.lp_in(n.end, c))
         })
+    }
+
+    /// Note `n`'s levels fit a volume table stepping every `f` ticks: its changes on that grid from its key-on, and
+    /// the loop point too if it sounds through it (keyed on afresh there on the way back, it plays a second table,
+    /// from the loop point on).
+    fn vol_table(&self, n: &Note, f: u64) -> bool {
+        n.vols.iter().all(|v| (v.0 - n.start) % f == 0) && self.through(n).is_none_or(|l| (l - n.start) % f == 0)
     }
 }
 
@@ -319,7 +329,7 @@ pub fn build(sc: &Score, opt: &Options) -> Arranged {
     let lp = sc.lp.map(map).filter(|&l| l < end);
     if let Some(lp) = lp { for t in &mut tracks { (t.end, t.lp) = (end, Some(lp)) } }
     // (`x` in decibels only for volume tables: they hold the levels of `v`.)
-    let xdb = sc.db && frame.is_some_and(|(f, _)| tracks.iter().any(|t| t.vol_tables(f)));
+    let xdb = sc.db && frame.is_some() && tracks.iter().any(|t| t.vol_tables());
     let mut header = vec![];
     if unit > 1.0 { header.push(format!("#TMODE{{unit={unit}}}")) }
     if xdb { header.push("#VMODE{%v1,1 %x1}".into()) } else if sc.db { header.push("#VMODE{%v1,1}".into()) } else if sc.fine { header.push("#VMODE{%v0,0}".into()) }
@@ -367,6 +377,10 @@ pub struct Envelopes {
     vol: HashMap<(usize, usize), usize>,
     cut: HashMap<(usize, usize), usize>,
     pitch: HashMap<(usize, usize), usize>,
+    /// Notes sounding through the loop point → the volume and pitch tables of their part from there, which a key-on
+    /// at the `$` plays on the way back. (Set after the `$`, mid-slur: a table only takes effect at a key-on.)
+    vtail: HashMap<(usize, usize), usize>,
+    ptail: HashMap<(usize, usize), usize>,
     /// Tracks with volume tables → their `v` (the master volume).
     master: HashMap<usize, u16>,
 }
@@ -417,63 +431,72 @@ impl Arranged {
         let at = |n: &Note, t: u64| (t - n.start) % f == 0;
         // (Output frames per envelope frame: `f` ticks.)
         let spf = (sion::RATE as f64 / fps as f64).round() as u64;
-        // Runs: (kind, values, track, note); kinds: 0 volume, 1 key-off volume, 2 pitch.
+        // Runs: (kind, values, track, note); kinds: 0 volume, 1 key-off volume, 2 volume from the loop point (of a
+        // note sounding through it), 3 pitch, 4 pitch from the loop point.
         let mut runs: Vec<(u8, Vec<i32>, usize, usize)> = vec![];
         for (ti, tr) in self.tracks.iter().enumerate().filter(|(_, t)| t.drum.is_none()) {
             // Volume: the notes' `v` levels, in `x`. (Linear `v` in 256 steps fits `x` up to 128; with `v` in
             // decibels `x` has to be too.)
             let scale = if tr.vmax == 256 { !tr.kmilli } else { tr.xdb };
-            if scale && tr.vol_tables(f) {
+            // (A note whose levels don't fit a table has them as slurs, in `x`.)
+            if scale && tr.vol_tables() {
                 for (ni, n) in tr.notes.iter().enumerate() {
-                    let run: Vec<i32> = per_frame(n, n.v, &n.vols, f, frames(n)).into_iter().map(i32::from).collect();
+                    let last = n.vols.last().map_or(n.v, |v| v.1) as i32;
                     // (From the key-off: the level the note ended at until the cut, then silence.)
-                    if let Some(c) = tr.cut(ni) { let mut r = vec![run[run.len() - 1]; ((c - n.end) / f) as usize]; r.push(0); runs.push((1, r, ti, ni)) }
+                    if let Some(c) = tr.cut(ni).filter(|c| (c - n.end) % f == 0) { let mut r = vec![last; ((c - n.end) / f) as usize]; r.push(0); runs.push((1, r, ti, ni)) }
+                    if !tr.vol_table(n, f) { continue }
+                    let run: Vec<i32> = per_frame(n, n.v, &n.vols, f, frames(n)).into_iter().map(i32::from).collect();
+                    if let Some(l) = tr.through(n) { runs.push((2, run[((l - n.start) / f) as usize..].to_vec(), ti, ni)) }
                     runs.push((0, run, ti, ni));
                 }
                 env.master.insert(ti, tr.x.unwrap_or(128) as u16);
             }
             for (ni, n) in tr.notes.iter().enumerate() {
-                // (Not for a note that sounds through the loop point (keyed on afresh there on the way back, its
-                // table would start over), nor one split off the frames by its other changes (a slurred note
+                // (Not for a note that sounds through the loop point off its frames (keyed on afresh there on the way
+                // back, it plays a table from there), nor one split off the frames by its other changes (a slurred note
                 // starts from its own pitch, until the next frame), nor a sample keyed on between output frames
                 // (a command's pitch change takes effect partway into one, a table's at its start).)
                 let splits = n.vols.iter().map(|v| v.0).chain(n.pans.iter().map(|p| p.0)).chain(n.lfos.iter().map(|l| l.0)).chain(n.waves.iter().map(|w| w.0));
                 let pcm = (n.instr.starts_with("%7") || n.instr.starts_with("%10")) && n.start * spf % f != 0;
-                let spans = tr.lp_in(n.start + 1, n.end - 1);
+                let spans = tr.through(n).is_some_and(|l| !at(n, l));
                 if tr.kmilli || pcm || spans || n.bends.is_empty() || n.ptab.is_some() || !n.bends.iter().map(|b| b.0).chain(splits).all(|t| at(n, t)) { continue }
-                runs.push((2, per_frame(n, n.k0, &n.bends, f, frames(n)).into_iter().map(|k| k - n.k0).collect(), ti, ni));
+                let run: Vec<i32> = per_frame(n, n.k0, &n.bends, f, frames(n)).into_iter().map(|k| k - n.k0).collect();
+                if let Some(l) = tr.through(n) { runs.push((4, run[((l - n.start) / f) as usize..].to_vec(), ti, ni)) }
+                runs.push((3, run, ti, ni));
             }
         }
         // Volume first (a track has all its volume tables or none: they get the numbers before pitch tables, which
         // can do without), and longest first, so shorter runs find a table that starts as they do.
-        runs.sort_by_key(|r| (r.0 == 2, std::cmp::Reverse(r.1.len())));
+        runs.sort_by_key(|r| (r.0 > 2, std::cmp::Reverse(r.1.len())));
         // (Key-off volume tables are volume tables too: they share.)
         let mut tables: Vec<(bool, Table)> = vec![];
-        // (Volume tables a track can't have all of: none for it.)
-        let mut failed: HashSet<usize> = HashSet::new();
         for (kind, run, ti, ni) in &runs {
-            let vol = *kind < 2;
-            if vol && failed.contains(ti) { continue }
+            let vol = *kind <= 2;
             let found = tables.iter().position(|t| t.0 == vol && plays(&t.1, run));
             let id = found.or_else(|| {
                 // (A table is for an envelope, not a whole part: past `MAX_TABLE` values the note keeps its slurs. A
                 // key-off table's held level counts once: however long the release, it is one run, `(v)n`.)
                 let t = shortest(run);
                 let size = if *kind == 1 { t.0.chunk_by(|a, b| a == b).count() } else { t.0.len() };
-                if size > MAX_TABLE || tables.len() == self.free.len() { return None }
+                if size > MAX_TABLE || tables.len() >= self.free.len() { return None }
                 tables.push((vol, t));
                 Some(tables.len() - 1)
             });
             match (id, kind) {
                 (Some(id), 0) => { env.vol.insert((*ti, *ni), id); }
                 (Some(id), 1) => { env.cut.insert((*ti, *ni), id); }
-                (Some(id), _) => { env.pitch.insert((*ti, *ni), id); }
-                (None, 2) => {}
-                (None, _) => { failed.insert(*ti); }
+                (Some(id), 2) => { env.vtail.insert((*ti, *ni), id); }
+                (Some(id), 3) => { env.pitch.insert((*ti, *ni), id); }
+                (Some(id), _) => { env.ptail.insert((*ti, *ni), id); }
+                // (Or the note keeps its slurs.)
+                (None, _) => {}
             }
         }
-        env.vol.retain(|k, _| !failed.contains(&k.0));
-        env.cut.retain(|k, _| !failed.contains(&k.0));
+        // (A note's pitch table only with the one from the loop point, where it sounds through it.)
+        env.pitch.retain(|k, _| { let t = &self.tracks[k.0]; t.through(&t.notes[k.1]).is_none() || env.ptail.contains_key(k) });
+        // (Likewise a volume table through the loop point.)
+        env.vol.retain(|k, _| { let t = &self.tracks[k.0]; t.through(&t.notes[k.1]).is_none() || env.vtail.contains_key(k) });
+        env.vtail.retain(|k, _| env.vol.contains_key(k));
         // A pitch table has to be shorter to write than the slurs it replaces (about `SLUR` characters a change),
         // with a reference (`np12`) per note that uses it.
         let mut gain: HashMap<usize, i64> = HashMap::new();
@@ -481,7 +504,7 @@ impl Arranged {
         for (id, (_, t)) in tables.iter().enumerate().filter(|t| !t.1.0) {
             if gain.get(&id).is_some_and(|&g| g < 12 + text_len(t)) { env.pitch.retain(|_, v| *v != id) }
         }
-        env.master.retain(|k, _| !failed.contains(k));
+        env.ptail.retain(|k, _| env.pitch.contains_key(k));
         // A note keeps the table the note before it had wherever that plays its values too (a note without
         // vibrato under a vibrato that starts later, an envelope cut short): fewer table changes to read. (With
         // `lines`, within a line only: a line that comes back then starts the same wherever it is, and stays a loop
@@ -495,25 +518,27 @@ impl Arranged {
             for (ni, n) in tr.notes.iter().enumerate() {
                 let prev = ni.checked_sub(1).map_or(0, |p| tr.notes[p].start);
                 if ni == 0 || bounds[bounds.partition_point(|&b| b <= prev)..].first().is_some_and(|&b| b <= n.start) { (cv, cc, cp) = (None, None, None) }
+                // (A note sounding through the loop point only with its tables from there.)
+                let through = tr.through(n).is_some();
                 if env.master.contains_key(&ti) {
-                    if let (Some(c), Some(run)) = (cv, run_of.get(&(0, ti, ni))) { if plays(c, run) { env.vol.insert((ti, ni), c); } }
+                    if let (Some(c), Some(run)) = (cv, run_of.get(&(0, ti, ni)).filter(|_| !through || env.vtail.contains_key(&(ti, ni)))) { if plays(c, run) { env.vol.insert((ti, ni), c); } }
                     cv = env.vol.get(&(ti, ni)).copied();
                     if let (Some(c), Some(run)) = (cc, run_of.get(&(1, ti, ni))) { if plays(c, run) { env.cut.insert((ti, ni), c); } }
                     cc = env.cut.get(&(ti, ni)).copied();
                 }
                 let zeros = vec![0; frames(n)];
-                let run = run_of.get(&(2, ti, ni)).copied().or((n.bends.is_empty() && n.ptab.is_none()).then_some(&zeros[..]));
+                let run = run_of.get(&(3, ti, ni)).copied().or((n.bends.is_empty() && n.ptab.is_none()).then_some(&zeros[..])).filter(|_| !through || env.ptail.contains_key(&(ti, ni)));
                 if let (Some(c), Some(run)) = (cp, run) { if plays(c, run) { env.pitch.insert((ti, ni), c); } }
                 cp = env.pitch.get(&(ti, ni)).copied();
             }
         }
         // Numbered last, the tables used by the most notes first: the shortest numbers where they are written most.
         let mut uses: HashMap<usize, usize> = HashMap::new();
-        for &id in env.vol.values().chain(env.cut.values()).chain(env.pitch.values()) { *uses.entry(id).or_default() += 1 }
+        for &id in env.vol.values().chain(env.cut.values()).chain(env.pitch.values()).chain(env.vtail.values()).chain(env.ptail.values()) { *uses.entry(id).or_default() += 1 }
         let mut used: Vec<(usize, usize)> = uses.into_iter().collect();
         used.sort_by_key(|&(id, n)| (std::cmp::Reverse(n), id));
         let num: HashMap<usize, usize> = used.iter().zip(&self.free).map(|(&(id, _), &k)| (id, k)).collect();
-        for m in [&mut env.vol, &mut env.cut, &mut env.pitch] { for id in m.values_mut() { *id = num[id] } }
+        for m in [&mut env.vol, &mut env.cut, &mut env.pitch, &mut env.vtail, &mut env.ptail] { for id in m.values_mut() { *id = num[id] } }
         // (`free` ascends, so this is in number order.)
         for (&(id, _), &k) in used.iter().zip(&self.free) { let t = &tables[id].1; env.header.push(format!("#TABLE{k}{{{}}}", table_body(&t.0, t.1))) }
         // (Only the tables step at the frame rate: without them it needn't be said.)
@@ -580,8 +605,8 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths, envs: Option<(&Enve
     // (Set before anything else, so it's the track's one `v`: the loop point has it too.)
     let mut v = tr.vmax;
     if let Some(m) = master.filter(|&m| m != tr.vmax) { out.push(Tok::Cmd(format!("v{m}"))); v = m }
-    // (Levels in `x`, without tables: written as `x` commands.)
-    let (xform, mut xl) = (master.is_some() && !tables, 128u16);
+    // (Levels in `x`: written as `x` commands where a note has no table.)
+    let (xform, mut xl) = (master.is_some(), 128u16);
     let (mut t, mut tempo) = (0, tr.tempo.iter().peekable());
     let (mut instr, mut pan, mut ptab, mut env, mut k, mut ph) = ("", 0, None, "", 0, (0.0, 0.0));
     let (mut lfo, mut rtab, mut cut): ((i32, i32), Option<usize>, Option<u64>) = ((0, 0), None, None);
@@ -634,8 +659,8 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths, envs: Option<(&Enve
         if xform { out.push(Tok::Cmd("x0".into())); xl = 0 } else { out.push(Tok::Cmd("v0".into())); v = 0 }
     }} }
     for (ni, n) in tr.notes.iter().enumerate() {
-        let tabs = envs.filter(|_| tables).map(|(e, ti)| (e.vol.get(&(ti, ni)).copied(), e.pitch.get(&(ti, ni)).copied(), e.cut.get(&(ti, ni)).copied()));
-        let (ntab, npt, nctab) = tabs.unwrap_or((None, None, None));
+        let get = |m: fn(&Envelopes) -> &HashMap<(usize, usize), usize>| envs.filter(|_| tables).and_then(|(e, ti)| m(e).get(&(ti, ni)).copied());
+        let (ntab, npt, nctab, tails) = (get(|e| &e.vol), get(|e| &e.pitch), get(|e| &e.cut), (get(|e| &e.vtail), get(|e| &e.ptail)));
         let nv = master.unwrap_or(n.v);
         let nptab = npt.map(|t| t as u8).or(n.ptab);
         // The previous note's release silenced (on the chip, by its driver) before this note.
@@ -643,7 +668,10 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths, envs: Option<(&Enve
         advance!(n.start);
         // A module change (`%`) resets the tone and envelope; so going back to the module's defaults needs one.
         // (Both also reset the LFO: `%` the whole channel, `@lfo` in a tone its depths.)
-        if n.instr != instr || (n.env.is_empty() && !env.is_empty()) { out.push(Tok::Cmd(n.instr.clone())); (instr, env, ph, lfo) = (&n.instr, "", (0.0, 0.0), (0, 0)) }
+        // (Only the waveform of a wavetable module, under the same envelope and no LFO: `@n` swaps it.)
+        let wave = n.instr != instr && n.env == env && lfo == (0, 0) && crate::score::same_wave(instr, &n.instr);
+        if wave { out.push(Tok::Cmd(crate::score::wave_cmd(&n.instr))); instr = &n.instr }
+        else if n.instr != instr || (n.env.is_empty() && !env.is_empty()) { out.push(Tok::Cmd(n.instr.clone())); (instr, env, ph, lfo) = (&n.instr, "", (0.0, 0.0), (0, 0)) }
         if n.env != env {
             // (An LFO rate the channel already has needn't be set again: that would only reset its depths.)
             let ((_, ra), (b, rb)) = (split_lfo(env), split_lfo(&n.env));
@@ -655,7 +683,7 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths, envs: Option<(&Enve
         if ntab != vtab { out.push(Tok::Cmd(vtab_cmd(ntab))); vtab = ntab }
         if master.is_some() && nctab != ctab { out.push(Tok::Cmd(ctab_cmd(nctab))); ctab = nctab }
         if nv != v { out.push(Tok::Cmd(format!("v{nv}"))); v = nv }
-        if xform && n.v != xl { out.push(Tok::Cmd(format!("x{}", n.v))); xl = n.v }
+        if xform && ntab.is_none() && n.v != xl { out.push(Tok::Cmd(format!("x{}", n.v))); xl = n.v }
         if n.pan != pan { out.push(Tok::Cmd(format!("@p{}", n.pan))); pan = n.pan }
         if nptab != ptab { out.push(Tok::Cmd(ptab_cmd(nptab))); ptab = nptab }
         if n.k0 != k { out.push(Tok::Cmd(kcmd(n.k0))); k = n.k0 }
@@ -677,10 +705,19 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths, envs: Option<(&Enve
             let nw = waves.peek().map(|b| b.0);
             let nt = tempo.peek().map(|x| x.0).filter(|&x| x > n.start && x < n.end);
             // (A note that sounds through the loop point is split there, slurred: `c&$c`.)
-            let nlp = tr.lp.filter(|&l| mark.is_none() && l > n.start && l < n.end);
+            let nlp = tr.through(n).filter(|_| mark.is_none());
             let Some(split) = [nb, nv, np, nl, nw, nt, nlp].into_iter().flatten().min() else { break };
             if split > at { out.push(Tok::Note { key: key as u8, len: (split - at) as u32, slur: true }); at = split }
-            if nlp == Some(split) { loop_point!() }
+            if nlp == Some(split) {
+                let level = xl;
+                loop_point!();
+                // (On the way back the note is keyed on afresh here: from its tables from here on, or the level it
+                // is at.)
+                if let Some(t) = tails.0 { out.push(Tok::Cmd(vtab_cmd(Some(t)))); vtab = Some(t) }
+                if let Some(t) = tails.1 { out.push(Tok::Cmd(ptab_cmd(Some(t as u8)))); ptab = Some(t as u8) }
+                if let Some(m) = &mut mark { (m.vtab, m.ptab) = (vtab, ptab) }
+                if xform && ntab.is_none() && !vols.peek().is_some_and(|b| b.0 == split) { out.push(Tok::Cmd(format!("x{level}"))); xl = level }
+            }
             while let Some((_, s)) = tempo.next_if(|x| x.0 == split) { out.push(Tok::Cmd(s.clone())) }
             while let Some(&(_, nk)) = bend.next_if(|b| b.0 == split) {
                 let total = n.key as i32 * unit + nk;
@@ -698,14 +735,16 @@ pub fn tokens(tr: &Track, gate: Option<u32>, lens: &Lengths, envs: Option<(&Enve
             while let Some(&(_, nl)) = lfos.next_if(|b| b.0 == split) { lfo_cmds(&mut out, &mut lfo, nl) }
             // (Same module: `@n` changes the waveform and leaves the note, envelope and LFO as they are.)
             while let Some((_, w)) = waves.next_if(|b| b.0 == split) {
-                if *w != instr { out.push(Tok::Cmd(format!("@{}", w.split_once('@').unwrap().1))); instr = w }
+                if *w != instr { out.push(Tok::Cmd(crate::score::wave_cmd(w))); instr = w }
             }
         }
         out.push(Tok::Note { key: key as u8, len: (n.end - at) as u32, slur: false });
         gates.push((first, out.len() - 1));
         t = n.end;
         // (A volume-table track silences the release by its key-off table.)
-        cut = tr.cut(ni).filter(|_| master.is_none() || xform);
+        cut = tr.cut(ni).filter(|_| master.is_none() || nctab.is_none());
+        // (A table leaves `x` where it ends.)
+        if ntab.is_some() || nctab.is_some() { xl = u16::MAX }
     }
     // (After the last note, only within the song.)
     if let Some(c) = cut { silence!(c) }

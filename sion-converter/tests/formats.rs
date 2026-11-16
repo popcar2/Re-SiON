@@ -236,7 +236,7 @@ fn block(ty: u8, body: &[u8]) -> Vec<u8> { let mut b = vec![0x67, 0x66, ty]; b.e
 
 fn wait(b: &mut Vec<u8>, n: u16) { b.extend([0x61, n as u8, (n >> 8) as u8]) }
 
-const EXACT: Options = Options { grid: None, gain: None, wavetables: false, exact: false, exact_pcm: true, track: None };
+const EXACT: Options = Options { grid: None, gain: None, wavetables: false, exact: false, exact_pcm: true, exact_rate: false, track: None };
 
 /// Convert both ways: (default, `--exact-pcm`).
 fn both(data: &[u8]) -> (sion_converter::Converted, sion_converter::Converted) { (check(data), check_with(data, &EXACT)) }

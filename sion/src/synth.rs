@@ -425,8 +425,8 @@ pub struct Chan {
     /// The playing key's level and pan offset (`#PCMVOICE`, `#SAMPLER`), and whether it plays on through key-off.
     svol: f32, span: i32, hold: bool,
     /// How much louder the output was before the volume changes since the renderer last took this (see `volume`;
-    /// 1: none), for declicking.
-    pub vj: f32,
+    /// 1: none), for declicking; and the carriers' level before them (NaN: no change).
+    pub vj: f32, vt0: f32,
     /// Fraction of a frame added to the `@ph` start frame; how late (in output frames, 0..1) the last event
     /// came, so a PCM note's start or pitch change can be placed at its exact time.
     /// (`slate`: set by a key-on, used by this frame's pitch update only.)
@@ -492,7 +492,7 @@ impl Chan {
         Chan {
             ops: vec![], n: 1, alg: 0, act: 0, fb: 0, fbc: 0, fratio: 1.0, inp: (0, 0), ring: (0, 0), outp: (0, 0), stale: true,
             lfo: 2, lfo_tab: vec![], lfo_step: 0.0, lfo_ph: 0, lfo_t: 1.0, amd: 0, pmd: 0, am: 0.0, pm: 0,
-            vol: [0.0; 8], pan: 64, vm: (0, 0), xv: (128, 256), pitch: 0, on: false, fine: 0.0, pcm: -1, smp: 0, sidx: 0, svol: 1.0, span: 0, hold: false, vj: 1.0, spos: 0, sfrac: 0.0, sstep: 0.0, sfrac0: 0.0, slate: 0.0, slen: 0.0, sleft: 0.0,
+            vol: [0.0; 8], pan: 64, vm: (0, 0), xv: (128, 256), pitch: 0, on: false, fine: 0.0, pcm: -1, smp: 0, sidx: 0, svol: 1.0, span: 0, hold: false, vj: 1.0, vt0: f32::NAN, spos: 0, sfrac: 0.0, sstep: 0.0, sfrac0: 0.0, slate: 0.0, slen: 0.0, sleft: 0.0,
             rejoin: false, dm: false, dplay: false, dnew: false, dprev: None, dlv: 0.0, doff: 0.0, dg: 0.0, dhp: (0.0, 0.0), wire: [wiring(b'i').1; 4],
             f_on: false, f_type: 0, f_cut: [128, 128, 128, 128, 0, 128], f_time: [0, 0, 0, i32::MAX, 0, i32::MAX], f_res: 1.0, f_v: [0.0; 3], cutoff: 128, cut_off: 0, f_st: 5, f_step: i32::MAX, f_next: 0, f_inc: 0, f_cnt: i32::MAX,
             ks: false, kbuf: vec![], kidx: 0.0, kout: 0.0, k_lpf: 0.875, kx: 1.0,
@@ -528,9 +528,9 @@ impl Chan {
         let code = ALG[ops - 1].get(alg).filter(|_| cnt != 5).map_or(&b"iiii"[..], |c| c.as_bytes());
         for ((o, w), &c) in self.ops.iter_mut().zip(&mut self.wire).zip(code) { let (f, wc) = wiring(c); (o.fin, *w) = (f & 8 != 0, wc) }
         // (The carriers changed: the old level says nothing about the new one, so this isn't a volume change.)
-        let vj = self.vj;
+        let vj = (self.vj, self.vt0);
         self.volume(self.xv.0, self.xv.1);
-        self.vj = vj;
+        (self.vj, self.vt0) = vj;
     }
 
     pub fn set_voice(&mut self, v: &Voice) {
@@ -556,18 +556,24 @@ impl Chan {
         }
     }
 
-    /// Also adds to `vj` how much louder the output was before (old over new gain; infinite: now silent, 0:
-    /// silent before).
+    /// Also sets `vj`: how much louder the output was before the changes since the renderer last took it (old
+    /// over new gain; infinite: now silent, 0: silent before). (From the level before the first of them, so the
+    /// same change comes out the same however many steps it took.)
     pub fn volume(&mut self, x: i32, vel: i32) {
         self.xv = (x, vel);
         if self.ks { self.kx = x as f32 / 128.0 }
         let tl = vtl(self.vm.1, if self.ks { 256 } else { x * 2 }) + vtl(self.vm.0, vel);
         // (Every carrier gets the same offset, so the output scales by the change.)
-        let jump = self.ops.iter().find(|o| o.fin).filter(|o| o.tlo != tl)
-            .map_or(1.0, |o| if tl >= OFF { f32::INFINITY } else if o.tlo >= OFF { 0.0 } else { M::exp2((tl - o.tlo) / 64.0) });
+        if let Some(o) = self.ops.iter().find(|o| o.fin).filter(|o| o.tlo != tl) {
+            if self.vt0.is_nan() { self.vt0 = o.tlo }
+            let t0 = self.vt0;
+            self.vj = if t0 == tl { 1.0 } else if tl >= OFF { f32::INFINITY } else if t0 >= OFF { 0.0 } else { M::exp2((tl - t0) / 64.0) };
+        }
         for o in &mut self.ops { o.tlo = if o.fin { tl } else { 0.0 } }
-        if jump != 1.0 { self.vj = if jump.is_infinite() || jump == 0.0 { jump } else { self.vj * jump } }
     }
+
+    /// `vj`, which the renderer has now taken into account.
+    pub fn take_vj(&mut self) -> f32 { self.vt0 = f32::NAN; core::mem::replace(&mut self.vj, 1.0) }
 
     /// The pan the output is at: the track's, plus the playing key's offset.
     pub fn out_pan(&self) -> i32 { (self.pan + self.span).clamp(0, 128) }

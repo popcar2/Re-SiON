@@ -410,6 +410,8 @@ struct Track {
     /// Envelope settings for [key-off, key-on] x [amplitude, tone, note, pitch, filter]: (table, frames per step).
     set: [[Option<(usize, i32)>; 5]; 2],
     xoff: [bool; 2], sweep: [i32; 2],
+    /// A volume table has set the channel's level since `x` / `v` last did.
+    tvol: bool,
     /// Where the release sweep stops: 0 until `s`/`@rr` set it (then its limit, even for no sweep, as SiON does).
     swe0: f64, modt: [Option<Vec<i32>>; 2],
     env: [Option<(usize, usize, i32, i32)>; 5], menv: Option<usize>,
@@ -499,7 +501,7 @@ impl Track {
             s: s.into(), i: 0, loops: vec![], rep: None, moved: false, end: false, once: false,
             at: 0.0, koff: INF, kon: INF, q: (sh.quant * 3 / 4) as f64 / sh.quant as f64, qc: 0.0, kd: 0.0,
             oct: 5, len: 480, ns: 0, vel: 256, vsh: sh.vmode.2, x: 128, kt: 0, k: 0, kf: 0.0, note: 0, slur: false, md: 0, tone: 0,
-            set: [[None; 5]; 2], xoff: [false; 2], sweep: [0; 2], swe0: 0.0, modt: [None, None], env: [None; 5], menv: None,
+            set: [[None; 5]; 2], xoff: [false; 2], tvol: false, sweep: [0; 2], swe0: 0.0, modt: [None, None], env: [None; 5], menv: None,
             swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 1.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0, src: -1,
             ch: Chan::new(), dc: Declick::new(64),
         };
@@ -565,11 +567,19 @@ impl Track {
                 self.ch.volume(self.x, self.vel);
                 self.ch.cut_off = 0;
                 if self.set[0][1].or(self.set[1][1]).is_some() { self.select(sh, self.tone); }
+            } else if self.tvol {
+                // (A note without tables after a volume table (the last note's, or its key-off one) starts from
+                // `x` too, not the level that table left the channel at.)
+                self.ch.volume(self.x, self.vel);
             }
+            self.tvol = false;
             if self.ch.on { self.ch.note_off() }
             self.process(sh, 1);
             self.ch.note_on();
-            self.dc.kon = !self.ch.ks;
+            // (A key-on that leaves the waveform where it is (`@ph255`) carries on as a slur would: its level
+            // change eases as any other.)
+            let carries = self.ch.pcm < 0 && self.ch.ops[..self.ch.n.max(1)].iter().all(|o| o.phase == 255);
+            self.dc.kon = !self.ch.ks && !carries;
         } else if self.sweep[1] > 0 {
             self.ch.pitch = old;
             (self.sws, self.swe, self.swp) = ((pi - old) as f64 / self.sweep[1] as f64, pi as f64, old as f64);
@@ -601,7 +611,7 @@ impl Track {
 
     /// One envelope frame (`#FPS` times per second).
     fn frame(&mut self, sh: &Shared) {
-        if let Some(v) = self.adv(sh, 0) { self.ch.volume((self.xo + v).clamp(0, 128), self.vel) }
+        if let Some(v) = self.adv(sh, 0) { self.ch.volume((self.xo + v).clamp(0, 128), self.vel); self.tvol = true }
         if self.pact {
             self.ch.pitch = self.cur(sh, 3) + (self.cur(sh, 2) << 6) + self.swp as i32;
             self.adv(sh, 3);
@@ -814,6 +824,7 @@ impl Track {
                         }
                         self.vel = self.vel.clamp(0, 512);
                         ch.volume(self.x, self.vel);
+                        self.tvol = false;
                     }
                     b"%v" => { self.vsh = p(1, 4).clamp(0, 7); ch.vm.0 = p(0, 0); ch.volume(self.x, self.vel) }
                     b"%x" => { ch.vm.1 = p(0, 0); ch.volume(self.x, self.vel) }
@@ -1100,7 +1111,7 @@ impl Song {
     pub fn set_declick(&mut self, on: bool) { self.declick = on; self.declick_reset() }
 
     /// Forget what declicking took note of: nothing from before now is smoothed over.
-    fn declick_reset(&mut self) { for t in &mut self.tracks { (t.dc, t.ch.vj) = (Declick::new(t.ch.out_pan()), 1.0) } }
+    fn declick_reset(&mut self) { for t in &mut self.tracks { t.dc = Declick::new(t.ch.out_pan()); t.ch.take_vj(); } }
 
     /// `new` for MML as bytes (UTF-8, though only the ASCII in it matters), so no text conversion is needed.
     pub fn from_bytes(src: &[u8]) -> Song {
@@ -1405,7 +1416,8 @@ impl Song {
                     let [l, r] = lr(pan);
                     [v * l, v * r, v]
                 } else {
-                    t.dc.run(v, pan, lr(pan), lr(t.dc.pan), core::mem::replace(&mut t.ch.vj, 1.0))
+                    let vj = t.ch.take_vj();
+                    t.dc.run(v, pan, lr(pan), lr(t.dc.pan), vj)
                 };
                 let sends = if t.ch.vol[1..].iter().any(|v| *v > 0.0) { 8 } else { 1 };
                 for (k, s) in self.slots.iter_mut().enumerate().take(sends) {

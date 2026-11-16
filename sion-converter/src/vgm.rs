@@ -334,13 +334,15 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
     let mut notes = st.notes(0, 2);
     let fine = !hits.is_empty();
     // Rows: the longest frame count (up to 12) that most notes start on a multiple of, as a 1/16 note.
+    // (Not counting the notes of a legato run after its first: they fall where the driver's frames do.)
     let (mut rowlen, mut shift) = (6u64, 0u64);
-    if !notes.is_empty() {
+    let keyed: Vec<&Note> = notes.iter().filter(|n| n.ofs != crate::score::NO_RESET).collect();
+    if !keyed.is_empty() {
         for r in (2..=12u64).rev() {
             let mut count = vec![0usize; r as usize];
-            for n in &notes { count[(n.start % r) as usize] += 1 }
+            for n in &keyed { count[(n.start % r) as usize] += 1 }
             let (best, &c) = count.iter().enumerate().max_by_key(|x| x.1).unwrap();
-            if c * 100 >= notes.len() * 85 { (rowlen, shift) = (r, (r - best as u64) % r); break }
+            if c * 100 >= keyed.len() * 85 { (rowlen, shift) = (r, (r - best as u64) % r); break }
         }
     }
     // With samples, count in SiON's own ticks (480 per quarter note, a row being a 1/16 note: `sub` ticks per

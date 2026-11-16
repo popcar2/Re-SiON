@@ -104,6 +104,8 @@
         <div>Wavetables <span>— tracker modules: approximate samples with wavetables and noise (much smaller; only chiptune samples come out close)</span></div></label>
       <label class="check"><input type="checkbox" id="exactPcm">
         <div>Exact PCM <span>— VGM and NSF: capture samples exactly as the chips output them (many times larger)</span></div></label>
+      <label class="check"><input type="checkbox" id="exactRate">
+        <div>Exact frame rate <span>— NSF and GBS: keep the console's own rate (60.1 Hz NES, 59.73 Hz Game Boy) instead of rounding to 60 Hz (larger)</span></div></label>
     </div>
   </details>
 
@@ -149,9 +151,10 @@ const opts = () => ({
   exact: $("exact").checked,
   wavetables: $("wavetables").checked,
   exactPcm: $("exactPcm").checked,
+  exactRate: $("exactRate").checked,
 });
 // Changing an option converts the current file again.
-for (const id of ["grid", "gain", "track", "exact", "wavetables", "exactPcm"]) $(id).addEventListener("change", () => current && run());
+for (const id of ["grid", "gain", "track", "exact", "wavetables", "exactPcm", "exactRate"]) $(id).addEventListener("change", () => current && run());
 
 // ---- Converting ----
 let current = null; // {name, bytes}

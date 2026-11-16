@@ -1,6 +1,6 @@
 //! sion-convert: MIDI, tracker modules (MOD/S3M/XM/IT), VGM/VGZ, GYM, S98, NSF/NSFE/NSF2, GBS and SPC → SiON MML, written as by hand.
 //!
-//! Usage: sion-convert <input> [-o output.mml] [--grid N] [--gain G] [--wavetables] [--exact] [--exact-pcm] [--track N] [--plain] [--verify] [--wav FILE]
+//! Usage: sion-convert <input> [-o output.mml] [--grid N] [--gain G] [--wavetables] [--exact] [--exact-pcm] [--exact-rate] [--track N] [--plain] [--verify] [--wav FILE]
 
 use std::process::exit;
 
@@ -22,6 +22,8 @@ const HELP: &str = "usage: sion-convert <input> [options]
   --track N          NSF/NSFE/GBS: which song of the file to convert (from 1; default: the file's first song)
   --exact-pcm        VGM/NSF: capture samples exactly as the chips output them (timing jitter and all) instead of
                      storing each sound once (many times larger)
+  --exact-rate       NSF/GBS: keep the console's exact frame rate (60.1 Hz NES, 59.73 Hz Game Boy) instead of
+                     rounding each frame to 60 Hz (larger output; by default the song is 0.16% / 0.45% off speed)
   --plain            write the plain MML (one command per event) instead
   --verify           render both versions with the sion crate and check the audio is identical; for a
                      tracker module with --exact, also compare with the module mixed straight from its samples
@@ -42,6 +44,7 @@ fn main() {
             "--wavetables" => opt.wavetables = true,
             "--exact-pcm" => opt.exact_pcm = true,
             "--exact" => opt.exact = true,
+            "--exact-rate" => opt.exact_rate = true,
             "--track" => opt.track = Some(val("--track").parse().unwrap_or_else(|_| fail("--track takes a number, e.g. 2"))),
             "--plain" => plain = true,
             "--verify" => verify = true,

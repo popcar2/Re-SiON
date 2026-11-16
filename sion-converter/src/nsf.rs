@@ -480,6 +480,19 @@ pub(crate) fn pick_track(track: Option<usize>, songs: usize, first: usize) -> Re
 }
 
 /// A played driver's log as a score, its silent loop dropped; an error if it plays nothing.
+/// The frame as a whole number of samples (the NES's 60.1 Hz as 60, PAL's 50.007 as 50, the Game Boy's 59.73 as
+/// 60), the song played that much off speed (0.16%, 0.45%): SiON's envelope tables step on whole samples, so the
+/// driver's per-frame volume and pitch changes can be tables instead of a slur each frame (`Arranged::envelopes`).
+/// Returns the new end and loop point. (A rate not within 0.5% of one that divides 44100 is kept.)
+pub(crate) fn retime(writes: &mut [Write], end: u64, loop_at: Option<u64>, period: &mut Option<f64>) -> (u64, Option<u64>) {
+    let whole = |p: f64| { let w = 44100.0 / (44100.0 / p).round(); (44100.0 % w == 0.0 && (p / w - 1.0).abs() < 0.005).then_some((p, w)) };
+    let Some((p, w)) = period.and_then(whole) else { return (end, loop_at) };
+    let r = w / p;
+    for w in writes.iter_mut() { w.at = (w.at as f64 * r).round() as u64 }
+    *period = Some(w);
+    ((end as f64 * r).round() as u64, loop_at.map(|l| (l as f64 * r).round() as u64))
+}
+
 pub(crate) fn log_score(log: Log, warnings: Vec<String>, song: usize) -> Result<(Score, Vec<String>), String> {
     let (mut score, w) = crate::vgm::render(log, warnings)?;
     score.drop_silent_loop();
@@ -488,7 +501,7 @@ pub(crate) fn log_score(log: Log, warnings: Vec<String>, song: usize) -> Result<
 }
 
 /// `track`: which song of the file (from 1; default: the file's own first song).
-pub fn to_score(data: &[u8], exact: bool, track: Option<usize>) -> Result<(Score, Vec<String>), String> {
+pub fn to_score(data: &[u8], exact: bool, exact_rate: bool, track: Option<usize>) -> Result<(Score, Vec<String>), String> {
     let f = parse(data)?;
     let mut warnings = vec![];
     let song = pick_track(track, f.songs, f.first)?;
@@ -604,7 +617,8 @@ pub fn to_score(data: &[u8], exact: bool, track: Option<usize>) -> Result<(Score
     writes.retain(|w| w.at < end);
     let level = vec![1.0; chips.len()];
     // (Without PLAY, the header's rate doesn't time the music: the driver's frames are found from the writes.)
-    let (period, phase) = if play { (Some(44100.0 * us / 1e6), Some(0.0)) } else { (None, None) };
+    let (mut period, phase) = if play { (Some(44100.0 * us / 1e6), Some(0.0)) } else { (None, None) };
+    let (end, loop_at) = if exact_rate { (end, loop_at) } else { retime(&mut writes, end, loop_at, &mut period) };
     let log = Log { chips, level, writes, blocks: nes.blocks, end, loop_at, period, phase, dac: None, shelf: false };
     log_score(log, warnings, song)
 }

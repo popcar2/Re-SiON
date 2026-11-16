@@ -1,7 +1,7 @@
 // SiON MML converter: JS wrapper for convert.wasm (browser, Node, Deno; no dependencies).
 //
 //   const conv = await Converter.load(fetch("convert.wasm"));   // or bytes / a WebAssembly.Module
-//   const r = conv.convert(fileBytes, { grid, gain, wavetables, exact, exactPcm, track });
+//   const r = conv.convert(fileBytes, { grid, gain, wavetables, exact, exactPcm, exactRate, track });
 //   if (r.ok) download(r.mml); else alert(r.error);
 //
 //   r: { ok, mml, format, tracks, notes, bytes, plainBytes, secs, loopSecs, warnings } or { ok: false, error }.
@@ -26,11 +26,11 @@ export class Converter {
   #fresh() { this.#x = new WebAssembly.Instance(this.#module, {}).exports; }
 
   /** Convert a file (Uint8Array / ArrayBuffer). Options as on the command line (all optional). */
-  convert(bytes, { grid = 0, gain = 0, wavetables = false, exact = false, exactPcm = false, track = 0 } = {}) {
+  convert(bytes, { grid = 0, gain = 0, wavetables = false, exact = false, exactPcm = false, exactRate = false, track = 0 } = {}) {
     const x = this.#x, data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
     const ptr = x.convert_alloc(data.length);
     new Uint8Array(x.memory.buffer, ptr, data.length).set(data);
-    const flags = (wavetables ? 1 : 0) | (exact ? 2 : 0) | (exactPcm ? 4 : 0);
+    const flags = (wavetables ? 1 : 0) | (exact ? 2 : 0) | (exactPcm ? 4 : 0) | (exactRate ? 8 : 0);
     try {
       x.convert_run(ptr, data.length, grid, gain, flags, track);
     } catch (e) {

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use crate::bytes::{text, u16le};
 use crate::chips::{Chip, GameBoy};
 use crate::cpu::Bus;
-use crate::nsf::{ending, log_score, mix, pick_track, MAX_SECS};
+use crate::nsf::{ending, log_score, mix, pick_track, retime, MAX_SECS};
 use crate::score::Score;
 use crate::sm83::Sm83;
 use crate::vgm::{Log, Write};
@@ -157,7 +157,7 @@ fn call(cpu: &mut Sm83, gb: &mut Gb, addr: u16, budget: u64) -> bool {
 }
 
 /// `track`: which song of the file (from 1; default: the file's own first song).
-pub fn to_score(data: &[u8], track: Option<usize>) -> Result<(Score, Vec<String>), String> {
+pub fn to_score(data: &[u8], exact_rate: bool, track: Option<usize>) -> Result<(Score, Vec<String>), String> {
     let f = parse(data)?;
     let mut warnings = vec![];
     let song = pick_track(track, f.songs, f.first.min(f.songs - 1))?;
@@ -219,7 +219,8 @@ pub fn to_score(data: &[u8], track: Option<usize>) -> Result<(Score, Vec<String>
     writes.retain(|w| w.at < end);
     let chips: Vec<Box<dyn Chip>> = vec![Box::new(GameBoy::new())];
     // (A driver that changes its timer's rate has no one frame length: the frames are found from the writes.)
-    let (period, phase) = if steady { (Some(44100.0 * p0), Some(0.0)) } else { (None, None) };
+    let (mut period, phase) = if steady { (Some(44100.0 * p0), Some(0.0)) } else { (None, None) };
+    let (end, loop_at) = if exact_rate { (end, loop_at) } else { retime(&mut writes, end, loop_at, &mut period) };
     let log = Log { chips, level: vec![1.0], writes, blocks: vec![], end, loop_at, period, phase, dac: None, shelf: false };
     let (mut score, w) = log_score(log, warnings, song)?;
     if score.title.is_empty() {

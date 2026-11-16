@@ -76,8 +76,8 @@ pub fn convert(data: &[u8], opt: &Options) -> Result<Converted, String> {
                     w.extend(more);
                     (score, w)
                 }
-                Format::Nsf => nsf::to_score(data, opt.exact_pcm, opt.track)?,
-                Format::Gbs => gbs::to_score(data, opt.track)?,
+                Format::Nsf => nsf::to_score(data, opt.exact_pcm, opt.exact_rate, opt.track)?,
+                Format::Gbs => gbs::to_score(data, opt.exact_rate, opt.track)?,
                 _ => spc::to_score(data)?,
             };
             // (Chip logs have no bars of their own: the tempo makes a row a 1/16 note, so a line is 16 rows.)

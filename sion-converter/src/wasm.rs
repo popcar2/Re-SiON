@@ -30,7 +30,7 @@ pub unsafe extern "C" fn convert_dealloc(ptr: *mut u8, len: usize) {
 
 /// Convert the `len` bytes at `data` (any supported format, recognised from its contents). Options as on the
 /// command line: `grid` (0: exact timing), `gain` (0 or less: automatic), `flags` (1 `--wavetables`, 2 `--exact`,
-/// 4 `--exact-pcm`), `track` (0: the file's first song). Returns 1 on success, 0 on failure (the error is in
+/// 4 `--exact-pcm`, 8 `--exact-rate`), `track` (0: the file's first song). Returns 1 on success, 0 on failure (the error is in
 /// the info).
 ///
 /// # Safety
@@ -44,6 +44,7 @@ pub unsafe extern "C" fn convert_run(data: *const u8, len: usize, grid: u32, gai
         wavetables: flags & 1 != 0,
         exact: flags & 2 != 0,
         exact_pcm: flags & 4 != 0,
+        exact_rate: flags & 8 != 0,
         track: (track > 0).then_some(track as usize),
     };
     let (mml, info, ok) = match crate::convert(data, &opt) {

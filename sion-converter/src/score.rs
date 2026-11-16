@@ -223,8 +223,7 @@ impl Stream {
     /// chip changing the waveform, the VRC6 saw's rate or a pulse's duty, doesn't restart it either.)
     fn switch(&self, a: usize, b: usize) -> bool {
         let (a, b) = (&self.tones[a], &self.tones[b]);
-        let module = |s: &str| s.strip_prefix('%').and_then(|r| r.split_once('@')).filter(|(m, n)| matches!(*m, "1" | "4") && n.parse::<u32>().is_ok()).map(|(m, _)| m.to_string());
-        a.env == b.env && a.legato == b.legato && module(&a.instr).is_some() && module(&a.instr) == module(&b.instr)
+        a.env == b.env && a.legato == b.legato && same_wave(&a.instr, &b.instr)
     }
 
     /// Notes on channels `ch0..`: one note per key-on (or per pitch step for tones without an envelope), with
@@ -234,10 +233,15 @@ impl Stream {
         let mut out = vec![];
         let ku = if self.exact { 64000.0 } else { 64.0 };
         let tiny = |k: i32| if kstep > 1 && k.abs() <= 1 { 0 } else { k };
+        // A detune off `key`, rounded from `origin` (see `origin` below).
+        let detune = |pitch: f32, key: u8, origin: u8| tiny(((pitch - origin as f32) as f64 * ku).round() as i32) - (key as i32 - origin as i32) * ku as i32;
         for (c, frames) in self.chans.iter().enumerate() {
             let mut cur: Option<(Note, usize, f32, i32)> = None; // note, tone, last amplitude, last pan
             // A released note: its index in `out`, its amplitude and pitch (1/64 semitones) at the key-off.
             let mut rel: Option<(usize, f32, i32)> = None;
+            // The key of the note a legato run of notes started with: their detunes are rounded from it, as they
+            // were when the run was one slurred note (see below).
+            let mut origin = 0u8;
             let close = |cur: &mut Option<(Note, usize, f32, i32)>, t: u64, out: &mut Vec<Note>| {
                 if let Some((mut n, ..)) = cur.take() { n.end = t; out.push(n) }
             };
@@ -277,17 +281,37 @@ impl Stream {
                 // would, every frame of an arpeggio or slide (a buzz at the frame rate).
                 let tone = &self.tones[f.tone];
                 let keep = cur.as_ref().is_some_and(|(_, tn, ..)| !f.trig && (*tn == f.tone || self.switch(*tn, f.tone)));
+                // But a jump to another note (a driver's legato) whose level starts over (the driver's envelope does)
+                // is a new note all the same, keyed on without restarting the waveform (`@ph255`): it plays the same,
+                // and its levels can be the same envelope table as the note before. (Not for tones whose own envelope would restart, nor
+                // under an LFO, which a key-on restarts too.)
+                let legato = keep && !self.exact && !tone.legato && f.lfo == (0, 0) && wavetable(&tone.instr) && cur.as_ref().is_some_and(|(n, _, last, _)| {
+                    let lk = n.bends.last().map_or(n.k0, |b| b.1);
+                    n.lfo0 == (0, 0) && n.lfos.is_empty() && (f.pitch as f64 - n.key as f64 - lk as f64 / ku).abs() >= 0.75
+                        && *last < f.amp
+                });
+                if legato {
+                    close(&mut cur, t, &mut out);
+                    let key = f.pitch.round().clamp(0.0, 127.0);
+                    let mut n = Note::new(ch0 + c as u32, t, t + 1, key as u8, f.amp, tone.instr.clone());
+                    (n.env, n.pan, n.ofs) = (tone.env.clone(), f.pan, NO_RESET);
+                    // (Its detune as the slur would have had it.)
+                    n.k0 = detune(f.pitch, key as u8, origin);
+                    cur = Some((n, f.tone, f.amp, f.pan));
+                    continue;
+                }
                 if !keep {
                     close(&mut cur, t, &mut out);
                     // (A PCM key-on starts its note even when silent: the sample is playing from its start.)
                     if f.amp <= 0.0 && !(self.exact && f.trig) { continue }
                     let key = f.pitch.round().clamp(0.0, 127.0);
+                    origin = key as u8;
                     let mut n = Note::new(ch0 + c as u32, t, t + 1, key as u8, f.amp, tone.instr.clone());
                     n.env = tone.env.clone();
                     n.pan = f.pan;
                     n.lfo0 = f.lfo;
                     // Detunes of a 64th of a semitone (frequency register rounding) are inaudible.
-                    n.k0 = tiny(((f.pitch - key) as f64 * ku).round() as i32);
+                    n.k0 = detune(f.pitch, origin, origin);
                     if self.exact { n.ofs = (f.pos * 1000.0).round() / 1000.0 }
                     cur = Some((n, f.tone, f.amp, f.pan));
                     continue;
@@ -295,7 +319,8 @@ impl Stream {
                 let (n, tn, last, pan) = cur.as_mut().unwrap();
                 if *tn != f.tone { n.waves.push((t, tone.instr.clone())); *tn = f.tone }
                 if self.exact && f.pan != *pan { n.pans.push((t, f.pan)); *pan = f.pan }
-                let k = tiny(((f.pitch - n.key as f32) as f64 * ku).round() as i32);
+                // (A legato note's detunes as the slur would have had them.)
+                let k = detune(f.pitch, n.key, origin);
                 let lk = n.bends.last().map_or(n.k0, |b| b.1);
                 if (k - lk).abs() >= kstep { n.bends.push((t, k)) }
                 if (f.amp - *last).abs() > 1e-4 * last.max(f.amp) { n.vols.push((t, f.amp)); *last = f.amp }
@@ -317,6 +342,24 @@ impl Stream {
         out.retain(|n| !(self.exact && n.amp == 0.0 && n.vols.iter().all(|v| v.1 == 0.0)));
         out
     }
+}
+
+/// The key-on phase (`@ph`, `Note::ofs`) that leaves a waveform where it is.
+pub const NO_RESET: f64 = 255.0;
+
+/// A wavetable module's tone (`%1@n`, `%4@n`): a key-on restarts its waveform at the key-on phase (`@ph`), and
+/// `@n` swaps the waveform, nothing else.
+pub fn wavetable(instr: &str) -> bool { wave_module(instr).is_some() }
+
+/// Tones `a` and `b` are waveforms of the same wavetable module: `@n` changes one to the other.
+pub fn same_wave(a: &str, b: &str) -> bool { wave_module(a).is_some_and(|m| wave_module(b) == Some(m)) }
+
+/// The waveform command (`@n`) of a wavetable tone (see `wavetable`).
+pub fn wave_cmd(instr: &str) -> String { format!("@{}", instr.split_once('@').unwrap().1) }
+
+/// The module of a wavetable tone (see `wavetable`).
+pub fn wave_module(instr: &str) -> Option<&str> {
+    instr.strip_prefix('%').and_then(|r| r.split_once('@')).filter(|(m, n)| matches!(*m, "1" | "4") && n.parse::<u32>().is_ok()).map(|(m, _)| m)
 }
 
 /// SiON's LFO cycle is a whole number of frames: a table of `k` rounds of a cycle `frames` long (1 to 8: the
