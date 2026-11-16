@@ -8,7 +8,8 @@
 // they're enabled; idle() — play pressed with nothing loaded; idleText — shown under "Nothing playing";
 // show(song) — after the bar updates (song: the meta passed to play, null when stopped); ended() — the song played out (default: stop);
 // notes(offsets) — follow playback: called with the UTF-8 byte offsets in the MML of the notes playing, as they
-// are heard ([] once nothing is); heatmap: true — show the song's spectrum rising from the bar (heatmap.js).
+// are heard ([] once nothing is); heatmap: true — show the song's spectrum rising from the bar (heatmap.js), with a
+// checkbox in the bar to turn it off (remembered per browser).
 
 import { heatmap } from "./heatmap.js";
 
@@ -17,6 +18,7 @@ const PLAY = "M4 2.5v11L13.5 8z", PAUSE = "M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z";
 
 const BAR = `<footer>
   <div class="bar">
+  <label class="viz" id="viz" title="Show the visualizer" hidden><input type="checkbox" id="vizon" checked>Visualizer</label>
   <div class="seek">
     <time id="pos">0:00</time>
     <input type="range" id="seek" min="0" max="1" step="any" value="0" disabled aria-label="Seek">
@@ -39,6 +41,16 @@ export function createPlayer(hooks = {}) {
   $("prev").hidden = !hooks.prev;
   $("next").hidden = !hooks.next;
   const idleText = $("artist").textContent = hooks.idleText ?? "";
+  // The visualizer checkbox: whether it's on is remembered (when storage is available), and applies from the start.
+  $("viz").hidden = !hooks.heatmap;
+  try { if (localStorage.getItem("sion-visualizer") === "off") $("vizon").checked = false } catch {}
+  $("vizon").onchange = () => {
+    const on = $("vizon").checked;
+    try { localStorage.setItem("sion-visualizer", on ? "on" : "off") } catch {}
+    heat?.enable(on);
+    // Clicked (not tabbed to): let go of focus, so space goes back to play / pause.
+    if (!$("vizon").matches(":focus-visible")) $("vizon").blur();
+  };
 
   let ctx, node, heat, ready, song = null, id = 0; // song: what's loaded ({title, artist}); id: bumped per song
   let text = null; // the MML of the song loaded, once it has arrived (for the download button)
@@ -69,7 +81,7 @@ export function createPlayer(hooks = {}) {
       await ctx.audioWorklet.addModule(new URL("worklet.js", import.meta.url));
       node = new AudioWorkletNode(ctx, "sion", { numberOfInputs: 0, outputChannelCount: [2] });
       node.connect(ctx.destination);
-      if (hooks.heatmap) heat = heatmap(ctx, node, footer, playing);
+      if (hooks.heatmap) heat = heatmap(ctx, node, footer, playing, $("vizon").checked);
       const { port1, port2 } = new MessageChannel();
       node.port.postMessage({ port: port1 }, [port1]);
       renderer.postMessage({ port: port2 }, [port2]);

@@ -249,7 +249,7 @@ $("download").onclick = () => {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 };
-const player = createPlayer({ idleText: "Converter", idle: () => output && play() });
+const player = createPlayer({ idleText: "Converter", heatmap: true, idle: () => output && play() });
 function play() { player.play(output.mml, { title: output.title, artist: "Converted", volume: 1, file: output.file }) }
 $("listen").onclick = play;
 </script>

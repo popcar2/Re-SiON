@@ -35,6 +35,13 @@
     text-align: left; white-space: nowrap;
   }
   .menu button span:first-child { overflow: hidden; text-overflow: ellipsis; }
+  /* On narrow screens the menu would stick out past the right edge under the Examples button (widening the page,
+     which shifted the player bar out of view), so there it spans the toolbar instead. */
+  @media (max-width: 560px) {
+    .tools { position: relative; }
+    .examples { position: static; }
+    .menu { width: 100%; }
+  }
   .menu button .a { margin-left: auto; flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
 
   /* The editor: a textarea with transparent text over a <pre> showing the same text, so the notes being
@@ -232,7 +239,7 @@ function notes(offsets) {
 }
 
 // ---- Player ----
-const player = createPlayer({ idleText: "Playground", idle: run, notes });
+const player = createPlayer({ idleText: "Playground", heatmap: true, idle: run, notes });
 
 function run() {
   played = text.value;
@@ -278,10 +285,15 @@ menu.addEventListener("keydown", (ev) => {
 async function pick(e) {
   open(false);
   const mml = await (await fetch("songs/" + encodeURIComponent(e.file), { cache: "no-cache" })).text();
-  // Through insertText, so picking an example can be undone (Ctrl+Z) like any edit.
-  text.focus();
-  text.select();
-  if (!document.execCommand("insertText", false, mml)) text.value = mml;
+  // Through insertText, so picking an example can be undone (Ctrl+Z) like any edit. Not on touch screens:
+  // focusing the editor there pops up the on-screen keyboard, and its opening and closing again shifts the
+  // page, which pushed the player bar out of view.
+  if (matchMedia("(pointer: coarse)").matches) text.value = mml;
+  else {
+    text.focus({ preventScroll: true });
+    text.select();
+    if (!document.execCommand("insertText", false, mml)) text.value = mml;
+  }
   source = { ...e, mmlTitle: titleOf(mml) };
   text.setSelectionRange(0, 0);
   text.scrollTop = 0;

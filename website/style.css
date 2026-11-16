@@ -95,3 +95,12 @@ svg { width: 14px; height: 14px; fill: currentColor; }
 /* The spectrum heatmap (js/heatmap.js): inside the player bar, rising from the bottom of the window under its controls. */
 footer canvas.heatmap { position: absolute; left: 0; bottom: 0; width: 100%; height: min(64px, 12vh); pointer-events: none; }
 footer div.bar { position: relative; }
+footer canvas.heatmap[hidden] { display: none; }
+/* Its on/off checkbox: a tab standing on top of the bar at its right, over the bar's top border. */
+footer label.viz {
+  position: absolute; bottom: 100%; right: 16px; display: flex; align-items: center; gap: 5px; padding: 4px 9px 3px;
+  background: var(--bg); border: 1px solid var(--line); border-bottom: 0; border-radius: 7px 7px 0 0;
+  color: var(--muted); font-size: 11px; cursor: pointer; user-select: none;
+}
+footer label.viz[hidden] { display: none; }
+footer label.viz input { margin: 0; accent-color: var(--accent); cursor: pointer; }

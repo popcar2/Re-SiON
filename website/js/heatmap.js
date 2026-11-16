@@ -4,6 +4,7 @@
 //
 //   const heat = heatmap(ctx, node, footer, playing);  // node: the audio to show; playing(): whether to draw it
 //   heat.wake();                                       // call when playback starts, so drawing resumes
+//   heat.enable(on);                                   // show or hide it (hidden, it doesn't draw at all)
 
 const LOW = 40, HIGH = 10000; // Hz, the range shown, spaced logarithmically
 const SUB = 4;                // pixels computed per column: the levels are curved between columns, then scaled up
@@ -14,7 +15,7 @@ const FADE = 0.9;             // per frame, how fast the heat dies away once pau
 const INTENSE = 0.4; // how intense a point must be to show at all
 const EDGE = 0.1;    // over how much more intensity it fades in (a soft edge rather than a hard cutoff)
 
-export function heatmap(ctx, node, footer, playing) {
+export function heatmap(ctx, node, footer, playing, on = true) {
   const analyser = ctx.createAnalyser();
   analyser.fftSize = 2048;
   analyser.smoothingTimeConstant = 0.7;
@@ -26,6 +27,7 @@ export function heatmap(ctx, node, footer, playing) {
   const canvas = document.createElement("canvas");
   canvas.className = "heatmap";
   canvas.setAttribute("aria-hidden", "true");
+  canvas.hidden = !on;
   footer.prepend(canvas); // (inside the bar, under its controls: see style.css)
   const g = canvas.getContext("2d");
   // Drawn at the canvas's full height but only SUB pixels per column, then stretched across: a glow that is
@@ -130,5 +132,17 @@ export function heatmap(ctx, node, footer, playing) {
     frame = live || any ? requestAnimationFrame(draw) : 0;
   }
 
-  return { wake() { if (!frame) frame = requestAnimationFrame(draw) } };
+  const wake = () => { if (on && !frame) frame = requestAnimationFrame(draw) };
+  return {
+    wake,
+    enable(v) {
+      on = v;
+      canvas.hidden = !on;
+      if (on) { if (playing()) wake(); return }
+      // Off: stop drawing, and start from nothing when turned back on.
+      cancelAnimationFrame(frame);
+      frame = 0;
+      heat.fill(0);
+    },
+  };
 }
