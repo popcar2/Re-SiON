@@ -680,6 +680,9 @@ impl Chan {
     /// No operator is sounding (a filter or plucked string may still be ringing out).
     pub fn silent(&self) -> bool { self.ops.iter().all(|o| o.st == 0) }
 
+    /// Nothing at all to play (as many channels are at any moment): `sample` would only return 0.
+    pub fn idle(&self) -> bool { !self.ks && !self.f_on && self.silent() && !self.dmc_busy() }
+
     /// `leap` for a DPCM sample: it moves on (the one before it is taken to have finished), the level goes where
     /// it got to, and the DC blocker starts settled there.
     fn dpcm_leap(&mut self, sh: &Shared, nf: f32) {
@@ -779,11 +782,11 @@ impl Chan {
         self.stale = false;
     }
 
-    /// Produce one sample. `pipes` carry signals between tracks (`@i`, `@o`, `@r`).
+    /// Produce one sample, for a channel that isn't `idle` (an idle one plays 0: the caller skips it, and takes
+    /// `slate` itself). `pipes` carry signals between tracks (`@i`, `@o`, `@r`).
     #[cfg_attr(feature = "small", optimize(speed))]
     pub fn sample(&mut self, sh: &Shared, pipes: &mut [f32; 4]) -> f32 {
         let late = core::mem::take(&mut self.slate);
-        if !self.ks && !self.f_on && self.silent() && !self.dmc_busy() { return 0.0 }
         if self.pmd != 0 || self.amd > 0 {
             self.lfo_t -= self.lfo_step;
             if self.lfo_t < 0.0 {

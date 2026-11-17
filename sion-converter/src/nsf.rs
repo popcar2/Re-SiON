@@ -434,10 +434,20 @@ fn run(cpu: &mut Cpu, nes: &mut Nes, until: u64, jams: &mut usize) {
 /// at least `min` frames: (start, period).
 pub(crate) fn repeat(sig: &[u64], min: usize) -> Option<(usize, usize)> {
     let n = sig.len();
+    // How far back from the end the hashes match those `p` frames later: the longest common suffix of `sig` and
+    // `sig[..n - p]`, for every `p` at once (the Z-function of `sig` read backwards), in linear time.
+    let r = |k: usize| sig[n - 1 - k];
+    let mut z = vec![0usize; n];
+    let (mut lo, mut hi) = (0, 0);
+    for k in 1..n {
+        let mut m = if k < hi { z[k - lo].min(hi - k) } else { 0 };
+        while k + m < n && r(m) == r(k + m) { m += 1 }
+        z[k] = m;
+        if k + m > hi { (lo, hi) = (k, k + m) }
+    }
     let mut best: Option<(usize, usize)> = None;
     for p in min.max(1)..=n / 2 {
-        let mut i = n - p;
-        while i > 0 && sig[i - 1] == sig[i - 1 + p] { i -= 1 }
+        let i = n - p - z[p];
         if n - i >= 2 * p && best.is_none_or(|(j, _)| i < j) { best = Some((i, p)) }
         if best.is_some_and(|(j, _)| j == 0) { break }
     }

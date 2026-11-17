@@ -406,6 +406,9 @@ struct Track {
     /// Has reached the end of its sequence at least once (ended, or jumped back to its `$` loop point).
     once: bool,
     at: f64, koff: f64, kon: f64, q: f64, qc: f64, kd: f64,
+    /// The first of `at` (unless ended), `kon` and `koff`: when `run` next has something to do but count down to
+    /// the next envelope frame. (They only change in `events`, which keeps it up to date.)
+    wake: f64,
     oct: i32, len: i32, ns: i32, vel: i32, vsh: i32, x: i32, kt: i32, k: i32, kf: f32, note: i32, slur: bool, md: i32, tone: i32,
     /// Envelope settings for [key-off, key-on] x [amplitude, tone, note, pitch, filter]: (table, frames per step).
     set: [[Option<(usize, i32)>; 5]; 2],
@@ -427,6 +430,11 @@ struct Track {
     lag: u64, seen: u64, next: u64,
     /// Byte offset in the source MML of the note playing now (-1: none), from `\x03<offset>` markers (see `spans`).
     src: i32,
+    /// The channel feeds an effect send (`@v`'s levels past the first).
+    sends: bool,
+    /// While rendering: the channel was idle (see `Chan::idle`) with nothing fading at the last frame, and has been
+    /// left alone since, so until the track has something to do it stays that way.
+    quiet: bool,
     ch: Chan,
     dc: Declick,
 }
@@ -499,10 +507,10 @@ impl Track {
     fn new(s: Vec<u8>, sh: &Shared) -> Track {
         let mut t = Track {
             s: s.into(), i: 0, loops: vec![], rep: None, moved: false, end: false, once: false,
-            at: 0.0, koff: INF, kon: INF, q: (sh.quant * 3 / 4) as f64 / sh.quant as f64, qc: 0.0, kd: 0.0,
+            at: 0.0, koff: INF, kon: INF, wake: 0.0, q: (sh.quant * 3 / 4) as f64 / sh.quant as f64, qc: 0.0, kd: 0.0,
             oct: 5, len: 480, ns: 0, vel: 256, vsh: sh.vmode.2, x: 128, kt: 0, k: 0, kf: 0.0, note: 0, slur: false, md: 0, tone: 0,
             set: [[None; 5]; 2], xoff: [false; 2], tvol: false, sweep: [0; 2], swe0: 0.0, modt: [None, None], env: [None; 5], menv: None,
-            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 1.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0, src: -1,
+            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 1.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0, src: -1, sends: false, quiet: false,
             ch: Chan::new(), dc: Declick::new(64),
         };
         t.ch.vm = (sh.vmode.0, sh.vmode.1);
@@ -634,11 +642,17 @@ impl Track {
 
     /// Advance to tick `now`: run due commands, key on/off and envelope frames.
     #[inline]
-    fn run(&mut self, sh: &Shared, now: f64, bpm: &mut f64) {
+    fn run(&mut self, sh: &Shared, now: f64, bpm: &mut f64) { if !self.calm(now) { self.events(sh, now, bpm) } }
+
+    /// `run` for a frame with nothing due but the countdown to the next envelope frame (as most are): does that
+    /// and returns true, or returns false.
+    #[inline]
+    fn calm(&mut self, now: f64) -> bool {
         // Events that fall exactly on this frame are due now, whichever way rounding in `now` went.
         let due = now + 1e-6;
-        // (Most frames have nothing due but the countdown to the next envelope frame.)
-        if (self.end || due < self.at) && due < self.kon && due < self.koff && self.res > 1.0 { self.res -= 1.0 } else { self.events(sh, now, bpm) }
+        let calm = due < self.wake && self.res > 1.0;
+        if calm { self.res -= 1.0 }
+        calm
     }
 
     /// `run` for a frame with something to do. How far into the previous frame an event fell lets a PCM note
@@ -663,6 +677,7 @@ impl Track {
         }
         if due >= self.kon { self.late = late(self.kon, *bpm); self.kon = INF; self.key_on(sh); self.ch.stale = true }
         if due >= self.koff { self.key_off(sh); self.ch.stale = true }
+        self.wake = if self.end { INF } else { self.at }.min(self.kon).min(self.koff);
         self.res -= 1.0;
         if self.res <= 0.0 { self.frame(sh); self.res += self.itv; self.ch.stale = true }
     }
@@ -828,7 +843,10 @@ impl Track {
                     }
                     b"%v" => { self.vsh = p(1, 4).clamp(0, 7); ch.vm.0 = p(0, 0); ch.volume(self.x, self.vel) }
                     b"%x" => { ch.vm.1 = p(0, 0); ch.volume(self.x, self.vel) }
-                    b"@v" => for k in 0..8 { ch.vol[k] = if a[k] == MIN { (k == 0) as i32 as f32 * 0.5 } else { a[k] as f32 / 128.0 } },
+                    b"@v" => {
+                        for k in 0..8 { ch.vol[k] = if a[k] == MIN { (k == 0) as i32 as f32 * 0.5 } else { a[k] as f32 / 128.0 } }
+                        self.sends = a[1..8].iter().any(|&v| v > 0);
+                    }
                     b"p" => ch.pan = if a[0] == MIN { 64 } else { (a[0] * 16).clamp(0, 128) },
                     b"@p" => ch.pan = p(0, 0).clamp(-64, 64) + 64,
                     b"%f" => ch.f_type = if (0..3).contains(&a[0]) { a[0] as usize } else { 0 },
@@ -1111,7 +1129,7 @@ impl Song {
     pub fn set_declick(&mut self, on: bool) { self.declick = on; self.declick_reset() }
 
     /// Forget what declicking took note of: nothing from before now is smoothed over.
-    fn declick_reset(&mut self) { for t in &mut self.tracks { t.dc = Declick::new(t.ch.out_pan()); t.ch.take_vj(); } }
+    fn declick_reset(&mut self) { for t in &mut self.tracks { (t.dc, t.quiet) = (Declick::new(t.ch.out_pan()), false); t.ch.take_vj(); } }
 
     /// `new` for MML as bytes (UTF-8, though only the ASCII in it matters), so no text conversion is needed.
     pub fn from_bytes(src: &[u8]) -> Song {
@@ -1404,10 +1422,13 @@ impl Song {
             let at = (self.pos % PIPE_BLOCK as u64) as usize;
             let mut pipes = self.pipes[at];
             for t in &mut self.tracks {
-                t.run(&self.sh, self.now, &mut self.bpm);
-                let v = t.ch.sample(&self.sh, &mut pipes) * 0.5;
+                // (Many tracks are quiet at any moment: until they have something to do, nothing to render.)
+                if !t.calm(self.now) { t.events(&self.sh, self.now, &mut self.bpm) } else if t.quiet { continue }
+                let idle = t.ch.idle();
+                let v = if idle { t.ch.slate = 0.0; 0.0 } else { t.ch.sample(&self.sh, &mut pipes) * 0.5 };
                 // (Silent, and silent before: nothing to carry over; changes meanwhile wait for the next sound.)
-                if v == 0.0 && t.dc.v == 0.0 && !t.dc.fading() { continue }
+                if v == 0.0 && t.dc.v == 0.0 && !t.dc.fading() { t.quiet = idle; continue }
+                t.quiet = false;
                 let pan = t.ch.out_pan();
                 let lr = |p: i32| [self.sh.pan[(128 - p) as usize], self.sh.pan[p as usize]];
                 let o = if !self.declick || t.dc.calm(pan, t.ch.vj) {
@@ -1419,7 +1440,7 @@ impl Song {
                     let vj = t.ch.take_vj();
                     t.dc.run(v, pan, lr(pan), lr(t.dc.pan), vj)
                 };
-                let sends = if t.ch.vol[1..].iter().any(|v| *v > 0.0) { 8 } else { 1 };
+                let sends = if t.sends { 8 } else { 1 };
                 for (k, s) in self.slots.iter_mut().enumerate().take(sends) {
                     let g = t.ch.vol[k];
                     if g != 0.0 && (k == 0 || !s.fx.is_empty()) {

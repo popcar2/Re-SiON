@@ -380,6 +380,12 @@ pub fn noise_key(rate: f64) -> f32 { (12.0 * (rate / (0.018581361 * 44100.0)).lo
 /// Each value is held for 1/rate s (a sinc² spectrum); what lies above that the output filters drop (a noise
 /// shifting at 112 kHz keeps about 37%, -4.3 dB), while SiON's noise puts all of its power in band.
 pub fn noise_level(rate: f64) -> f32 {
+    // (Chips ask for it every frame, at the few rates their noise runs at: each is worked out once.)
+    thread_local! { static SEEN: std::cell::RefCell<std::collections::HashMap<u64, f32>> = Default::default() }
+    SEEN.with(|s| *s.borrow_mut().entry(rate.to_bits()).or_insert_with(|| noise_share(rate)))
+}
+
+fn noise_share(rate: f64) -> f32 {
     use std::f64::consts::PI;
     let b = 22050.0 / rate.max(1.0);
     // 2 ∫0^b sinc²(x) dx, sinc(x) = sin(πx) / πx; past a few lobes the tail is about 1 / (π² b).

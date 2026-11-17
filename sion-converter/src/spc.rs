@@ -137,7 +137,7 @@ struct Dsp {
 }
 
 impl Dsp {
-    fn sync(&mut self, cycle: u64, ram: &[u8]) { while self.t < cycle / 32 { self.step(ram) } }
+    fn sync(&mut self, cycle: u64, ram: &Ram) { while self.t < cycle / 32 { self.step(ram) } }
 
     fn read(&self, a: u8) -> u8 {
         let a = a as usize & 0x7f;
@@ -159,14 +159,14 @@ impl Dsp {
     }
 
     /// Where voice `i`'s sample `srcn` starts and loops, from the sample directory.
-    fn dir(&self, ram: &[u8], srcn: u8) -> (u16, u16) {
+    fn dir(&self, ram: &Ram, srcn: u8) -> (u16, u16) {
         let e = (self.regs[DIR] as usize * 256 + srcn as usize * 4) & 0xffff;
         let w = |k: usize| ram[(e + k) & 0xffff] as u16 | (ram[(e + k + 1) & 0xffff] as u16) << 8;
         (w(0), w(2))
     }
 
     /// The sample a key-on plays, decoded from RAM as it is now (cached by its blocks' contents).
-    fn sample(&mut self, ram: &[u8], start: u16, lp: u16) -> usize {
+    fn sample(&mut self, ram: &Ram, start: u16, lp: u16) -> usize {
         let (blocks, at) = chain(ram, start, lp);
         let h = blocks.iter().fold(0u64, |h, b| b.iter().fold(h, |h, &x| mix(h, x as u64)));
         if let Some(&i) = self.cache.get(&(start, lp, h)) { return i }
@@ -185,7 +185,7 @@ impl Dsp {
         if vs.len() >= VERSIONS { *vs.last().unwrap() } else { i }
     }
 
-    fn step(&mut self, ram: &[u8]) {
+    fn step(&mut self, ram: &Ram) {
         self.counter = if self.counter == 0 { 0x77ff } else { self.counter - 1 };
         let even = self.t & 1 == 0;
         let (kon, koff) = if even { (std::mem::take(&mut self.new_kon), self.regs[KOFF]) } else { (0, 0) };
@@ -282,10 +282,13 @@ impl Dsp {
     }
 }
 
+/// The sound unit's 64 KB of RAM.
+type Ram = [u8; 0x10000];
+
 /// The 9-byte BRR blocks a sample plays, in order: from `start` to its end block, then (if it loops back to a
 /// block not among those) from `lp` to the end again. A sample that ends without looping leaves out its last
 /// block, which the DSP never plays. Also the block its loop starts on.
-fn chain(ram: &[u8], start: u16, lp: u16) -> (Vec<[u8; 9]>, Option<usize>) {
+fn chain(ram: &Ram, start: u16, lp: u16) -> (Vec<[u8; 9]>, Option<usize>) {
     let read = |a: u16| -> [u8; 9] { std::array::from_fn(|k| ram[(a as usize + k) & 0xffff]) };
     let follow = |from: u16, out: &mut Vec<[u8; 9]>, addrs: &mut Vec<u16>| {
         let mut a = from;
@@ -310,7 +313,8 @@ fn chain(ram: &[u8], start: u16, lp: u16) -> (Vec<[u8; 9]>, Option<usize>) {
 
 /// The sound unit as the driver sees it: RAM, the timers, the I/O ports, the DSP.
 struct Apu {
-    ram: Vec<u8>,
+    /// (A whole 64 KB, so 16-bit addresses need no bounds checks.)
+    ram: Box<Ram>,
     rom: [u8; 64],
     ipl: bool,
     ports: [u8; 4],
@@ -360,6 +364,8 @@ impl Apu {
 
 impl Bus for Apu {
     fn read(&mut self, a: u16, cycle: u64) -> u8 {
+        // (Most reads are of plain RAM.)
+        if (0x100..0xffc0).contains(&a) { return self.ram[a as usize] }
         match a {
             0xf2 => self.addr,
             0xf3 => { self.volatile += 1; self.dsp.sync(cycle, &self.ram); self.dsp.read(self.addr) }
@@ -423,7 +429,7 @@ struct Played { dsp: Dsp, regs0: [u8; 128], end: u64, lp: Option<u64>, tags: Tag
 fn play(d: &[u8], warnings: &mut Vec<String>) -> Result<Played, String> {
     if d.len() < 0x10180 { return Err("truncated SPC file".into()) }
     let tags = tags(d);
-    let ram = d[0x100..0x10100].to_vec();
+    let ram: Box<Ram> = d[0x100..0x10100].to_vec().into_boxed_slice().try_into().unwrap();
     let regs: [u8; 128] = d[0x10100..0x10180].try_into().unwrap();
     let mut rom = IPL;
     if let Some(r) = d.get(0x101c0..0x10200).filter(|r| r.iter().any(|&b| b != 0)) { rom.copy_from_slice(r) }
@@ -571,7 +577,10 @@ impl Env {
 fn sion_rate(a: f64) -> i32 {
     if a <= 0.0 { return 0 }
     if a > env_inc(60) * 1.5 { return 63 }
-    (1..=60).min_by(|&x, &y| (env_inc(x) / a).ln().abs().total_cmp(&(env_inc(y) / a).ln().abs())).unwrap()
+    // (The steps rise with the rate, about 19% apart: the closest is one of the two either side of `a`.)
+    let k = (1..=60).find(|&x| env_inc(x) >= a).unwrap_or(61);
+    let off = |x: i32| (env_inc(x) / a).ln().abs();
+    if k == 1 || (k <= 60 && off(k) < off(k - 1)) { k } else { k - 1 }
 }
 
 /// SiON steps (`env_inc`'s units; 0: none, infinite: at once) for an exponential fall of one DSP step (-1/256 of
