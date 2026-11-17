@@ -499,10 +499,11 @@ impl Arranged {
         env.vtail.retain(|k, _| env.vol.contains_key(k));
         // A pitch table has to be shorter to write than the slurs it replaces (about `SLUR` characters a change),
         // with a reference (`np12`) per note that uses it.
-        let mut gain: HashMap<usize, i64> = HashMap::new();
-        for (&(ti, ni), &id) in &env.pitch { *gain.entry(id).or_default() += SLUR * self.tracks[ti].notes[ni].bends.len() as i64 - 5 }
+        // (Per table: the gain over its notes, if any use it.)
+        let mut gain: Vec<Option<i64>> = vec![None; tables.len()];
+        for (&(ti, ni), &id) in &env.pitch { *gain[id].get_or_insert(0) += SLUR * self.tracks[ti].notes[ni].bends.len() as i64 - 5 }
         for (id, (_, t)) in tables.iter().enumerate().filter(|t| !t.1.0) {
-            if gain.get(&id).is_some_and(|&g| g < 12 + text_len(t)) { env.pitch.retain(|_, v| *v != id) }
+            if gain[id].is_some_and(|g| g < 12 + text_len(t)) { env.pitch.retain(|_, v| *v != id) }
         }
         env.ptail.retain(|k, _| env.pitch.contains_key(k));
         // A note keeps the table the note before it had wherever that plays its values too (a note without
@@ -533,12 +534,13 @@ impl Arranged {
             }
         }
         // Numbered last, the tables used by the most notes first: the shortest numbers where they are written most.
-        let mut uses: HashMap<usize, usize> = HashMap::new();
-        for &id in env.vol.values().chain(env.cut.values()).chain(env.pitch.values()).chain(env.vtail.values()).chain(env.ptail.values()) { *uses.entry(id).or_default() += 1 }
-        let mut used: Vec<(usize, usize)> = uses.into_iter().collect();
+        let mut uses = vec![0usize; tables.len()];
+        for &id in env.vol.values().chain(env.cut.values()).chain(env.pitch.values()).chain(env.vtail.values()).chain(env.ptail.values()) { uses[id] += 1 }
+        let mut used: Vec<(usize, usize)> = uses.into_iter().enumerate().filter(|x| x.1 > 0).collect();
         used.sort_by_key(|&(id, n)| (std::cmp::Reverse(n), id));
-        let num: HashMap<usize, usize> = used.iter().zip(&self.free).map(|(&(id, _), &k)| (id, k)).collect();
-        for m in [&mut env.vol, &mut env.cut, &mut env.pitch, &mut env.vtail, &mut env.ptail] { for id in m.values_mut() { *id = num[id] } }
+        let mut num = vec![0; tables.len()];
+        for (&(id, _), &k) in used.iter().zip(&self.free) { num[id] = k }
+        for m in [&mut env.vol, &mut env.cut, &mut env.pitch, &mut env.vtail, &mut env.ptail] { for id in m.values_mut() { *id = num[*id] } }
         // (`free` ascends, so this is in number order.)
         for (&(id, _), &k) in used.iter().zip(&self.free) { let t = &tables[id].1; env.header.push(format!("#TABLE{k}{{{}}}", table_body(&t.0, t.1))) }
         // (Only the tables step at the frame rate: without them it needn't be said.)

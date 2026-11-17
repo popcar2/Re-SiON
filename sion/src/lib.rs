@@ -190,9 +190,9 @@ fn key_scale(center: f32, range: f32, below: f32, step: f32, above: f32) -> Vec<
     (0..128).map(|i| if i < lo { below } else if i < hi { v += step; v - step } else { above }).collect()
 }
 
-/// `#PCMWAVE` (`W`), `#PCMVOICE` (`V`) or `#SAMPLER` (`S`) number `k`. They only refer to `#PCMB`s by number, so
-/// they can come before them: the cut samples are made once all are read (`cuts`). See the README for the
-/// arguments.
+/// `#PCMWAVE` (`kind` `W`), `#PCMVOICE` (`V`) or `#SAMPLER` (`P`; each name's fourth letter) number `k`. They
+/// only refer to `#PCMB`s by number, so they can come before them: the cut samples are made once all are read
+/// (`cuts`). See the README for the arguments.
 fn pcm_table(sh: &mut Shared, kind: u8, k: usize, dat: &[u8], pfx: &[u8]) {
     let blank = || PcmVoice { keys: None, vol: vec![1.0; 128], pan: vec![0; 128], env: None, init: vec![] };
     let f = fields(dat);
@@ -1187,31 +1187,30 @@ impl Song {
             let k = num(body, &mut j).unwrap_or(0).max(0) as usize;
             ws(body, &mut j);
             let (dat, pfx) = if body.get(j) == Some(&b'{') { let e = find(body, j, b"}"); (&body[j + 1..(e - 1).max(j + 1)], &body[e..]) } else { (&body[j..], &body[j..]) };
-            let text = dat;
             match name {
                 b"END" => break,
                 b"@" | b"OPM@" | b"OPN@" | b"OPL@" | b"OPX@" | b"MA@" | b"AL@" => sh.voices[k & 255] = voice(name, &nums(dat), pfx),
                 b"FPS" => sh.fps = if k > 0 { k as f32 } else { nums(dat).first().copied().unwrap_or(60.0).max(1.0) },
-                b"SIGN" => sh.sign = sign(text),
-                b"MACRO" => dynamic = has(text, b"dynamic"),
+                b"SIGN" => sh.sign = sign(dat),
+                b"MACRO" => dynamic = has(dat, b"dynamic"),
                 b"QUANT" => if k > 0 { sh.quant = k as i32 },
                 b"TMODE" => {
                     let v = nums(&dat[find(dat, 0, b"=")..]).first().copied().filter(|v| *v > 0.0);
-                    sh.tmode = if has(text, b"timerb") { (1, v.unwrap_or(4000.0) as f64 * 1.220703125) } else if has(text, b"fps") { (2, v.unwrap_or(60.0) as f64 * 60.0) } else { (0, 1.0 / v.unwrap_or(1.0) as f64) };
+                    sh.tmode = if has(dat, b"timerb") { (1, v.unwrap_or(4000.0) as f64 * 1.220703125) } else if has(dat, b"fps") { (2, v.unwrap_or(60.0) as f64 * 60.0) } else { (0, 1.0 / v.unwrap_or(1.0) as f64) };
                 }
                 b"VMODE" => {
-                    if has(text, b"n88") || has(text, b"mdx") { (sh.vmode.0, sh.vmode.1) = (4, 3) }
-                    if has(text, b"psg") { (sh.vmode.0, sh.vmode.1) = (3, 3) }
+                    if has(dat, b"n88") || has(dat, b"mdx") { (sh.vmode.0, sh.vmode.1) = (4, 3) }
+                    if has(dat, b"psg") { (sh.vmode.0, sh.vmode.1) = (3, 3) }
                     for (key, x) in [(b"%v", false), (b"%x", true)] {
-                        if let Some(p) = text.windows(2).position(|w| w == key) {
-                            let (mut j, d) = (p + 2, text);
-                            let m = num(d, &mut j).unwrap_or(0).clamp(0, 4);
-                            if x { sh.vmode.1 = m } else { sh.vmode.0 = m; ws(d, &mut j); if d.get(j) == Some(&b',') { j += 1; sh.vmode.2 = num(d, &mut j).unwrap_or(4).clamp(0, 7) } }
+                        if let Some(p) = dat.windows(2).position(|w| w == key) {
+                            let mut j = p + 2;
+                            let m = num(dat, &mut j).unwrap_or(0).clamp(0, 4);
+                            if x { sh.vmode.1 = m } else { sh.vmode.0 = m; ws(dat, &mut j); if dat.get(j) == Some(&b',') { j += 1; sh.vmode.2 = num(dat, &mut j).unwrap_or(4).clamp(0, 7) } }
                         }
                     }
                 }
-                b"FBMODE" => sh.fb2 = has(text, b"chip"),
-                b"REV" => sh.rev = (if has(text, b"vol") { 1 } else { -1 }, if has(text, b"oct") { 1 } else { -1 }),
+                b"FBMODE" => sh.fb2 = has(dat, b"chip"),
+                b"REV" => sh.rev = (if has(dat, b"vol") { 1 } else { -1 }, if has(dat, b"oct") { 1 } else { -1 }),
                 b"TABLE" => if k < 255 { sh.tables[k] = Some(table(dat, pfx)).filter(|t| !t.0.is_empty()) },
                 b"WAV" => {
                     let t = table(dat, pfx).0;
@@ -1237,9 +1236,7 @@ impl Song {
                     sh.dpcm[k & 255] = a.get(3).is_some_and(|f| *f as i32 & 4 != 0);
                     if sh.dpcm[k & 255] { raw.push((k & 255, bytes)) }
                 }
-                b"PCMWAVE" => pcm_table(&mut sh, b'W', k, dat, pfx),
-                b"PCMVOICE" => pcm_table(&mut sh, b'V', k, dat, pfx),
-                b"SAMPLER" => pcm_table(&mut sh, b'S', k, dat, pfx),
+                b"PCMWAVE" | b"PCMVOICE" | b"SAMPLER" => pcm_table(&mut sh, name[3], k, dat, pfx),
                 b"EFFECT" => effects.push((k, dat.to_vec(), pfx.to_vec())),
                 b"FM" => conn.push((seqs.len(), dat.to_vec())),
                 _ => {}

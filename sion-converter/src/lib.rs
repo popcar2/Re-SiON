@@ -127,8 +127,7 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
     // (A looping song renders once through, plus a second of its loop.)
     let limit = loop_secs.map_or(60.0 * 30.0, |_| secs + 1.0);
     let mut lens = mml::Lengths::new();
-    let mut plain: Vec<_> = song.tracks.iter().map(|t| arrange::tokens(t, None, &lens, None, false)).collect();
-    let mut plain_mml = mml::plain(&song.header, &plain, &lens);
+    let mut plain_mml = plain(&song, &lens, None);
     // The volume estimate can't know how loud SiON's waveforms and FM voices really come out: if the result
     // would clip, turn the master volume down until it doesn't.
     // (Rendered samples are limited to ±1, so a clipping peak only says "too loud": step down until it fits.)
@@ -137,17 +136,13 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
             let (peak, x) = (peak(&plain_mml, limit), song.master());
             if peak <= 0.98 || x <= 1 { break }
             song.set_master(((x as f32 * if peak >= 0.999 { 0.75 } else { 0.95 / peak }) as i32).min(x - 1));
-            plain = song.tracks.iter().map(|t| arrange::tokens(t, None, &lens, None, false)).collect();
-            plain_mml = mml::plain(&song.header, &plain, &lens);
+            plain_mml = plain(&song, &lens, None);
         }
     }
     // (The plain MML keeps the data as it was made, so a check against it covers the compacted data too.)
     // (The written MML plays the notes' per-frame runs from tables, the plain one as slurs: checked equal.)
     let env = song.envelopes(false);
-    if !env.header.is_empty() {
-        plain = song.tracks.iter().enumerate().map(|(i, t)| arrange::tokens(t, None, &lens, Some((&env, i)), false)).collect();
-        plain_mml = mml::plain(&song.header, &plain, &lens);
-    }
+    if !env.header.is_empty() { plain_mml = plain(&song, &lens, Some(&env)) }
     let mut written = |env: &arrange::Envelopes| -> String {
         let header: Vec<String> = song.header.iter().chain(&env.header).map(|h| mml::compact(h)).collect();
         let toks_of = |gate: Option<u32>| -> Vec<Vec<mml::Tok>> { song.tracks.iter().enumerate().map(|(i, t)| arrange::tokens(t, gate, &lens, Some((env, i)), true)).collect() };
@@ -179,6 +174,12 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
         loop_secs,
         warnings,
     }
+}
+
+/// The plain MML (one command per event) of the arranged song, with `env`'s levels as slurs in `x`.
+fn plain(song: &arrange::Arranged, lens: &mml::Lengths, env: Option<&arrange::Envelopes>) -> String {
+    let toks: Vec<_> = song.tracks.iter().enumerate().map(|(i, t)| arrange::tokens(t, None, lens, env.map(|e| (e, i)), false)).collect();
+    mml::plain(&song.header, &toks, lens)
 }
 
 /// What a change of gate (`q`, `@q`) costs in a readable track, over its characters: each line restates it.

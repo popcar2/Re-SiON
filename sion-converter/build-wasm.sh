@@ -16,7 +16,7 @@ if ! command -v wasm-opt >/dev/null 2>&1; then
 fi
 
 before=$(wc -c < "$WASM")
-wasm-opt "$WASM" -O3 --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
+wasm-opt "$WASM" -Os --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
   --enable-mutable-globals --strip-debug --strip-producers -o "$WASM.opt"
 mv "$WASM.opt" "$WASM"
 echo "wasm-opt: $before -> $(wc -c < "$WASM") bytes"

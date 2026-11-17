@@ -58,7 +58,6 @@ fn frame(st: &mut Stream, instr: &str, pitch: f32, amp: f32, pan: i32, trig: boo
 /// channels at extreme periods, or play samples by writing volumes).
 fn audible(hz: f64) -> bool { (16.0..=16000.0).contains(&hz) }
 
-// ---------------------------------------------------------------------------------------------------------
 /// Texas Instruments SN76489 (Master System, Game Gear, Mega Drive, BBC Micro...): three square waves and a
 /// noise channel with 2 dB volume steps.
 pub struct Sn76489 { clock: f64, latch: usize, tone: [u16; 3], noise: u8, vol: [u8; 4], stereo: u8, trig: bool }
@@ -97,7 +96,6 @@ impl Chip for Sn76489 {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------
 /// General Instrument AY-3-8910 / Yamaha YM2149 (MSX, ZX Spectrum 128, Atari ST, Amstrad CPC), also the SSG
 /// part of the YM2203/2608/2610: three squares sharing one noise generator and one envelope generator.
 /// Reported as three tone channels, then three noise channels (one per channel that mixes the noise in).
@@ -163,7 +161,6 @@ impl Chip for Ay8910 {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------
 /// Ricoh 2A03 (NES/Famicom APU): two pulse waves, a triangle and noise, with the hardware envelopes,
 /// length counters, linear counter and sweeps; and the delta modulation channel's samples (DPCM from memory, and
 /// levels written to `$4011`) as embedded samples.
@@ -444,7 +441,6 @@ impl Chip for NesApu {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------
 /// Konami VRC6 (NSF expansion sound): two pulses with eight duties in sixteenths and a 7-step sawtooth. Writes
 /// address `reg` = channel * 4 + register ($9000-$9002 → 0-2, $A000 → 4-6, $B000 → 8-10), and 3 for $9003.
 pub struct Vrc6 { cpu: f64, r: [u8; 12], trig: [bool; 3] }
@@ -494,7 +490,6 @@ impl Chip for Vrc6 {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------
 /// Game Boy (DMG) APU: two pulse waves (the first with a frequency sweep), a 32-step 4-bit wavetable channel
 /// and noise; with envelopes, length counters and stereo panning.
 pub struct GameBoy {

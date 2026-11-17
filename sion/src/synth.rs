@@ -114,7 +114,13 @@ impl Shared {
 
 /// The S-DSP's Gaussian interpolation curve (weights of 2048; at position `u` + `i` / 256, frame `u` gets
 /// `[255 - i]`, `u + 1` `[511 - i]`, `u + 2` `[256 + i]` and `u + 3` `[i]`).
-const GAUSS: [i16; 512] = [
+/// (As floats, read faster; the size-optimised sion.wasm keeps them in 16 bits, half the size.)
+const GAUSS: [Gauss; 512] = { let mut g = [0 as Gauss; 512]; let mut i = 0; while i < 512 { g[i] = GAUSS16[i] as Gauss; i += 1 } g };
+#[cfg(not(feature = "wasm"))]
+type Gauss = f32;
+#[cfg(feature = "wasm")]
+type Gauss = i16;
+const GAUSS16: [i16; 512] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2,
     2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10,
     11, 11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 15, 16, 16, 17, 17, 18, 19, 19, 20, 20, 21, 21, 22, 23, 23, 24, 24, 25, 26, 27, 27,

@@ -89,7 +89,8 @@ fn write_wav(path: &str, mml: &str, secs: f64) -> std::io::Result<()> {
     sion_converter::render_chunks(mml, secs, |b| for s in b { pcm.extend(((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes()) });
     let secs = pcm.len() as f64 / 4.0 / rate as f64;
     let mut f = Vec::with_capacity(44 + pcm.len());
-    for (tag, v) in [(&b"RIFF"[..], 36 + pcm.len() as u32)] { f.extend(tag); f.extend(v.to_le_bytes()) }
+    f.extend(b"RIFF");
+    f.extend((36 + pcm.len() as u32).to_le_bytes());
     f.extend(b"WAVEfmt ");
     for v in [16u32, 1 | 2 << 16, rate, rate * 4, 4 | 16 << 16] { f.extend(v.to_le_bytes()) }
     f.extend(b"data");

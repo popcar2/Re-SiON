@@ -86,8 +86,7 @@ fn main() {
             ("s", _) => set(None),
             (_, Ok(n)) if (1..=songs.len()).contains(&n) => match std::fs::read(&songs[n - 1]) {
                 Ok(mml) => {
-                    let mml = String::from_utf8_lossy(&mml);
-                    set(Some((sion::Song::new(&mml), volume(&songs[n - 1]))));
+                    set(Some((sion::Song::from_bytes(&mml), volume(&songs[n - 1]))));
                     say(&["playing: ", &name(n - 1), "\n"])
                 }
                 Err(_) => say(&["cannot read song\n"]),

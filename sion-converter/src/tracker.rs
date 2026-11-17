@@ -183,7 +183,6 @@ fn plain_instruments(names: Vec<String>) -> Vec<Instrument> {
     names.into_iter().enumerate().map(|(s, name)| Instrument { map: (0..120).map(|k| (k as u8, s as u16 + 1)).collect(), venv: None, penv: None, fadeout: 0, gvol: 128, pan: None, nna: 0, name }).collect()
 }
 
-// ---------------------------------------------------------------------------------------------------------
 // MOD
 
 fn mod_chans(d: &[u8]) -> Option<usize> {
@@ -283,7 +282,6 @@ fn load_mod(d: &[u8]) -> Result<Module, String> {
     })
 }
 
-// ---------------------------------------------------------------------------------------------------------
 // S3M / IT effects (letters A..Z = 1..26)
 
 fn it_fx(cmd: u8, p: u8, s3m: bool) -> Fx {
@@ -331,7 +329,6 @@ fn it_fx(cmd: u8, p: u8, s3m: bool) -> Fx {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------
 // S3M
 
 fn load_s3m(d: &[u8]) -> Result<Module, String> {
@@ -406,7 +403,6 @@ fn load_s3m(d: &[u8]) -> Result<Module, String> {
     })
 }
 
-// ---------------------------------------------------------------------------------------------------------
 // XM
 
 fn xm_env(d: &[u8], pts: usize, n: u8, sus: u8, ls: u8, le: u8, flags: u8, pan: bool) -> Option<Env> {
@@ -519,7 +515,6 @@ fn load_xm(d: &[u8]) -> Result<Module, String> {
     })
 }
 
-// ---------------------------------------------------------------------------------------------------------
 // IT
 
 fn it_env(d: &[u8], o: usize, pan: bool) -> Option<Env> {

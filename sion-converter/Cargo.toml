@@ -19,11 +19,15 @@ sion = { path = "../sion" }
 [profile.release]
 lto = true
 codegen-units = 1
+# A panic only ends the program (its message still prints): no unwinding tables, and no symbols.
+panic = "abort"
+strip = true
 
-# The wasm build (`build-wasm.sh`): converting is heavy work (chip emulation, rendering to check the volume,
-# minifying), so optimise for speed; a panic aborts (the JS wrapper then starts a fresh instance).
+# The wasm build (`build-wasm.sh`): "s" converts as fast as 3 (2026-11-17, 29 SPCs in node: 52.5 s either way) and
+# is 17% smaller gzipped (334 vs 401 KB); "z" is smaller still (293 KB) but 37% slower. A panic aborts (the JS
+# wrapper then starts a fresh instance).
 [profile.wasm]
 inherits = "release"
-opt-level = 3
+opt-level = "s"
 panic = "abort"
 strip = "debuginfo"
