@@ -27,9 +27,16 @@ int32_t sion_song_render(SionSong *song, float *out, size_t frames);
 /* Move playback `frames` ahead without output, for seeking: the sequencer leaps from event to event and
    the channels' envelopes, sample positions and LFOs leap along with it, then the last moment is rendered
    so filters and effects settle. Fast (cost grows with the song's events, not its length in frames), and
-   close to, not exactly, what continuous playback would give there.
+   close to, not exactly, what continuous playback would give there. The jump is crossfaded over (about
+   6 ms), from the audio the song would have rendered next to the audio after the skip; with nothing rendered
+   yet, the audio after the skip just fades in. Off with declicking.
    Returns 1 while playing, 0 once finished. To seek backwards, make a new song and skip from the start. */
 int32_t sion_song_skip(SionSong *song, uint64_t frames);
+
+/* Forget the audio rendered so far, so the next skip fades in from silence rather than crossfading from it.
+   For players that render ahead and throw their buffer away on a seek: the song is then past what was
+   heard, so fade out the buffer yourself from the frame playing, and call this before skipping. */
+void sion_song_forget_rendered(SionSong *song);
 
 /* Frames played (rendered or skipped) so far. */
 uint64_t sion_song_position(const SionSong *song);

@@ -71,14 +71,25 @@ pub unsafe extern "C" fn sion_song_render(song: *mut Song, out: *mut f32, frames
     song.render(slice::from_raw_parts_mut(out, frames * 2)) as i32
 }
 
-/// Move playback `frames` ahead without output, for seeking (see `Song::skip`). Returns 1 while the song
-/// plays, 0 once it has finished. To seek backwards, make a new song and skip from the start.
+/// Move playback `frames` ahead without output, for seeking (see `Song::skip`), crossfading over the jump.
+/// Returns 1 while the song plays, 0 once it has finished. To seek backwards, make a new song and skip from
+/// the start.
 ///
 /// # Safety
 /// `song` must be a live song.
 #[no_mangle]
 pub unsafe extern "C" fn sion_song_skip(song: *mut Song, frames: u64) -> i32 {
     song.as_mut().map_or(0, |s| s.skip(frames) as i32)
+}
+
+/// Forget the audio rendered so far, so the next skip fades in from silence rather than crossfading from it
+/// (see `Song::forget_rendered`): for players that render ahead and throw their buffer away on a seek.
+///
+/// # Safety
+/// `song` must be a live song.
+#[no_mangle]
+pub unsafe extern "C" fn sion_song_forget_rendered(song: *mut Song) {
+    if let Some(s) = song.as_mut() { s.forget_rendered() }
 }
 
 /// Frames played (rendered or skipped) so far.

@@ -458,6 +458,9 @@ struct Declick {
 /// Samples a declick offset takes to fade out (about a millisecond).
 const DECLICK: u32 = 48;
 
+/// Frames a `Song::skip` crossfades over (about 6 ms).
+const SKIP_FADE: u32 = 256;
+
 impl Declick {
     fn new(pan: i32) -> Declick { Declick { pan, ..Declick::default() } }
 
@@ -932,6 +935,12 @@ pub struct Song {
     tracks: Vec<Track>, sh: Shared, slots: Vec<Slot>, bpm: f64, now: f64, tail: usize,
     /// Smooth over the jumps from key-ons and volume and pan changes (see `Declick`; on by default).
     declick: bool,
+    /// The crossfade after a `skip` (see there): frames of it left, and the audio it fades out (interleaved
+    /// stereo, one frame per frame of it, or empty: fade in from silence).
+    fade: u32, old: Vec<f32>,
+    /// Nothing has been played to crossfade a `skip` from: nothing rendered since the song was made, or since
+    /// `forget_rendered`.
+    fresh: bool,
     /// Frames played (rendered or skipped) so far.
     pos: u64,
     /// Tick and tempo at the last tempo change, and frames since: `now` is computed from these rather than summed
@@ -1126,7 +1135,13 @@ impl Song {
     pub fn new(mml: &str) -> Song { Song::from_bytes(mml.as_bytes()) }
 
     /// Turn declicking on (the default) or off. Off, the output is exactly SiON's, jumps and all.
-    pub fn set_declick(&mut self, on: bool) { self.declick = on; self.declick_reset() }
+    pub fn set_declick(&mut self, on: bool) { self.declick = on; self.fade = 0; self.declick_reset() }
+
+    /// Forget the audio rendered so far, so the next `skip` fades in from silence rather than crossfading from
+    /// it. For players that render ahead and throw away what they buffered on a seek: the song's position is
+    /// then past what was heard, so the crossfade would fade out audio nobody heard. Such a player fades out
+    /// its buffer from the frame playing itself.
+    pub fn forget_rendered(&mut self) { (self.fresh, self.fade, self.old) = (true, 0, vec![]) }
 
     /// Forget what declicking took note of: nothing from before now is smoothed over.
     fn declick_reset(&mut self) { for t in &mut self.tracks { (t.dc, t.quiet) = (Declick::new(t.ch.out_pan()), false); t.ch.take_vj(); } }
@@ -1281,7 +1296,7 @@ impl Song {
         }
         let mut next = 511;
         let tracks = seqs.into_iter().map(|s| Track::new(statics(&inline(&s, &mut sh.tables, &mut next), &sh), &sh)).collect();
-        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, declick: true, pos: 0, base: (0.0, 120.0, 0), pipes: vec![[0.0; 4]; PIPE_BLOCK] }
+        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, declick: true, fade: 0, old: vec![], fresh: true, pos: 0, base: (0.0, 120.0, 0), pipes: vec![[0.0; 4]; PIPE_BLOCK] }
     }
 
     /// Per track, the byte offset in the source MML of the note it is playing now (-1: none, resting or ended),
@@ -1333,8 +1348,25 @@ impl Song {
     /// (reverb, delay..) settle. The result is close to, though not exactly, what continuous playback would
     /// give there: echoes of what played before that last moment are missing, and the phases of oscillators
     /// with vibrato drift. Returns false once the song has finished, as `render` does.
+    /// With declicking on (see `set_declick`), the jump is crossfaded over, as the output would otherwise cut
+    /// off mid-wave and start again mid-wave, with pops: the first `SKIP_FADE` frames (about 6 ms) skipped are
+    /// rendered, and fade out as the audio after the skip fades in. With nothing rendered before (a new song, or
+    /// after `forget_rendered`), the audio after the skip just fades in from silence.
     /// To seek backwards, make a new `Song` and skip forward from the start.
     pub fn skip(&mut self, frames: u64) -> bool {
+        if !self.declick || frames == 0 { return self.leap(frames) }
+        let fresh = self.fresh;
+        let n = if fresh { 0 } else { frames.min(SKIP_FADE as u64) as usize };
+        // (Rendered, it carries on any crossfade still going.)
+        let mut old = vec![0f32; 2 * n];
+        if n > 0 { self.render(&mut old); }
+        let playing = self.leap(frames - n as u64);
+        (self.fade, self.old, self.fresh) = (if fresh { SKIP_FADE } else { n as u32 }, old, fresh);
+        playing
+    }
+
+    /// `skip`, without the crossfade.
+    fn leap(&mut self, frames: u64) -> bool {
         let end = self.pos + frames;
         let at = |s: f32| end.saturating_sub((s * RATE) as u64);
         // Effects need longer to build up (delay lines fill, reverb rings in) than anything else does.
@@ -1409,6 +1441,22 @@ impl Song {
         self.now = self.base.0 + self.base.2 as f64 * self.bpm * 8.0 / RATE as f64;
     }
 
+    /// Crossfade the start of `out` from the audio before a `skip` (see `Song::fade`).
+    #[cold]
+    #[inline(never)]
+    fn crossfade(&mut self, out: &mut [f32]) {
+        let len = if self.old.is_empty() { SKIP_FADE } else { (self.old.len() / 2) as u32 };
+        for o in out.chunks_exact_mut(2) {
+            if self.fade == 0 { break }
+            let i = 2 * (len - self.fade) as usize;
+            self.fade -= 1;
+            let g = 1.0 - self.fade as f32 / len as f32;
+            let (l, r) = self.old.get(i..i + 2).map_or((0.0, 0.0), |o| (o[0], o[1]));
+            o[0] = o[0] * g + l * (1.0 - g); o[1] = o[1] * g + r * (1.0 - g);
+        }
+        if self.fade == 0 { self.old = vec![] }
+    }
+
     /// Fill `out` with interleaved stereo samples; returns false once the song has finished.
     /// Songs with a `$` loop point never finish.
     #[cfg_attr(feature = "small", optimize(speed))]
@@ -1461,6 +1509,8 @@ impl Song {
         // Finished once every track has ended and the output has been quiet for a while.
         let quiet = master.buf.iter().all(|f| f[0].abs() + f[1].abs() < 1e-4);
         self.tail = if self.tracks.iter().all(Track::done) && quiet { self.tail + n } else { 0 };
+        if self.fade > 0 { self.crossfade(out) }
+        self.fresh = false;
         self.tail < RATE as usize / 2
     }
 }

@@ -3,14 +3,14 @@
 // Out (node.port): {pos: frame, notes} now and then (notes: of the chunk playing, if render.js sends them), {ended}
 // once a song has played out.
 //
-// Starting over (a seek, another song, stop) would jump straight from one waveform to another and pop, so the old
-// audio fades out over FADE frames from where it was cut, and the new audio fades in from silence.
+// Starting over (a seek, another song, stop) would cut the old audio off mid-wave and pop, so it fades out over FADE
+// frames from where it was cut. (The new audio needs no fade: a song starts from silence, and after a skip the library
+// fades it in itself.)
 
 const FADE = 256; // frames (~6 ms at 44.1 kHz)
 
 class SionProcessor extends AudioWorkletProcessor {
   gen = -1; volume = 1; queue = []; at = 0; end = false; tick = 0; pos = -1; notes;
-  gain = 1;                                   // fade-in of the queue playing, 0 → 1
   old = []; oldAt = 0; oldVol = 1; oldGain = 0; // what was cut off, fading out
 
   constructor() {
@@ -28,13 +28,13 @@ class SionProcessor extends AudioWorkletProcessor {
   reset(m) {
     // Something audible was cut off: fade it out from where it stands. (If the new queue hadn't started yet, the
     // previous fade-out, if any, carries on.)
-    if (this.queue.length && this.gain > 0) {
+    if (this.queue.length && this.pos >= 0) {
       this.dropOld();
-      this.old = this.queue; this.oldAt = this.at; this.oldVol = this.volume; this.oldGain = this.gain;
+      this.old = this.queue; this.oldAt = this.at; this.oldVol = this.volume; this.oldGain = 1;
     } else {
       for (const c of this.queue) this.recycle(c);
     }
-    this.queue = []; this.at = 0; this.end = false; this.gain = 0;
+    this.queue = []; this.at = 0; this.end = false;
     this.gen = m.gen; this.volume = m.volume; this.pos = -1; this.notes = undefined;
   }
 
@@ -48,12 +48,7 @@ class SionProcessor extends AudioWorkletProcessor {
     while (i < n && this.queue.length) {
       const c = this.queue[0], b = c.buf, frames = b.length >> 1;
       const take = Math.min(n - i, frames - this.at);
-      let g = this.gain;
-      for (let k = 0, j = this.at * 2; k < take; k++, j += 2) {
-        if (g < 1) g = Math.min(1, g + step);
-        l[i + k] = b[j] * v * g; r[i + k] = b[j + 1] * v * g;
-      }
-      this.gain = g;
+      for (let k = 0, j = this.at * 2; k < take; k++, j += 2) { l[i + k] = b[j] * v; r[i + k] = b[j + 1] * v; }
       i += take;
       this.at += take;
       this.pos = c.pos + this.at;

@@ -6,8 +6,10 @@
 //   while (song.render(buf)) { /* play buf */ }          // returns false once finished
 //   song.free();
 //
-//   Seeking: song.skip(frames) jumps ahead (song.position tells where it is); sion.length(mml) gives a song's
-//   length in frames. To go back, make a new song and skip from the start.
+//   Seeking: song.skip(frames) jumps ahead (song.position tells where it is), crossfading over the jump;
+//   sion.length(mml) gives a song's length in frames. To go back, make a new song and skip from the start.
+//   Rendering ahead into a queue, and dropping it on a seek? Then fade the queue out yourself from the frame
+//   playing, and call song.forgetRendered() before skipping.
 //
 //   Following along: song.notes() gives, per track, the byte offset in the MML of the note it is playing.
 
@@ -68,6 +70,10 @@ export class Song {
   /** Move `frames` ahead without output, for seeking: fast, and close to (not exactly) what playing up to
    *  there would give. Returns false once the song has finished. */
   skip(frames) { return this.#s.x.sion_song_skip(this.#h, frames) !== 0; }
+
+  /** Forget the audio rendered so far, so the next skip fades in from silence instead of crossfading from it:
+   *  for players that render ahead and drop what they buffered on a seek (they fade that out themselves). */
+  forgetRendered() { this.#s.x.sion_song_forget_rendered(this.#h); }
 
   /** Per track, the byte offset in the MML text (as UTF-8) of the note it is playing now, -1 for none. */
   notes() {

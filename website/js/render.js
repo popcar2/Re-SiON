@@ -70,6 +70,8 @@ onmessage = ({ data }) => {
       gen++;
       ahead = 0;
       port.postMessage({ gen, volume });
+      // (What was rendered ahead is dropped, and the worklet fades it out from the frame playing.)
+      song.forgetRendered();
       if (!song.skip(target - song.position)) finish();
       fill();
     } else {
