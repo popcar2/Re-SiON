@@ -17,7 +17,9 @@ const EDGE = 0.1;    // over how much more intensity it fades in (a soft edge ra
 
 export function heatmap(ctx, node, footer, playing, on = true) {
   const analyser = ctx.createAnalyser();
-  analyser.fftSize = 2048;
+  // Fine enough that the bass gets bins of its own (about 6 Hz each): with coarser ones, a low note filled whole
+  // runs of columns that all read the same bin, and stood far taller than a high one as loud.
+  analyser.fftSize = 8192;
   analyser.smoothingTimeConstant = 0.7;
   analyser.minDecibels = -90;
   analyser.maxDecibels = -25;
@@ -86,25 +88,25 @@ export function heatmap(ctx, node, footer, playing, on = true) {
     if (live) {
       analyser.getByteFrequencyData(bins);
       for (let i = 0; i < cols; i++) {
-        // Half the band's loudest bin (so a lone chiptune tone still counts), half its average (so one bin
-        // flickering doesn't swing the whole band).
-        let top = 0, sum = 0;
+        // The band's loudest bin: high bands span many bins and low ones few, so an average would make the same
+        // note read quieter the higher it is.
+        let top = 0;
         const [lo, hi] = ranges[i];
-        for (let b = lo; b < hi; b++) { top = Math.max(top, bins[b]); sum += bins[b] }
-        let v = (top + sum / (hi - lo)) / 2;
-        // Music has less energy up high; tilt the highs up a little so the right side isn't always dark.
-        v = Math.min(1, v / 255 * (1 + 0.3 * i / cols));
+        for (let b = lo; b < hi; b++) top = Math.max(top, bins[b]);
+        const v = top / 255;
         // Ease toward it: up almost at once, so hits land on the beat; down quickly enough to follow the music,
         // but not so fast it flickers.
         heat[i] += (v - heat[i]) * (v > heat[i] ? 0.7 : 0.18);
       }
     } else for (let i = 0; i < cols; i++) heat[i] *= FADE;
 
-    // Neighbours blend (over two columns each side), so single bands don't spike.
+    // Each band spreads into a hill over two columns each side, so a lone band is a mound rather than a spike.
+    // (Spread, not averaged: averaging would flatten a lone high note, while a low one, whose sound spills over
+    // several narrow bands anyway, kept its height.)
     let any = false;
     for (let i = 0; i < cols; i++) {
       const at = (j) => heat[Math.min(cols - 1, Math.max(0, j))];
-      level[i] = (at(i - 2) + 4 * at(i - 1) + 6 * heat[i] + 4 * at(i + 1) + at(i + 2)) / 16;
+      level[i] = Math.max(heat[i], 0.85 * Math.max(at(i - 1), at(i + 1)), 0.55 * Math.max(at(i - 2), at(i + 2)));
       if (level[i] > 0.01) any = true;
     }
 

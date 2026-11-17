@@ -49,5 +49,39 @@ fn main() {
         // Only when it changes: songs.json sits in songs/, which reruns this script whenever anything in it is touched.
         let (path, text) = (web.join("songs/songs.json"), format!("[\n{}\n]\n", rows.join(",\n")));
         if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) { fs::write(path, text).unwrap(); }
+        song_list(&web.join("songs.html"), Some(&list(&web.join("songs"))), lookup);
+        song_list(&web.join("index.html"), None, lookup); // the home page's examples
     }
+}
+
+/// Writes the song list into songs.html, between its `<!-- songs -->` and `<!-- /songs -->` markers, so the list
+/// is in the page as it loads: one row per song, linking to its file, with its volume. With no `names`, it keeps the
+/// songs the page already lists there (by their links, in their order), so a hand-picked list just gets fresh rows.
+fn song_list(page: &Path, names: Option<&[String]>, volume: impl Fn(&str) -> f32) {
+    let Ok(html) = fs::read_to_string(page) else { return };
+    let (open, close) = ("<!-- songs -->", "<!-- /songs -->");
+    let (Some(start), Some(end)) = (html.find(open), html.find(close)) else { return };
+    let listed: Vec<String>;
+    let names = match names {
+        Some(names) => names,
+        None => {
+            // The reverse of `url` below.
+            let unescape = |s: &str| s.replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
+                .replace("%3F", "?").replace("%23", "#").replace("%20", " ").replace("%25", "%");
+            listed = html[start..end].split("href=\"songs/").skip(1).filter_map(|r| r.split_once('"')).map(|(h, _)| unescape(h)).collect();
+            &listed
+        }
+    };
+    let text = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;");
+    // Only what would break the URL is escaped (the file names stay readable in the page).
+    let url = |s: &str| text(&s.replace('%', "%25").replace(' ', "%20").replace('#', "%23").replace('?', "%3F"));
+    let rows: String = names.iter().enumerate().map(|(i, n)| {
+        let name = n.trim_end_matches(".sionmml").trim_end_matches(".mml");
+        let (artist, title) = name.split_once(" - ").unwrap_or(("", name));
+        format!("  <li><a href=\"songs/{}\" data-volume=\"{:.3}\"><span class=\"n\">{}</span><div class=\"t\"><span>{}</span><span class=\"a\">{}</span></div></a></li>\n",
+                url(n), volume(n), i + 1, text(title), text(artist))
+    }).collect();
+    let new = format!("{}{open}\n{rows}  {}", &html[..start], &html[end..]);
+    // Only when it changes (as with songs.json).
+    if new != html { fs::write(page, new).unwrap(); }
 }

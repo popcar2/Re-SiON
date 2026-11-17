@@ -27,11 +27,14 @@ header nav a[aria-current] { color: var(--fg); background: var(--hover); font-we
 
 /* Song lists (songs.html, and the examples on the home page). */
 ol.songs { list-style: none; margin: 0; padding: 0; }
-ol.songs li {
-  display: grid; grid-template-columns: 22px 1fr; gap: 8px; align-items: baseline;
-  padding: 8px 10px; border-radius: 8px; cursor: pointer; user-select: none;
-}
+ol.songs li { border-radius: 8px; cursor: pointer; user-select: none; }
 ol.songs li:hover { background: var(--hover); }
+/* Each row is a link to its song file; the link fills the whole row (padding included), so every pixel of it is clickable. */
+ol.songs li > a {
+  display: grid; grid-template-columns: 22px 1fr; gap: 8px; align-items: baseline;
+  padding: 8px 10px; border-radius: inherit; color: inherit; text-decoration: none;
+}
+ol.songs li > a:focus-visible { outline: 2px solid var(--accent); }
 ol.songs li .n { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 ol.songs li .t { display: flex; gap: 8px; align-items: baseline; min-width: 0; white-space: nowrap; }
 ol.songs li .t span { overflow: hidden; text-overflow: ellipsis; }
@@ -59,7 +62,12 @@ footer div.row { display: flex; align-items: center; gap: 12px; }
 footer div.seek { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 footer .now { flex: 1; min-width: 0; }
 footer .now .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 550; }
-footer .now .a { color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+footer .now .a {
+  color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  /* A 1px outline in the page background, so the label stays readable over the visualizer. */
+  text-shadow: -1px -1px 0 var(--bg), 0 -1px 0 var(--bg), 1px -1px 0 var(--bg), -1px 0 0 var(--bg),
+    1px 0 0 var(--bg), -1px 1px 0 var(--bg), 0 1px 0 var(--bg), 1px 1px 0 var(--bg);
+}
 /* As wide as the buttons under them, and centred, so the length sits right above the download button. */
 footer time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; min-width: var(--btn); text-align: center; }
 
@@ -86,6 +94,8 @@ footer button {
   width: var(--btn); height: var(--btn); flex: none; display: grid; place-items: center; padding: 0; cursor: pointer;
   color: var(--fg); background: transparent; border: 1px solid var(--line); border-radius: 50%;
 }
+/* Above the visualizer (which would otherwise paint over them), on a mostly opaque fill of the page background. */
+footer button:where(#prev, #next) { position: relative; z-index: 1; background: color-mix(in srgb, var(--bg) 80%, transparent); }
 footer button:hover:not(:disabled) { background: var(--hover); }
 footer button:disabled { opacity: 0.35; cursor: default; }
 footer button.main { background: var(--fg); color: var(--bg); border-color: var(--fg); width: 40px; height: 40px; }

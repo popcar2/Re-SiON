@@ -1,12 +1,29 @@
 <!doctype html>
 <!-- The home page of the SiON player for the browser. Serve this folder with `python3 serve.py`
-     (pages are linked without .html), then open it. Uses the same files as songs.html (style.css, js/, wasm/sion.wasm, songs/ with songs.json). -->
+     (pages are linked without .html), then open it. Uses the same files as songs.html (style.css, js/, wasm/sion.wasm, songs/). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SiON</title>
+<title>Re-SiON</title>
+<script>
+// Clicking a song plays it here instead of opening its file. This is caught from the first moment, before the list
+// below has even finished arriving: on a slow connection the player (the script at the end) can take seconds, and
+// a song picked before then waits in `picked` and is shown as picked.
+var picked = null, pick = (a) => {
+  picked = a;
+  document.body.classList.add("picked");
+  for (const b of document.querySelectorAll("#list a")) b.parentNode.classList.toggle("on", b === a);
+};
+addEventListener("click", (e) => {
+  const a = e.target.closest?.("#list a");
+  if (!a || e.button || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return; // opening it in a new tab: let the link be
+  e.preventDefault();
+  pick(a);
+});
+</script>
 <link rel="stylesheet" href="style.css">
+<link rel="modulepreload" href="js/player.js">
 <style>
   article p { margin: 0 0 14px; line-height: 1.6; }
   article h2 { font-size: 15px; font-weight: 650; margin: 32px 0 10px; }
@@ -17,11 +34,11 @@
 <body>
 <main>
   <header>
-    <h1><a href="./" aria-current="page">SiON</a></h1>
+    <h1><a href="./" aria-current="page">Re-SiON</a></h1>
     <nav><a href="songs">Songs</a><a href="playground">Playground</a><a href="convert">Convert</a><a href="docs">Docs</a></nav>
   </header>
   <article>
-    <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. SiON is a small player for MML music: give it
+    <p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Re-SiON is a small player for MML music: give it
        text, and it plays it back as audio, right here in your browser.</p>
     <p>Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud
        exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p>
@@ -29,40 +46,27 @@
        Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p>
     <h2>Examples</h2>
   </article>
-  <ol class="songs" id="list"></ol>
+  <!-- The examples: songs from songs/, with their volumes (rows written by sion-desktop-player/build.rs, which keeps
+       the songs linked between the markers, in order, so change the list by editing the links). -->
+  <ol class="songs" id="list">
+  <!-- songs -->
+  <li><a href="songs/rect%20-%20BOSCONIAN%20X68k%20_%20Flash%20Flash%20Flash.mml" data-volume="0.283"><span class="n">1</span><div class="t"><span>BOSCONIAN X68k _ Flash Flash Flash</span><span class="a">rect</span></div></a></li>
+  <li><a href="songs/Sonic%20the%20Hedgehog%203%20(prototype)%20-%20Carnival%20Night%20Zone%20Act%201.mml" data-volume="1.969"><span class="n">2</span><div class="t"><span>Carnival Night Zone Act 1</span><span class="a">Sonic the Hedgehog 3 (prototype)</span></div></a></li>
+  <li><a href="songs/Hautbois%20-%20[SFC]『クロノ・トリガー』よりChrono%20Trigger.mml" data-volume="1.130"><span class="n">3</span><div class="t"><span>[SFC]『クロノ・トリガー』よりChrono Trigger</span><span class="a">Hautbois</span></div></a></li>
+  <li><a href="songs/keim_at_Si%20-%20Twin%20Memories%20_%20Pop'nツインビー%20(Stage1).mml" data-volume="0.714"><span class="n">4</span><div class="t"><span>Twin Memories _ Pop'nツインビー (Stage1)</span><span class="a">keim_at_Si</span></div></a></li>
+  <li><a href="songs/LinearDrive%20-%20[AC]%20OUTRUN%20-%20LAST%20WAVE%20-%20(C)SEGA%201986.mml" data-volume="1.343"><span class="n">5</span><div class="t"><span>[AC] OUTRUN - LAST WAVE - (C)SEGA 1986</span><span class="a">LinearDrive</span></div></a></li>
+  <!-- /songs -->
+  </ol>
 </main>
 
 <script type="module">
 import { createPlayer } from "./js/player.js";
 
-// The examples, by file name in songs/. Their volumes come from songs/songs.json, as on the song list.
-const EXAMPLES = [
-  "rect - BOSCONIAN X68k _ Flash Flash Flash.mml",
-  "Sonic the Hedgehog 3 (prototype) - Carnival Night Zone Act 1.mml",
-  "Hautbois - [SFC]『クロノ・トリガー』よりChrono Trigger.mml",
-  "keim_at_Si - Twin Memories _ Pop'nツインビー (Stage1).mml",
-  "LinearDrive - [AC] OUTRUN - LAST WAVE - (C)SEGA 1986.mml",
-];
-const songs = EXAMPLES.map((file, i) => {
-  const name = file.replace(/\.(sion)?mml$/i, ""), volume = 1;
-  const cut = name.indexOf(" - ");
-  return cut < 0 ? { i, file, volume, title: name, artist: "" }
-                 : { i, file, volume, artist: name.slice(0, cut), title: name.slice(cut + 3) };
-});
-// The volumes arrive in the background, so the list shows straight away; play() waits for them.
-const volumes = fetch("songs/songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
-  for (const { file, volume = 1 } of list) for (const s of songs) if (s.file === file) s.volume = volume;
-}).catch(() => {});
-
-// ---- Song list ----
-const rows = songs.map((s) => {
-  const li = document.createElement("li");
-  li.innerHTML = `<span class="n">${s.i + 1}</span><div class="t"><span></span><span class="a"></span></div>`;
-  li.querySelector(".t span").textContent = s.title;
-  li.querySelector(".a").textContent = s.artist;
-  li.onclick = () => play(s.i);
-  document.getElementById("list").append(li);
-  return li;
+// The list is already in the page (each row links to its song file); the script at the top catches clicks on it.
+const rows = [...document.querySelectorAll("#list li")];
+const songs = rows.map((li, i) => {
+  const a = li.querySelector("a");
+  return { i, url: a.href, file: decodeURIComponent(a.getAttribute("href").split("/").pop()), volume: +(a.dataset.volume ?? 1), title: li.querySelector(".t span").textContent, artist: li.querySelector(".a").textContent };
 });
 
 // ---- Player ----
@@ -80,11 +84,16 @@ const player = createPlayer({
 
 function current() { return player.song?.i ?? -1 }
 
+// From now on picks play straight away, starting with the one made while the player loaded, if any.
+const index = (a) => rows.indexOf(a.closest("li"));
+window.pick = (a) => play(index(a));
+if (picked) play(index(picked));
+
+// (no-cache: revalidate with the server, so a reconverted song plays without a hard refresh.)
 function play(i) {
   const s = songs[i];
   document.body.classList.add("picked");
-  const mml = fetch("songs/" + encodeURIComponent(s.file), { cache: "no-cache" }).then((r) => r.text());
-  player.play(Promise.all([mml, volumes]).then(([text]) => text), s); // (the player reads s.volume once this resolves)
+  player.play(fetch(s.url, { cache: "no-cache" }).then((r) => r.text()), s);
   rows[i].scrollIntoView({ block: "nearest" });
 }
 </script>
