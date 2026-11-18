@@ -7,13 +7,19 @@
 //   heat.enable(on);                                   // show or hide it (hidden, it doesn't draw at all)
 
 const LOW = 40, HIGH = 10000; // Hz, the range shown, spaced logarithmically
-const SUB = 4;                // pixels computed per column: the levels are curved between columns, then scaled up
+const PX = 2;                 // device pixels per pixel computed across: the levels are curved between columns,
+                              // and drawn at (nearly) the screen's resolution so the shapes stay sharp
 const FADE = 0.9;             // per frame, how fast the heat dies away once paused or stopped
 
 // Only the intense parts show: they fade in from nothing at INTENSE in the page's ice-blue accent, and turn white
 // toward the most intense.
-const INTENSE = 0.4; // how intense a point must be to show at all
-const EDGE = 0.1;    // over how much more intensity it fades in (a soft edge rather than a hard cutoff)
+const INTENSE = 0.4;  // how intense a point must be to show at all
+const EDGE = 2;     // over how many device pixels it fades in: just enough to smooth the edge, without blurring it
+const WHITE = 0.5;    // how intense a point must be to start turning white
+const LEVELS = 1024;  // colours from quiet to loud (fine enough that the thin fade-in has steps of its own)
+
+// x ** 1.2 for x from 0 to 1 in 1024 steps (looked up rather than worked out for every pixel).
+const POW = Float32Array.from({ length: 1025 }, (_, j) => (j / 1024) ** 1.2);
 
 export function heatmap(ctx, node, footer, playing, on = true) {
   const analyser = ctx.createAnalyser();
@@ -32,15 +38,16 @@ export function heatmap(ctx, node, footer, playing, on = true) {
   canvas.hidden = !on;
   footer.prepend(canvas); // (inside the bar, under its controls: see style.css)
   const g = canvas.getContext("2d");
-  // Drawn at the canvas's full height but only SUB pixels per column, then stretched across: a glow that is
-  // smooth up the page, without working out every pixel of the width.
+  // Drawn at the canvas's full height and every PX pixels across, then stretched by that little: sharp, while
+  // working out only half the pixels on a high-density screen.
   const cells = document.createElement("canvas").getContext("2d");
 
-  let cols = 0, ranges = [], heat = new Float32Array(0), level = new Float32Array(0), image, color, frame = 0;
+  let cols = 0, ranges = [], heat = new Float32Array(0), level = new Float32Array(0), image, color, frame = 0, iw = 0;
+  let color32; // the same colours, a whole pixel each
 
   // Columns: about one per 18 px of width, each covering a slice of the frequency range. (Fewer, wider bands
   // are steadier than many narrow ones.)
-  function layout(rows) {
+  function layout(width, rows) {
     const n = Math.max(20, Math.min(90, Math.round(innerWidth / 18)));
     if (n !== cols) {
       cols = n;
@@ -53,27 +60,34 @@ export function heatmap(ctx, node, footer, playing, on = true) {
         return [lo, Math.max(lo + 1, Math.ceil(b / hz))];
       });
     }
-    if (!image || image.width !== n * SUB || image.height !== rows) {
-      cells.canvas.width = n * SUB;
+    iw = Math.max(n, Math.ceil(width / PX));
+    if (!image || image.width !== iw || image.height !== rows) {
+      cells.canvas.width = iw;
       cells.canvas.height = rows;
-      image = cells.createImageData(n * SUB, rows);
+      image = cells.createImageData(iw, rows);
     }
   }
 
-  // 256 colours from quiet to loud: clear below INTENSE, then fading in and turning from accent to white.
-  function palette() {
+  // LEVELS colours from quiet to loud: clear below INTENSE, then fading in over about EDGE pixels at the canvas's
+  // height, and from WHITE turning (gently at first) from accent to white. (Whitening from INTENSE left the bluest
+  // part a thin stripe at the top.)
+  let paletteRows = 0;
+  function palette(rows = paletteRows) {
+    paletteRows = rows;
+    // (Near the edge, intensity falls by about 1.1 per canvas height; see draw().)
+    const edge = Math.max(1e-3, EDGE * 1.1 / Math.max(1, rows));
     const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim();
     const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(accent);
     const accent3 = m ? [1, 2, 3].map((k) => parseInt(m[k], 16)) : [42, 143, 196];
-    color = new Uint8ClampedArray(256 * 4);
-    for (let i = 0; i < 256; i++) {
-      const t = i / 255, u = Math.max(0, (t - INTENSE) / (1 - INTENSE)), e = Math.min(1, Math.max(0, (t - INTENSE) / EDGE));
+    color = new Uint8ClampedArray(LEVELS * 4);
+    for (let i = 0; i < LEVELS; i++) {
+      const t = i / (LEVELS - 1), u = Math.max(0, (t - WHITE) / (1 - WHITE)) ** 1.5, e = Math.min(1, Math.max(0, (t - INTENSE) / edge));
       for (let c = 0; c < 3; c++) color[i * 4 + c] = accent3[c] + (255 - accent3[c]) * u;
       color[i * 4 + 3] = 255 * e * e * (3 - 2 * e) * 0.75;
     }
+    color32 = new Uint32Array(color.buffer);
   }
-  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", palette);
-  palette();
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => palette());
 
   function draw() {
     const w = canvas.clientWidth, h = canvas.clientHeight, dpr = devicePixelRatio || 1;
@@ -81,8 +95,9 @@ export function heatmap(ctx, node, footer, playing, on = true) {
       canvas.width = Math.round(w * dpr);
       canvas.height = Math.round(h * dpr);
     }
-    const rows = Math.max(1, Math.min(160, canvas.height));
-    layout(rows);
+    const rows = Math.max(1, Math.min(320, canvas.height));
+    layout(canvas.width, rows);
+    if (rows !== paletteRows) palette(rows);
 
     const live = playing();
     if (live) {
@@ -112,15 +127,20 @@ export function heatmap(ctx, node, footer, playing, on = true) {
 
     // Each point is hottest at the bar and cools to nothing at its level. Levels between column centres follow a
     // curve through them (Catmull-Rom), so the shapes roll rather than step.
-    const px = image.data, iw = cols * SUB;
+    // (Only the pixels that show are worked out, from the bar up until it fades out; the rest are cleared at once.)
+    const px = new Uint32Array(image.data.buffer), clear = Math.ceil(INTENSE * (LEVELS - 1));
+    px.fill(0);
     for (let x = 0; x < iw; x++) {
-      const p = (x + 0.5) / SUB - 0.5, i = Math.floor(p), t = p - i;
+      const p = (x + 0.5) / iw * cols - 0.5, i = Math.floor(p), t = p - i;
       const a = level[Math.max(0, i - 1)], b = level[Math.max(0, i)], c = level[Math.min(cols - 1, i + 1)], d = level[Math.min(cols - 1, i + 2)];
       const v = Math.min(1, Math.max(0, b + 0.5 * t * (c - a + t * (2 * a - 5 * b + 4 * c - d + t * (3 * (b - c) + d - a)))));
+      if (v * (LEVELS - 1) < clear) continue;
+      // Its intensity at height up: v * (1 - up / v) ** 1.2, which is v ** -0.2 * (v - up) ** 1.2.
+      const scale = (LEVELS - 1) * v ** -0.2;
       for (let y = 0; y < rows; y++) {
-        const up = (y + 0.5) / rows, f = v > up ? 1 - up / v : 0;
-        const k = Math.round(255 * v * f ** 1.2) * 4, o = ((rows - 1 - y) * iw + x) * 4;
-        px[o] = color[k]; px[o + 1] = color[k + 1]; px[o + 2] = color[k + 2]; px[o + 3] = color[k + 3];
+        const k = Math.round(scale * POW[Math.round((v - (y + 0.5) / rows) * 1024)] || 0);
+        if (k < clear) break;
+        px[(rows - 1 - y) * iw + x] = color32[k];
       }
     }
     cells.putImageData(image, 0, 0);

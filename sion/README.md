@@ -61,7 +61,7 @@ song.free(); // songs live in wasm memory: free them when done
 
 ### C / C++
 
-Link against `libsion.so` (Linux) or `sion.dll` (Windows) and include `sion.h`.
+Link against `libsion.so` (Linux) or `libsion.dll` (Windows) and include `sion.h`.
 
 ```c
 #include <string.h>
@@ -207,7 +207,7 @@ outputs small.
 | `cargo build --release` | The Rust library. |
 | `cargo test` | Runs the tests in `tests/`. |
 | `./build-wasm.sh` | `target/wasm32-unknown-unknown/wasm/sion.wasm`. Runs `wasm-opt` too if Binaryen is installed. |
-| `./build-ffi.sh [TARGET]` | `target/TARGET/ffi/libsion.so`, or `sion.dll` + `libsion.dll.a` for a Windows target. |
+| `./build-ffi.sh [TARGET]` | `target/TARGET/ffi/libsion.so`, or `libsion.dll` + `libsion.dll.a` for a Windows target. |
 
 Cargo features:
 

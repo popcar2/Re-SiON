@@ -1,35 +1,42 @@
-// Worker: owns the sion.wasm instance and renders the current song ahead of playback, so a CPU hiccup eats into
-// the buffer instead of the audio deadline. Chunks go straight to the worklet over a MessagePort.
+// Worker: owns the sion.wasm instance. Renders the current song ahead of playback, straight to the worklet over a
+// MessagePort, and measures its length.
 //
-// From the page: {port} once (the channel to the worklet), {mml, volume, notes} to play (mml null stops; notes:
-//   send which notes are playing, see below), {seek: frame}.
+// From the page: {port} once (the channel to the worklet), {mml, id, volume, notes} to play (mml null stops; notes:
+//   send which notes are playing), {seek: frame}.
+// To the page: {id, frames} (song length), then {id, loop} (loop start frame, -1 = none).
 // To the worklet: {gen, volume} = drop everything queued and start over; {gen, buf, pos, notes} = a chunk of interleaved
-//   stereo starting at frame pos (notes: byte offsets in the MML of the notes playing at its end, if asked for); {gen, end} = no more chunks for this song.
+//   stereo starting at frame pos (notes: byte offsets in the MML of the notes playing at its end); {gen, end} = no more chunks.
 // From the worklet: {gen, buf} = that chunk has been played (the buffer comes back to be reused).
 import { Sion } from "./sion.js";
 
-const CHUNK = 1024;   // frames per chunk (8 render quanta)
-const AHEAD = 16384;  // frames kept rendered ahead of playback (~370 ms at 44.1 kHz)
-
+const CHUNK = 1024, AHEAD = 16384; // frames per chunk, frames kept rendered ahead (~370 ms)
 const sion = Sion.load(fetch("../wasm/sion.wasm"));
-let port, song = null, mml = null, volume = 1, notes = false, gen = 0, ahead = 0, done = true;
 const spare = [];
+let port, song, mml, volume = 1, notes = false, gen = 0, ahead = 0, done = true;
 
-function start(text, seekTo = 0) {
-  song?.free();
-  mml = text;
-  song = null;
+function reset() {
   gen++;
   ahead = 0;
+  port?.postMessage({ gen, volume });
+}
+
+function start(text, seekTo, id) {
+  song?.free();
+  song = null;
+  mml = text;
   done = text == null;
-  port?.postMessage({ gen, volume }); // (no port yet: stopped before audio was ever started)
+  reset();
   if (done) return;
   const g = gen;
   sion.then((s) => {
-    if (g !== gen) return; // superseded while the wasm was still loading
+    if (g !== gen) return;
     song = s.song(text);
-    if (seekTo > 0 && !song.skip(seekTo)) finish();
+    if (seekTo && !song.skip(seekTo)) finish();
     fill();
+    // Measured after the first fill, so audio starts first. The loop pass waits a turn to let the buffer top up.
+    if (id == null) return;
+    postMessage({ id, frames: s.length(text) });
+    setTimeout(() => postMessage({ id, loop: s.loopStart(text) }));
   });
 }
 
@@ -40,12 +47,10 @@ function finish() {
 
 function fill() {
   while (song && !done && ahead < AHEAD) {
-    const buf = spare.pop() ?? new Float32Array(CHUNK * 2);
-    const pos = song.position;
-    const playing = song.render(buf);
+    const buf = spare.pop() ?? new Float32Array(CHUNK * 2), pos = song.position, more = song.render(buf);
     port.postMessage({ gen, buf, pos, notes: notes ? song.notes().filter((o) => o >= 0) : undefined }, [buf.buffer]);
     ahead += CHUNK;
-    if (!playing) finish();
+    if (!more) finish();
   }
 }
 
@@ -54,28 +59,19 @@ onmessage = ({ data }) => {
     port = data.port;
     port.onmessage = ({ data: { gen: g, buf } }) => {
       if (spare.length < 64) spare.push(buf);
-      if (g !== gen) return;
-      ahead -= buf.length >> 1;
-      fill();
+      if (g === gen) { ahead -= CHUNK; fill(); }
     };
   } else if ("mml" in data) {
     volume = data.volume ?? 1;
     notes = !!data.notes;
-    start(data.mml);
-  } else if ("seek" in data && mml != null) {
-    // Songs only play forwards: seeking means starting over (cheap) and skipping ahead from there, or from the
-    // current render position when that is still behind the target.
+    start(data.mml, 0, data.id);
+  } else if (mml != null) {
+    // Songs only play forwards: skip on from the render position if it's still behind the target, else start over.
     const target = Math.max(0, Math.round(data.seek));
-    if (song && !done && target >= song.position) {
-      gen++;
-      ahead = 0;
-      port.postMessage({ gen, volume });
-      // (What was rendered ahead is dropped, and the worklet fades it out from the frame playing.)
-      song.forgetRendered();
-      if (!song.skip(target - song.position)) finish();
-      fill();
-    } else {
-      start(mml, target);
-    }
+    if (!song || done || target < song.position) return start(mml, target);
+    reset();
+    song.forgetRendered();
+    if (!song.skip(target - song.position)) finish();
+    fill();
   }
 };

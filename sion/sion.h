@@ -1,4 +1,4 @@
-/* SiON MML player: C interface to libsion.so / sion.dll. */
+/* SiON MML player: C interface to libsion.so / libsion.dll. */
 #ifndef SION_H
 #define SION_H
 
