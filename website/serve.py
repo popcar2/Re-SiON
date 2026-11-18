@@ -7,7 +7,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 class Handler(SimpleHTTPRequestHandler):
     def translate_path(self, path):
-        # The page wins over a folder of the same name (/songs is songs.html, not the songs/ folder).
+        # The page wins over a folder of the same name (/songs is songs.html, not a songs/ folder).
         local = super().translate_path(path)
         if not local.endswith(os.sep) and os.path.isfile(local + ".html"):
             return local + ".html"

@@ -1,6 +1,6 @@
 //! Measures every song in `songs/` and picks a volume that brings it to a common loudness, so no song is
 //! much louder or quieter than the rest. The volumes are built into the desktop player (`volumes.rs` in
-//! OUT_DIR) and written, with the song list, to the web player's `songs/songs.json`.
+//! OUT_DIR) and written, with the song list, to the web player's `songs_mml/songs.json`.
 
 use std::{fs, path::Path, thread};
 
@@ -26,7 +26,7 @@ fn volume(mml: &str) -> f32 {
 fn main() {
     let (songs, web) = (Path::new("songs"), Path::new("../website"));
     println!("cargo::rerun-if-changed=songs");
-    println!("cargo::rerun-if-changed={}", web.join("songs").display());
+    println!("cargo::rerun-if-changed={}", web.join("songs_mml").display());
     let list = |dir: &Path| {
         let mut names: Vec<String> = fs::read_dir(dir).into_iter().flatten().flatten()
             .filter_map(|e| e.file_name().into_string().ok()).filter(|n| n.ends_with(".mml") || n.ends_with(".sionmml")).collect();
@@ -43,13 +43,13 @@ fn main() {
     let rs: String = names.iter().zip(&volumes).map(|(n, v)| format!("    ({n:?}, {v:.3}),\n")).collect();
     fs::write(Path::new(&std::env::var("OUT_DIR").unwrap()).join("volumes.rs"), format!("&[\n{rs}]")).unwrap();
 
-    if web.join("songs").is_dir() {
+    if web.join("songs_mml").is_dir() {
         let json = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        let rows: Vec<String> = list(&web.join("songs")).iter().map(|n| format!("{{\"file\": \"{}\", \"volume\": {:.3}}}", json(n), lookup(n))).collect();
-        // Only when it changes: songs.json sits in songs/, which reruns this script whenever anything in it is touched.
-        let (path, text) = (web.join("songs/songs.json"), format!("[\n{}\n]\n", rows.join(",\n")));
+        let rows: Vec<String> = list(&web.join("songs_mml")).iter().map(|n| format!("{{\"file\": \"{}\", \"volume\": {:.3}}}", json(n), lookup(n))).collect();
+        // Only when it changes: songs.json sits in songs_mml/, which reruns this script whenever anything in it is touched.
+        let (path, text) = (web.join("songs_mml/songs.json"), format!("[\n{}\n]\n", rows.join(",\n")));
         if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) { fs::write(path, text).unwrap(); }
-        song_list(&web.join("songs.html"), Some(&list(&web.join("songs"))), lookup);
+        song_list(&web.join("songs.html"), Some(&list(&web.join("songs_mml"))), lookup);
         song_list(&web.join("index.html"), None, lookup); // the home page's examples
     }
 }
@@ -68,7 +68,7 @@ fn song_list(page: &Path, names: Option<&[String]>, volume: impl Fn(&str) -> f32
             // The reverse of `url` below.
             let unescape = |s: &str| s.replace("&quot;", "\"").replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
                 .replace("%3F", "?").replace("%23", "#").replace("%20", " ").replace("%25", "%");
-            listed = html[start..end].split("href=\"songs/").skip(1).filter_map(|r| r.split_once('"')).map(|(h, _)| unescape(h)).collect();
+            listed = html[start..end].split("href=\"songs_mml/").skip(1).filter_map(|r| r.split_once('"')).map(|(h, _)| unescape(h)).collect();
             &listed
         }
     };
@@ -78,7 +78,7 @@ fn song_list(page: &Path, names: Option<&[String]>, volume: impl Fn(&str) -> f32
     let rows: String = names.iter().enumerate().map(|(i, n)| {
         let name = n.trim_end_matches(".sionmml").trim_end_matches(".mml");
         let (artist, title) = name.split_once(" - ").unwrap_or(("", name));
-        format!("  <li><a href=\"songs/{}\" data-volume=\"{:.3}\"><span class=\"n\">{}</span><div class=\"t\"><span>{}</span><span class=\"a\">{}</span></div></a></li>\n",
+        format!("  <li><a href=\"songs_mml/{}\" data-volume=\"{:.3}\"><span class=\"n\">{}</span><div class=\"t\"><span>{}</span><span class=\"a\">{}</span></div></a></li>\n",
                 url(n), volume(n), i + 1, text(title), text(artist))
     }).collect();
     let new = format!("{}{open}\n{rows}  {}", &html[..start], &html[end..]);

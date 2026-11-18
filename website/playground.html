@@ -1,6 +1,6 @@
 <!doctype html>
 <!-- MML playground: write or paste MML and play it, with the notes being played highlighted in the text.
-     Uses the same files as songs.html (style.css, js/, wasm/sion.wasm, songs/). -->
+     Uses the same files as songs.html (style.css, js/, wasm/sion.wasm, songs_mml/). -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -104,7 +104,7 @@ import { createPlayer } from "./js/player.js";
 const $ = (id) => document.getElementById(id);
 const text = $("mml"), view = $("view");
 
-// Songs from songs/ to read along with, mostly short and simple.
+// Songs from songs_mml/ to read along with, mostly short and simple.
 const EXAMPLES = [
   "fukuicat - ZANAC(FDS) _ AREA1,3,6,9.mml",
   "keim_at_Si - Formant Singing _.mml",
@@ -117,7 +117,7 @@ const EXAMPLES = [
   return { file, title: name.slice(cut + 3), artist: name.slice(0, cut), volume: 1 };
 });
 // The song list's per-song volumes (see songs.html), so examples play as loud as they do there.
-fetch("songs/songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
+fetch("songs_mml/songs.json", { cache: "no-cache" }).then((r) => r.json()).then((list) => {
   for (const e of EXAMPLES) e.volume = list.find((s) => s.file === e.file)?.volume ?? 1;
 }).catch(() => {});
 
@@ -288,7 +288,7 @@ menu.addEventListener("keydown", (ev) => {
 
 async function pick(e) {
   open(false);
-  const mml = e.mml ?? await (await fetch("songs/" + encodeURIComponent(e.file), { cache: "no-cache" })).text();
+  const mml = e.mml ?? await (await fetch("songs_mml/" + encodeURIComponent(e.file), { cache: "no-cache" })).text();
   // Through insertText, so picking an example can be undone (Ctrl+Z) like any edit. Not on touch screens:
   // focusing the editor there pops up the on-screen keyboard, and its opening and closing again shifts the
   // page, which pushed the player bar out of view.
