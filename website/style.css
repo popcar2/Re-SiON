@@ -136,6 +136,20 @@ footer button:disabled { opacity: 0.35; cursor: default; }
 footer button.main { background: var(--fg); color: var(--bg); border-color: var(--fg); width: 40px; height: 40px; }
 footer button.main:hover:not(:disabled) { background: var(--fg); opacity: 0.85; }
 svg { width: 14px; height: 14px; fill: currentColor; }
+/* Volume: the mute button with a short slider beside it, whose thumb always shows (it's a setting, not a position). */
+footer div.vol { display: flex; align-items: center; gap: 6px; flex: none; position: relative; z-index: 1; }
+footer div.vol input[type=range] { flex: none; width: 72px; --f: 1; }
+footer div.vol button { border-color: transparent; }
+footer div.vol svg { width: 16px; height: 16px; }
+/* The thumb stays inside the track, so its centre travels from 5px in to 5px short of the end: the fill (--f, 0 to 1)
+   ends at its centre, and at full volume the thumb's edge meets the track's end. */
+footer div.vol input[type=range]::-webkit-slider-runnable-track {
+  background: linear-gradient(var(--accent) 0 0) 0 / calc(5px + (100% - 10px) * var(--f)) 100% no-repeat, var(--line);
+}
+footer div.vol input[type=range]::-webkit-slider-thumb { width: 10px; height: 10px; margin-top: -3px; transform: none; }
+footer div.vol input[type=range]::-moz-range-thumb { width: 10px; height: 10px; transform: none; }
+/* Phones have volume buttons of their own: keep only the mute button there, leaving room for the title. */
+@media (max-width: 440px) { footer div.vol input[type=range] { display: none; } }
 
 /* The spectrum heatmap (js/heatmap.js): inside the player bar, rising from the bottom of the window under its controls. */
 footer canvas.heatmap { position: absolute; left: 0; bottom: 0; width: 100%; height: min(64px, 12vh); pointer-events: none; }

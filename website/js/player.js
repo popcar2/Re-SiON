@@ -9,7 +9,7 @@
 // show(song) — after the bar updates (song: the meta passed to play, null when stopped); ended() — the song played out (default: stop);
 // notes(offsets) — follow playback: called with the UTF-8 byte offsets in the MML of the notes playing, as they
 // are heard ([] once nothing is); heatmap: true — show the song's spectrum rising from the bar (heatmap.js), with a
-// checkbox in the bar to turn it off (remembered per browser).
+// checkbox in the bar to turn it off (remembered per browser). The bar's volume slider and mute button are remembered too.
 
 import { heatmap } from "./heatmap.js";
 
@@ -19,6 +19,9 @@ const MAX_MML = 16 << 20;
 // ...or holds control characters no text file has: it's some other kind of file, which would play as noise.
 const BINARY = /[\0-\x08\x0e-\x19\x1c-\x1f]/;
 const PLAY = "M4 2.5v11L13.5 8z", PAUSE = "M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z";
+// The volume button's speaker, and what's drawn beside it: sound waves (one when quiet, two when loud), or a cross when muted.
+const SPEAKER = "M1.5 5.5h3L8 2.5v11l-3.5-3h-3z";
+const WAVES = ["M10.5 6a3 3 0 010 4", "M10.5 6a3 3 0 010 4M12.5 4a6 6 0 010 8"], MUTED = "M10.5 5.5l4 5M14.5 5.5l-4 5";
 
 const BAR = `<footer>
   <div class="bar">
@@ -33,6 +36,10 @@ const BAR = `<footer>
     <button id="play" class="main" title="Play / pause (space)"><svg viewBox="0 0 16 16"><path id="icon" d="${PLAY}"/></svg></button>
     <button id="next" title="Next" disabled hidden><svg viewBox="0 0 16 16"><path d="M11 3h2v10h-2zM2 3v10l8-5z"/></svg></button>
     <div class="now"><div class="t" id="title">Nothing playing</div><div class="a" id="artist"></div></div>
+    <div class="vol">
+      <button id="mute" title="Mute (M)"><svg viewBox="0 0 16 16"><path d="${SPEAKER}"/><path id="waves" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+      <input type="range" id="vol" min="0" max="1" step="0.01" value="1" aria-label="Volume">
+    </div>
     <button id="save" title="Download MML" disabled><svg viewBox="0 0 16 16"><path d="M7 2h2v6.5l2.3-2.3 1.4 1.4L8 12.3 3.3 7.6l1.4-1.4L7 8.5zM3 13h10v1.5H3z"/></svg></button>
   </div>
   </div>
@@ -47,16 +54,25 @@ export function createPlayer(hooks = {}) {
   const idleText = $("artist").textContent = hooks.idleText ?? "";
   // The visualizer checkbox: whether it's on is remembered (when storage is available), and applies from the start.
   $("viz").hidden = !hooks.heatmap;
+  // Clicked (not tabbed to): let go of focus, so space goes back to play / pause.
+  const letGo = (el) => { if (!el.matches(":focus-visible")) el.blur() };
   try { if (localStorage.getItem("sion-visualizer") === "off") $("vizon").checked = false } catch {}
   $("vizon").onchange = () => {
     const on = $("vizon").checked;
     try { localStorage.setItem("sion-visualizer", on ? "on" : "off") } catch {}
     heat?.enable(on);
-    // Clicked (not tabbed to): let go of focus, so space goes back to play / pause.
-    if (!$("vizon").matches(":focus-visible")) $("vizon").blur();
+    letGo($("vizon"));
   };
 
-  let ctx, node, heat, ready, song = null, id = 0; // song: what's loaded ({title, artist}); id: bumped per song
+  // Volume: the slider's position (0 to 1) and whether it's muted, remembered when storage is available.
+  let volume = 1, muted = false;
+  try {
+    const v = parseFloat(localStorage.getItem("sion-volume"));
+    if (v >= 0 && v <= 1) volume = v;
+    muted = localStorage.getItem("sion-muted") === "on";
+  } catch {}
+
+  let ctx, node, gain, heat, ready, song = null, id = 0; // song: what's loaded ({title, artist}); id: bumped per song
   let text = null; // the MML of the song loaded, once it has arrived (for the download button)
   let refused = null; // {title, why}: the song last given to play() that can't be played, shown until the next
   let early = false; // the song played out before its length arrived: ended() waits for it (0 or 1 frame = plays no notes)
@@ -86,7 +102,9 @@ export function createPlayer(hooks = {}) {
       ctx = new AudioContext({ sampleRate: RATE, latencyHint: "playback" });
       await ctx.audioWorklet.addModule(new URL("worklet.js", import.meta.url));
       node = new AudioWorkletNode(ctx, "sion", { numberOfInputs: 0, outputChannelCount: [2] });
-      node.connect(ctx.destination);
+      // The volume applies after the visualizer's tap on node, so the visualizer looks the same at any volume.
+      gain = new GainNode(ctx, { gain: level() });
+      node.connect(gain).connect(ctx.destination);
       if (hooks.heatmap) heat = heatmap(ctx, node, footer, playing, $("vizon").checked);
       const { port1, port2 } = new MessageChannel();
       node.port.postMessage({ port: port1 }, [port1]);
@@ -192,6 +210,36 @@ export function createPlayer(hooks = {}) {
     $("dur").textContent = dur ? clock(dur) : !song ? "0:00" : "–:––";
   }
 
+  // The slider is curved (squared), so its travel matches how loud it sounds rather than the signal's amplitude.
+  const level = () => muted ? 0 : volume * volume;
+  function showVolume() {
+    const shown = muted ? 0 : volume;
+    $("vol").value = shown;
+    $("vol").style.setProperty("--f", shown);
+    $("waves").setAttribute("d", shown === 0 ? MUTED : WAVES[shown < 0.5 ? 0 : 1]);
+    $("mute").title = muted ? "Unmute (M)" : "Mute (M)";
+    $("mute").setAttribute("aria-pressed", muted);
+    // A quick ramp, so a change (dragging especially) doesn't click.
+    gain?.gain.setTargetAtTime(level(), ctx.currentTime, 0.015);
+  }
+  // Remembered once a change is made (not on every step of a drag).
+  function saveVolume() {
+    try {
+      localStorage.setItem("sion-volume", volume);
+      localStorage.setItem("sion-muted", muted ? "on" : "off");
+    } catch {}
+  }
+  function setMuted(on) {
+    muted = on;
+    if (!muted && volume === 0) volume = 0.5; // unmuting with the slider at 0 would still be silent
+    showVolume();
+    saveVolume();
+  }
+  $("vol").oninput = () => { volume = +$("vol").value; muted = false; showVolume() };
+  $("vol").onchange = () => { saveVolume(); letGo($("vol")) };
+  $("mute").onclick = () => { setMuted(!muted); letGo($("mute")) };
+  showVolume();
+
   $("seek").oninput = () => { dragging = true; $("pos").textContent = clock(+$("seek").value); showTime() };
   $("seek").onchange = () => { dragging = false; seek(+$("seek").value) };
 
@@ -207,10 +255,11 @@ export function createPlayer(hooks = {}) {
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   };
   addEventListener("keydown", (e) => {
-    if (e.target === $("seek") && e.key.startsWith("Arrow")) return; // the slider handles its own arrows
+    if (e.target.matches?.("input[type=range]") && e.key.startsWith("Arrow")) return; // the sliders handle their own arrows
     if (e.target.closest?.("textarea, input:not([type=range]), select, [contenteditable]")) return; // typing
     if (e.key === " ") { e.preventDefault(); toggle(); }
     else if (e.key === "Escape") stop();
+    else if (e.key.toLowerCase() === "m" && !e.ctrlKey && !e.metaKey && !e.altKey) setMuted(!muted);
     else if (e.key === "ArrowLeft") seek(shown() - 5 * RATE);
     else if (e.key === "ArrowRight") seek(shown() + 5 * RATE);
   });
