@@ -89,7 +89,7 @@ pub fn convert(data: &[u8], opt: &Options) -> Result<Converted, String> {
 }
 
 fn module_to_mml(m: &tracker::Module, opt: &Options) -> Converted {
-    let (score, w, _) = play::to_score(m, opt.wavetables, !opt.exact);
+    let (score, w, _) = play::to_score(m, opt.wavetables, !opt.exact, false);
     write(&score, opt, w)
 }
 
@@ -98,7 +98,7 @@ fn module_to_mml(m: &tracker::Module, opt: &Options) -> Converted {
 pub fn reference(data: &[u8]) -> Result<Vec<f32>, String> {
     if detect(data) != Some(Format::Module) { return Err("not a tracker module".into()) }
     let m = tracker::load(data)?;
-    let (_, _, tr) = play::to_score(&m, false, false);
+    let (_, _, tr) = play::to_score(&m, false, false, true);
     Ok(play::render(&m, &tr))
 }
 
@@ -133,8 +133,10 @@ fn write(score: &score::Score, opt: &Options, warnings: Vec<String>) -> Converte
     // (Rendered samples are limited to ±1, so a clipping peak only says "too loud": step down until it fits.)
     if opt.gain.is_none() {
         for _ in 0..8 {
-            let (peak, x) = (peak(&plain_mml, limit), song.master());
-            if peak <= 0.98 || x <= 1 { break }
+            let x = song.master();
+            if x <= 1 { break }
+            let peak = peak(&plain_mml, limit);
+            if peak <= 0.98 { break }
             song.set_master(((x as f32 * if peak >= 0.999 { 0.75 } else { 0.95 / peak }) as i32).min(x - 1));
             plain_mml = plain(&song, &lens, None);
         }
@@ -190,14 +192,15 @@ const GATE_STEADY: u32 = 6;
 pub fn render_chunks(mml: &str, secs: f64, f: impl FnMut(&[f32])) { render_song(sion::Song::new(mml), secs, f) }
 
 /// `render_chunks`, for a song already made.
-pub fn render_song(mut song: sion::Song, secs: f64, mut f: impl FnMut(&[f32])) {
+pub fn render_song(song: sion::Song, secs: f64, mut f: impl FnMut(&[f32])) { render_while(song, secs, |b| { f(b); true }) }
+
+/// `render_song`, also stopping once `f` returns false.
+fn render_while(mut song: sion::Song, secs: f64, mut f: impl FnMut(&[f32]) -> bool) {
     let (mut buf, mut frames) = (vec![0f32; 8192], 0usize);
     loop {
-        buf.fill(0.0);
         let more = song.render(&mut buf);
-        f(&buf);
         frames += buf.len() / 2;
-        if !more || frames as f64 >= sion::RATE as f64 * secs { return }
+        if !f(&buf) || !more || frames as f64 >= sion::RATE as f64 * secs { return }
     }
 }
 
@@ -217,10 +220,10 @@ pub fn render_raw(mml: &str, secs: f64) -> Vec<f32> {
     out
 }
 
-/// Loudest sample of the rendered MML (at most `secs` seconds).
+/// Loudest sample of the rendered MML (at most `secs` seconds); once it clips (0.999), that is all `write` needs.
 fn peak(mml: &str, secs: f64) -> f32 {
     let mut peak = 0f32;
-    render_chunks(mml, secs, |b| peak = b.iter().fold(peak, |p, s| p.max(s.abs())));
+    render_while(sion::Song::new(mml), secs, |b| { peak = b.iter().fold(peak, |p, s| p.max(s.abs())); peak < 0.999 });
     peak
 }
 

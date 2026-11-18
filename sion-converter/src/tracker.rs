@@ -118,7 +118,7 @@ impl Env {
         let i = p.partition_point(|x| x.0 as u32 <= t).max(1);
         let ((x0, y0), (x1, y1)) = (p[i - 1], p[i]);
         if x1 <= x0 { return y1 as f32 }
-        y0 as f32 + (y1 - y0) as f32 * (t - x0 as u32) as f32 / (x1 - x0) as f32
+        y0 as f32 + (y1 as f32 - y0 as f32) * (t - x0 as u32) as f32 / (x1 - x0) as f32
     }
 }
 

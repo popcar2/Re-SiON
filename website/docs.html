@@ -6,9 +6,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Re-SiON Docs</title>
 <link rel="stylesheet" href="style.css">
+<script src="js/theme.js"></script>
 <style>
   :root { --width: 760px; --code: #f1f0ec; }
-  @media (prefers-color-scheme: dark) { :root { --code: #1f1f1d; } }
+  :root[data-theme=dark] { --code: #1f1f1d; }
   main { padding-bottom: 96px; line-height: 1.6; }
   article h2 { font-size: 17px; font-weight: 650; letter-spacing: -0.01em; margin: 44px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); }
   article h3 { font-size: 14px; font-weight: 650; margin: 26px 0 6px; }

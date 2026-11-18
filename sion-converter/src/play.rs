@@ -475,11 +475,11 @@ fn step(e: &Env, t: u32, on: bool) -> u32 {
     t + 1
 }
 
-/// Perform the module. Samples are embedded as PCM unless `wavetables`.
-/// The module performed: its score, warnings, and the trace `render` mixes. `tidy` performs it the way it would
-/// be written by hand rather than exactly (see `Options::exact`): volume and pan per row, whole notes per row,
-/// single-cycle loops as wavetables, and the order list's patterns as the score's sections.
-pub fn to_score(m: &Module, wavetables: bool, tidy: bool) -> (Score, Vec<String>, Trace) {
+/// Perform the module: its score, warnings, and (with `trace`; else empty) the trace `render` mixes. Samples are
+/// embedded as PCM unless `wavetables`. `tidy` performs it the way it would be written by hand rather than exactly
+/// (see `Options::exact`): volume and pan per row, whole notes per row, single-cycle loops as wavetables, and the
+/// order list's patterns as the score's sections.
+pub fn to_score(m: &Module, wavetables: bool, tidy: bool, trace: bool) -> (Score, Vec<String>, Trace) {
     let mut defs = Defs::default();
     let mut full = 0;
     // (A sample that is all loop, of at most 1024 frames, is one cycle of a waveform: the wavetable is exact.)
@@ -488,7 +488,7 @@ pub fn to_score(m: &Module, wavetables: bool, tidy: bool) -> (Score, Vec<String>
         if wavetables || (tidy && cycle(s)) { return analyze(s, &mut defs) }
         pcm(s, &mut defs).unwrap_or_else(|| { full += 1; analyze(s, &mut defs) })
     }).collect();
-    let mut tr = Trace { chans: vec![vec![]; m.chans], ..Trace::default() };
+    let mut tr = Trace { chans: vec![vec![]; if trace { m.chans } else { 0 }], ..Trace::default() };
     let mut p = Player {
         m, sounds, bg: vec![], gvol: m.gvol as f32, speed: m.speed.max(1), tempo: m.tempo.max(32),
         clock: if m.kind == Kind::Mod { 3546895.0 } else { 8363.0 * 428.0 },
@@ -551,11 +551,11 @@ pub fn to_score(m: &Module, wavetables: bool, tidy: bool) -> (Score, Vec<String>
             let bpm = p.tempo as f64 * 24.0 / ppq as f64;
             if tempos.last().is_none_or(|l: &(u64, f64)| l.1 != bpm) { tempos.push((tick, bpm)) }
             let secs = 2.5 / p.tempo as f64;
-            tr.secs.push(secs);
+            if trace { tr.secs.push(secs) }
             for c in 0..m.chans {
                 let rate = p.rate(p.ch[c].p, p.ch[c].arp.unwrap_or(0) as f64, p.ch[c].vib_now);
                 let ch = &mut p.ch[c];
-                let Some(mut v) = ch.voice.take() else { st.chans[c].push(None); tr.chans[c].push(None); continue };
+                let Some(mut v) = ch.voice.take() else { st.chans[c].push(None); if trace { tr.chans[c].push(None) } continue };
                 let alive = Player::age(m, &mut v);
                 let s = &m.samples[v.smp];
                 let (env, pe) = Player::levels(m, &v);
@@ -568,7 +568,7 @@ pub fn to_score(m: &Module, wavetables: bool, tidy: bool) -> (Score, Vec<String>
                 if tidy { name(&mut names, c, v.ins) }
                 let f = Frame { pitch: snd.pitch(rate).clamp(0.0, 119.0), amp, tone, pan, trig, pos, lfo: (0, 0), rel: false };
                 st.chans[c].push(Some(f));
-                tr.chans[c].push(Some(Played { smp: v.smp, pos, rate, amp, pan }));
+                if trace { tr.chans[c].push(Some(Played { smp: v.smp, pos, rate, amp, pan })) }
                 v.pos += rate * secs;
                 let ended = s.lp.is_none() && v.pos >= s.data.len() as f64;
                 // (Tidy: a one-shot that has played out still lasts to the end of its row, so notes are whole rows.)
@@ -577,7 +577,7 @@ pub fn to_score(m: &Module, wavetables: bool, tidy: bool) -> (Score, Vec<String>
             // Background voices, each on a channel of its own.
             for k in 0..p.bg.len() {
                 let Some(mut v) = p.bg[k].take() else { continue };
-                while st.chans.len() <= m.chans + k { st.chans.push(vec![None; tick as usize]); tr.chans.push(vec![None; tick as usize]) }
+                while st.chans.len() <= m.chans + k { st.chans.push(vec![None; tick as usize]); if trace { tr.chans.push(vec![None; tick as usize]) } }
                 let alive = Player::age(m, &mut v);
                 let (env, pe) = Player::levels(m, &v);
                 let snd = &p.sounds[v.smp];
@@ -589,7 +589,7 @@ pub fn to_score(m: &Module, wavetables: bool, tidy: bool) -> (Score, Vec<String>
                 let (amp, pan) = if tidy { hold(&mut held, m.chans + k, rt == 0 || trig, amp, pan) } else { (amp, pan) };
                 if tidy { name(&mut names, m.chans + k, v.ins) }
                 st.chans[m.chans + k].push(Some(Frame { pitch: snd.pitch(v.rate).clamp(0.0, 119.0), amp, tone, pan, trig, pos, lfo: (0, 0), rel: false }));
-                tr.chans[m.chans + k].push(Some(Played { smp: v.smp, pos, rate: v.rate, amp, pan }));
+                if trace { tr.chans[m.chans + k].push(Some(Played { smp: v.smp, pos, rate: v.rate, amp, pan })) }
                 v.pos += v.rate * secs;
                 if alive && (!(s.lp.is_none() && v.pos >= s.data.len() as f64) || (tidy && rt + 1 < p.speed.max(1))) { p.bg[k] = Some(v) }
             }

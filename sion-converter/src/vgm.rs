@@ -28,11 +28,15 @@ const OTHER: [(usize, &str); 27] = [
 ];
 
 /// A register write at a sample time (44100 Hz), to chip number `chip` (`src`: of that byte of the sample bank);
-/// or (`block`) a data block for it.
-pub(crate) struct Write { pub at: u64, pub chip: usize, pub port: u8, pub reg: u8, pub val: u8, pub block: Option<usize>, pub src: Option<usize> }
+/// or (`block`) a data block for it. (Narrow fields: a log can hold millions.)
+pub(crate) struct Write { pub at: u64, pub block: Option<u32>, pub src: Option<u32>, pub chip: u8, pub port: u8, pub reg: u8, pub val: u8 }
 
 impl Write {
-    pub fn reg(at: u64, chip: usize, port: u8, reg: u8, val: u8) -> Self { Write { at, chip, port, reg, val, block: None, src: None } }
+    pub fn reg(at: u64, chip: usize, port: u8, reg: u8, val: u8) -> Self { Write { at, chip: chip as u8, port, reg, val, block: None, src: None } }
+    /// A write of byte `src` of the sample bank.
+    pub fn src(at: u64, chip: usize, port: u8, reg: u8, val: u8, src: usize) -> Self { Write { src: Some(src as u32), ..Write::reg(at, chip, port, reg, val) } }
+    /// Data block `block` (of `Log::blocks`) for chip `chip`.
+    pub fn block(at: u64, chip: usize, block: usize) -> Self { Write { block: Some(block as u32), ..Write::reg(at, chip, 0, 0, 0) } }
 }
 
 /// A chip log, from a VGM file or a played NSF: what `render` turns into a score.
@@ -82,7 +86,7 @@ impl DacStream {
             let i = first + self.base + (k % count) * self.step.max(1);
             let Some(&val) = bank.get(i) else { break };
             // (Bytes of bank 0, the YM2612's, can be stored as the bank itself.)
-            out.push(Write { at, chip, port, reg, val, block: None, src: (self.bank == 0).then_some(i) });
+            out.push(if self.bank == 0 { Write::src(at, chip, port, reg, val, i) } else { Write::reg(at, chip, port, reg, val) });
         }
     }
 }
@@ -157,7 +161,7 @@ pub fn to_score(data: &[u8], exact: bool) -> Result<(Score, Vec<String>), String
             0x80..=0x8f => {
                 // YM2612 DAC: the next byte of the sample bank, then a wait.
                 let s = slot[0x52];
-                if let (true, Some(&val)) = (s != usize::MAX, banks[0].get(ptr)) { writes.push(Write { at: t, chip: s, port: 0, reg: 0x2a, val, block: None, src: Some(ptr) }) }
+                if let (true, Some(&val)) = (s != usize::MAX, banks[0].get(ptr)) { writes.push(Write::src(t, s, 0, 0x2a, val, ptr)) }
                 (ptr, t) = (ptr + 1, t + (c & 15) as u64);
                 1
             }
@@ -167,18 +171,18 @@ pub fn to_score(data: &[u8], exact: bool) -> Result<(Score, Vec<String>), String
                 let body = d.get(i + 7..(i + 7 + n).min(d.len())).unwrap_or(&[]);
                 match ty {
                     0x00..=0x3f => {
-                        if ty == 0 && slot[0x52] != usize::MAX { blocks.push((0, banks[0].len(), body.to_vec())); writes.push(Write { at: t, chip: slot[0x52], port: 0, reg: 0, val: 0, block: Some(blocks.len() - 1), src: None }) }
+                        if ty == 0 && slot[0x52] != usize::MAX { blocks.push((0, banks[0].len(), body.to_vec())); writes.push(Write::block(t, slot[0x52], blocks.len() - 1)) }
                         starts[ty as usize].push((banks[ty as usize].len(), body.len()));
                         banks[ty as usize].extend_from_slice(body)
                     }
                     0x40..=0x7f => compressed = true,
                     0x80..=0xbf if body.len() >= 8 => {
                         let cmd = match ty { 0x81 => 0x56, 0x82 | 0x83 => 0x58, _ => 0 };
-                        if slot[cmd] != usize::MAX { blocks.push((ty, u32at(i + 11) as usize, body[8..].to_vec())); writes.push(Write { at: t, chip: slot[cmd], port: 0, reg: 0, val: 0, block: Some(blocks.len() - 1), src: None }) }
+                        if slot[cmd] != usize::MAX { blocks.push((ty, u32at(i + 11) as usize, body[8..].to_vec())); writes.push(Write::block(t, slot[cmd], blocks.len() - 1)) }
                     }
                     0xc0..=0xdf if body.len() >= 2 => {
                         let cmd = match ty { 0xc2 => 0xb4, _ => 0 };
-                        if slot[cmd] != usize::MAX { blocks.push((ty, body[0] as usize | (body[1] as usize) << 8, body[2..].to_vec())); writes.push(Write { at: t, chip: slot[cmd], port: 0, reg: 0, val: 0, block: Some(blocks.len() - 1), src: None }) }
+                        if slot[cmd] != usize::MAX { blocks.push((ty, body[0] as usize | (body[1] as usize) << 8, body[2..].to_vec())); writes.push(Write::block(t, slot[cmd], blocks.len() - 1)) }
                     }
                     _ => {}
                 }
@@ -236,13 +240,14 @@ pub fn to_score(data: &[u8], exact: bool) -> Result<(Score, Vec<String>), String
                 0xa0 | 0xb3 | 0xb4 if arg(1) & 0x80 != 0 => { i += len; continue } // second chip
                 _ => (0, arg(1), arg(2)),
             };
-            writes.push(Write { at: t, chip: s, port, reg, val, block: None, src: None });
+            writes.push(Write::reg(t, s, port, reg, val));
         }
         i += len;
     }
     let end = t.max(u32at(0x18) as u64);
     for st in &mut streams { st.flush(end, &banks, &mut writes) }
-    writes.sort_by_key(|w| w.at);
+    // (Stable: writes at the same time keep their order. Only DAC streams' writes come out of order.)
+    if !writes.is_sorted_by_key(|w| w.at) { writes.sort_by_key(|w| w.at) }
     if compressed { warnings.push("compressed sample data blocks are not converted".into()) }
     if writes.is_empty() { return Err("the VGM writes to no supported chip".into()) }
 
@@ -258,7 +263,7 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
     let Log { mut chips, level, writes, blocks, end, loop_at, period, phase, dac, shelf } = log;
     // Driver frame rate: the most common gap between bursts of writes, unless the header gives a rate. (Sample
     // data written to the YM2612 DAC isn't the driver's frame.)
-    let timing: Vec<&Write> = writes.iter().filter(|w| !(w.reg == 0x2a && w.port == 0 && dac == Some(w.chip)) && w.block.is_none()).collect();
+    let timing: Vec<&Write> = writes.iter().filter(|w| !(w.reg == 0x2a && w.port == 0 && dac == Some(w.chip as usize)) && w.block.is_none()).collect();
     let bursts: Vec<u64> = timing.iter().enumerate().filter(|(k, w)| *k == 0 || w.at > timing[k - 1].at + 32).map(|(_, w)| w.at).collect();
     let mut gaps = std::collections::HashMap::new();
     for p in bursts.windows(2) { if (147..=2205).contains(&(p[1] - p[0])) { *gaps.entry(p[1] - p[0]).or_insert(0usize) += 1 } }
@@ -300,11 +305,12 @@ pub(crate) fn render(log: Log, mut warnings: Vec<String>) -> Result<(Score, Vec<
             let w = &writes[wi];
             let dt = w.at as f64 - now;
             if dt > 0.0 { for c in &mut chips { c.run(dt / 44100.0) } now = w.at as f64 }
-            chips[w.chip].at(w.at as f64);
+            let chip = &mut chips[w.chip as usize];
+            chip.at(w.at as f64);
             match (w.block, w.src) {
-                (Some(b), _) => { let (ty, at, bytes) = &blocks[b]; chips[w.chip].data(*ty, *at, bytes) }
-                (None, Some(src)) => chips[w.chip].write_src(w.port, w.reg, w.val, src),
-                (None, None) => chips[w.chip].write(w.port, w.reg, w.val),
+                (Some(b), _) => { let (ty, at, bytes) = &blocks[b as usize]; chip.data(*ty, *at, bytes) }
+                (None, Some(src)) => chip.write_src(w.port, w.reg, w.val, src as usize),
+                (None, None) => chip.write(w.port, w.reg, w.val),
             }
             wi += 1;
         }

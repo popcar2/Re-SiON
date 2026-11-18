@@ -15,7 +15,8 @@ case $TARGET in
 *-windows-gnu*)
   # rustc names the Windows cdylib sion.dll; ship it as libsion.dll (matching libsion.so), and rebuild the
   # import library from the DLL's exports so it points programs at libsion.dll rather than sion.dll.
-  mv -f "$OUT/sion.dll" "$OUT/libsion.dll"
+  rm -f "$OUT/libsion.dll" # cargo may have hard-linked it to sion.dll on an earlier run
+  mv "$OUT/sion.dll" "$OUT/libsion.dll"
   DLLTOOL=$(command -v x86_64-w64-mingw32-dlltool || command -v dlltool)
   OBJDUMP=$(command -v x86_64-w64-mingw32-objdump || command -v objdump)
   { echo EXPORTS

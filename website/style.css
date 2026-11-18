@@ -3,11 +3,13 @@
   --width: 600px; /* the page column; the player bar matches it */
   --bg: #fafaf9; --fg: #1c1b1a; --muted: #8a8780; --line: #e8e6e1; --hover: #f1f0ec;
   --accent: #2a8fc4; --accent-soft: #e3f1f8;
-  color-scheme: light dark;
+  color-scheme: light;
 }
-@media (prefers-color-scheme: dark) {
-  :root { --bg: #151514; --fg: #ecebe8; --muted: #7d7a74; --line: #262624; --hover: #1d1d1b;
-          --accent: #7fd4f5; --accent-soft: #182a33; }
+/* Dark mode. js/theme.js sets data-theme from the visitor's choice, or else the system's, before the page draws. */
+:root[data-theme=dark] {
+  --bg: #151514; --fg: #ecebe8; --muted: #7d7a74; --line: #262624; --hover: #1d1d1b;
+  --accent: #7fd4f5; --accent-soft: #182a33;
+  color-scheme: dark;
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--fg); }
@@ -16,8 +18,39 @@ main { max-width: var(--width); margin: 0 auto; padding: 48px 16px 150px; }
 
 /* The title, centred, with the page links centred under it. */
 header { display: flex; flex-direction: column; align-items: center; gap: 10px; margin-bottom: 24px; }
-h1 { font-size: 20px; font-weight: 650; letter-spacing: -0.02em; margin: 0; }
-h1 a { color: inherit; text-decoration: none; }
+/* Rubik Black (SIL OFL 1.1), subset to just the glyphs of "Re-SiON". */
+@font-face { font-family: "Rubik Black Title"; src: url(fonts/rubik-black-title.woff2) format("woff2"); font-weight: 900; font-display: swap; }
+/* The title: heavy, spaced-out letters filled with an ice-blue sine wave
+   that flows endlessly through the glyphs (background clipped to the text). */
+:root {
+  --ice-top: var(--fg);
+  --ice-wave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 40' preserveAspectRatio='none'%3E%3Cpath d='M0 20C13 10 27 10 40 20S67 30 80 20V40H0Z' fill='%23167bb0' fill-opacity='1'/%3E%3C/svg%3E");
+}
+:root[data-theme=dark] {
+  --ice-wave: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 80 40' preserveAspectRatio='none'%3E%3Cpath d='M0 20C13 10 27 10 40 20S67 30 80 20V40H0Z' fill='%2363c4ee' fill-opacity='1'/%3E%3C/svg%3E");
+}
+h1 { font: 900 28px/1.1 "Rubik Black Title", ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.1em; margin: 0; }
+h1 a {
+  display: inline-block; margin-right: -0.1em; /* cancel the trailing letter-space so it stays centred */
+  text-decoration: none; color: var(--accent);
+  background: var(--ice-wave) 0 100% / 90px 76% repeat-x,
+              linear-gradient(var(--ice-top) 0 0);
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: ice-flow 6s linear infinite;
+}
+@keyframes ice-flow { to { background-position: -180px 100%, 0 0; } }
+@media (prefers-reduced-motion: reduce) { h1 a { animation: none; } }
+@media (forced-colors: active) { h1 a { background: none; -webkit-text-fill-color: currentColor; } }
+/* The light/dark switch (added by js/theme.js), in the top left corner. It shows the mode it switches to. */
+button.theme {
+  position: absolute; top: 12px; left: 12px; width: 34px; height: 34px; display: grid; place-items: center; padding: 0;
+  color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 50%; cursor: pointer;
+}
+button.theme:hover { color: var(--fg); background: var(--hover); }
+button.theme:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button.theme svg { width: 16px; height: 16px; fill: currentColor; }
+:root[data-theme=dark] button.theme .moon, :root:not([data-theme=dark]) button.theme .sun { display: none; }
 header nav { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px; }
 header nav a {
   color: var(--muted); font-size: 13px; text-decoration: none; padding: 4px 10px; border-radius: 6px;

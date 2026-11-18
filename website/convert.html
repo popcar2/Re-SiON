@@ -8,6 +8,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Re-SiON Converter</title>
 <link rel="stylesheet" href="style.css">
+<script src="js/theme.js"></script>
 <style>
   .note { text-align: center; color: var(--muted); font-size: 13px; line-height: 1.5; margin: 32px auto 0; max-width: 560px; }
   .drop {
@@ -41,7 +42,7 @@
   .result .name { font-weight: 600; overflow-wrap: anywhere; }
   .result .state { color: var(--muted); font-size: 13px; margin-top: 2px; font-variant-numeric: tabular-nums; }
   .result.error .state { color: #c4452a; }
-  @media (prefers-color-scheme: dark) { .result.error .state { color: #f08a6c; } }
+  :root[data-theme=dark] .result.error .state { color: #f08a6c; }
   .busy { height: 3px; margin-top: 12px; border-radius: 2px; background: var(--line); overflow: hidden; }
   .busy::after { content: ""; display: block; width: 30%; height: 100%; background: var(--accent); border-radius: 2px; animation: slide 1.1s ease-in-out infinite; }
   @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }

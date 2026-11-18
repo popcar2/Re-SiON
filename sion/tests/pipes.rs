@@ -66,3 +66,15 @@ fn adding_to_a_pipe_no_one_clears_builds_on_it() {
     let (lo, hi) = (depth.iter().copied().fold(f64::MAX, f64::min), depth.iter().copied().fold(0.0, f64::max));
     assert!(hi / lo > 2.0, "the depth varies: {depth:?}");
 }
+
+#[test]
+fn pipes_first_used_mid_song_are_as_if_used_from_the_start() {
+    // A song holds one frame of pipes until a pipe command runs. Here the first ones come partway in, a later
+    // track's write (added to, `@o2`) read a block late by an earlier one: as with the pipes in use from the start
+    // (`@o0,0`: output as usual).
+    let mml = "t120 %5@0 v16 r1 @i2,0 o5a1^1; %5@0 v8 r1 @o2,0 o4a1^1;";
+    let (late, early) = (render(mml, RATE as usize * 4), render(&format!("@o0,0 {mml}"), RATE as usize * 4));
+    let alone = render("t120 %5@0 v16 r1 o5a1^1;", RATE as usize * 4);
+    assert!(late != alone, "the pipe modulates");
+    assert_eq!(late, early);
+}

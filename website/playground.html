@@ -7,6 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Re-SiON Playground</title>
 <link rel="stylesheet" href="style.css">
+<script src="js/theme.js"></script>
 <style>
   main { max-width: 960px; padding-bottom: 0; }
   header { margin-bottom: 16px; }
@@ -134,11 +135,14 @@ v10             // volume: 10 out of 16, so it's not too loud
 l4              // note length: quarter notes, unless a note gives its own (r2 is a half-note rest)
 $ o5 c d e f g a b <c r2 c> b a g f e d c r2;  // o5: starts at the 5th octave
 `;
+// The starter itself comes first in the menu, to get back to it.
+const BASIC = { title: "Basic Example", artist: "Playground", volume: 1, mml: STARTER };
+EXAMPLES.unshift(BASIC);
 
 // ---- Editor ----
 // Every visit, reloads included, starts from STARTER.
 // What's in the textarea came from this example (its title and volume carry over until the text is replaced).
-let source = null;
+let source = { ...BASIC, mmlTitle: null };
 text.value = STARTER;
 
 function render() {
@@ -284,7 +288,7 @@ menu.addEventListener("keydown", (ev) => {
 
 async function pick(e) {
   open(false);
-  const mml = await (await fetch("songs/" + encodeURIComponent(e.file), { cache: "no-cache" })).text();
+  const mml = e.mml ?? await (await fetch("songs/" + encodeURIComponent(e.file), { cache: "no-cache" })).text();
   // Through insertText, so picking an example can be undone (Ctrl+Z) like any edit. Not on touch screens:
   // focusing the editor there pops up the on-screen keyboard, and its opening and closing again shifts the
   // page, which pushed the player bar out of view.

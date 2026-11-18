@@ -10,7 +10,7 @@ fn render(mml: &str) -> Vec<f32> { crate::render_raw(mml, 60.0 * 30.0) }
 /// Convert, render, and compare with the reference: (SNR in dB, MML).
 fn compare(m: &Module) -> (f64, String) {
     let out = module_to_mml(m, &Options { exact: true, ..Options::default() });
-    let (_, _, tr) = play::to_score(m, false, false);
+    let (_, _, tr) = play::to_score(m, false, false, true);
     let want = play::render(m, &tr);
     let got = render(&out.mml);
     assert_eq!(render(&out.plain), got, "minified MML must sound like the plain conversion");
@@ -129,7 +129,7 @@ fn debug_file() {
         }
     }
     let out = module_to_mml(&m, &Options { exact: true, ..Options::default() });
-    let (_, _, tr) = play::to_score(&m, false, false);
+    let (_, _, tr) = play::to_score(&m, false, false, true);
     let want = play::render(&m, &tr);
     let got = render(&out.mml);
     println!("total {:.1} dB", snr(&want, &got));

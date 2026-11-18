@@ -87,7 +87,7 @@ export function heatmap(ctx, node, footer, playing, on = true) {
     }
     color32 = new Uint32Array(color.buffer);
   }
-  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => palette());
+  addEventListener("themechange", () => palette()); // (from js/theme.js)
 
   function draw() {
     const w = canvas.clientWidth, h = canvas.clientHeight, dpr = devicePixelRatio || 1;

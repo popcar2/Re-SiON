@@ -2,8 +2,8 @@
 
 use crate::synth::{Table, RATE};
 use crate::m::M;
-use alloc::{vec, vec::Vec};
-use core::f32::consts::{PI, TAU};
+use alloc::{boxed::Box, vec, vec::Vec};
+use core::f32::consts::{FRAC_1_SQRT_2, PI, TAU};
 
 const NAMES: [&[u8]; 22] = [b"delay", b"reverb", b"chorus", b"autopan", b"ws", b"dist", b"comp", b"ds", b"speaker", b"stereo", b"eq", b"lf", b"hf", b"bf", b"nf", b"pf", b"af", b"lb", b"hb", b"nlf", b"nhf", b"vowel"];
 
@@ -11,6 +11,8 @@ pub struct Fx { k: usize, p: [f32; 8], s: Vec<f32>, i: usize, c: i32, t: [Option
 
 /// Biquad coefficients [b0, b1, b2, a1, a2] for filter kind 11..=18 (lf hf bf nf pf af lb hb).
 fn biquad(k: usize, freq: f32, band: f32, gain: f32) -> [f32; 5] {
+    // (At 0 Hz or Nyquist `sin` is 0, and the coefficients come out NaN: a silent mix from then on.)
+    let (freq, band) = (freq.clamp(1.0, RATE * 0.49), band.max(0.0));
     let (omg, a) = (freq * TAU / RATE, M::powf(10f32, gain * 0.025));
     let (cos, sin) = (M::cos(omg), M::sin(omg));
     let alp = sin * M::sinh(0.34657359 * band * omg / sin);
@@ -34,12 +36,17 @@ fn biquad(k: usize, freq: f32, band: f32, gain: f32) -> [f32; 5] {
 
 impl Fx {
     /// Build an effect from its MML name and arguments (NaN = default).
-    pub fn new(name: &[u8], a: &[f32; 16], tables: &[Option<Table>]) -> Option<Fx> {
+    pub fn new(name: &[u8], a: &[f32; 16], tables: &[Option<Box<Table>>]) -> Option<Fx> {
         let k = NAMES.iter().position(|n| *n == name)?;
         let g = |i: usize, d: f32| if a[i].is_nan() { d } else { a[i] };
         let (mut p, mut s, mut t) = ([0.0; 8], vec![], [None, None]);
         match k {
-            0 => { p = [(g(0, 250.0) * (RATE / 1000.0)).min(65535.0), (g(1, 25.0) / 100.0).clamp(-0.999, 0.999), (a[2] == 1.0) as i32 as f32, g(3, 100.0) / 100.0, 0., 0., 0., 0.]; s = vec![0.0; 131072] }
+            0 => {
+                p = [(g(0, 250.0) * (RATE / 1000.0)).min(65535.0), (g(1, 25.0) / 100.0).clamp(-0.999, 0.999), (a[2] == 1.0) as i32 as f32, g(3, 100.0) / 100.0, 0., 0., 0., 0.];
+                // A ring of stereo frames just longer than the delay (no delay: a full ring, read where it's written).
+                let d = p[0] as usize;
+                s = vec![0.0; 2 * if d == 0 { 65536 } else { (d + 1).next_power_of_two() }];
+            }
             1 => { p = [g(0, 70.0) / 100.0, g(1, 40.0) / 100.0, (g(2, 80.0) / 100.0).clamp(-0.99, 0.99), g(3, 100.0) / 100.0, 0., 0., 0., 0.]; s = vec![0.0; 16384] }
             2 => {
                 let off = M::floor((g(0, 20.0) * (RATE / 1000.0)).clamp(5.0, 4095.0));
@@ -86,7 +93,7 @@ impl Fx {
                 s.resize(54, 0.0);
             }
             _ => {
-                let tb = |i: usize| tables.get(g(i, 255.0) as usize).cloned().flatten().filter(|_| g(i, 255.0) < 255.0);
+                let tb = |i: usize| tables.get(g(i, 255.0) as usize).and_then(|t| t.as_deref().cloned()).filter(|_| g(i, 255.0) < 255.0);
                 t = [tb(0), tb(1)];
                 p[0] = M::floor(RATE / g(2, 20.0).max(1.0)).max(44.0);
                 p[1] = t[0].as_ref().map_or(128.0, |t| t.0[0] as f32);
@@ -106,13 +113,14 @@ impl Fx {
         for f in buf.iter_mut() {
             match self.k {
                 0 => {
-                    let (r, w) = (self.i, (self.i + p[0] as usize) & 65535);
+                    let m = s.len() / 2 - 1;
+                    let (r, w) = (self.i, (self.i + p[0] as usize) & m);
                     for c in 0..2 {
                         let n = s[r * 2 + (c ^ p[2] as usize)];
                         s[w * 2 + c] = f[c] - n * p[1];
                         f[c] = f[c] * (1.0 - p[3]) + n * p[3];
                     }
-                    self.i = (r + 1) & 65535;
+                    self.i = (r + 1) & m;
                 }
                 1 => {
                     let r = self.i;
@@ -174,7 +182,7 @@ impl Fx {
                     s[c + 2] = f[c];
                     f[c] = s[c];
                 }
-                9 => *f = if p[4] > 0.0 { [(f[0] + f[1]) * 0.70710678; 2] } else { [f[0] * p[0] + f[1] * p[1], f[0] * p[2] + f[1] * p[3]] },
+                9 => *f = if p[4] > 0.0 { [(f[0] + f[1]) * FRAC_1_SQRT_2; 2] } else { [f[0] * p[0] + f[1] * p[1], f[0] * p[2] + f[1] * p[3]] },
                 10 => for c in 0..2 {
                     let (n, s) = (f[c], &mut s[c * 11..c * 11 + 11]);
                     for (b, cf) in [(0, p[3]), (4, p[4])] {

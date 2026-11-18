@@ -19,8 +19,8 @@ mod wasm;
 #[allow(unsafe_code)]
 mod ffi;
 
-use alloc::{sync::Arc, vec, vec::Vec};
-use core::f32::consts::{PI, TAU};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use core::{cell::Cell, f32::consts::{PI, TAU}};
 use fx::Fx;
 use m::M;
 pub use synth::{Sample, PIPE_DEPTH, RATE};
@@ -194,38 +194,34 @@ fn key_scale(center: f32, range: f32, below: f32, step: f32, above: f32) -> Vec<
 /// only refer to `#PCMB`s by number, so they can come before them: the cut samples are made once all are read
 /// (`cuts`). See the README for the arguments.
 fn pcm_table(sh: &mut Shared, kind: u8, k: usize, dat: &[u8], pfx: &[u8]) {
-    let blank = || PcmVoice { keys: None, vol: vec![1.0; 128], pan: vec![0; 128], env: None, init: vec![] };
     let f = fields(dat);
     let a = |i: usize| f.get(i).copied().flatten();
     let at = |i: usize, d: f32| a(i).unwrap_or(d);
-    match kind {
-        // `#PCMWAVEn{id,note,from,to,channels,start,end,loop}`
-        b'W' => {
-            let Some(smp) = cut_of(sh, a(0), [a(5), a(6), a(7), a(1)]) else { return };
-            let (from, to) = (at(2, 0.0).max(0.0) as usize, at(3, 127.0) as i32);
-            let to = if to == -1 { from } else { to.min(127) as usize };
-            let v = sh.pcmv[k & 255].get_or_insert_with(blank);
-            let keys = v.keys.get_or_insert_with(|| vec![NO_SAMPLE; 128]);
-            for key in keys.iter_mut().take(to + 1).skip(from) { *key = smp }
-        }
-        // `#PCMVOICEn{volume center,range,amount, pan center,range,width, ar,dr,sr,rr,sl}commands`
-        b'V' => {
-            let v = sh.pcmv[k & 255].get_or_insert_with(blank);
-            let (vc, vr, vw) = (at(0, 64.0) as i32 as f32, at(1, 0.0), at(2, 0.0) / 128.0);
-            let step = |w: f32, r: f32| if r == 0.0 { w } else { w / r };
-            v.vol = key_scale(vc, vr, 1.0 - vw.max(0.0), step(vw, vr), 1.0 + vw.min(0.0));
-            let (pc, pr, pw) = (at(3, 64.0) as i32 as f32, at(4, 0.0), at(5, 0.0));
-            v.pan = key_scale(pc, pr, -pw * 0.5, step(pw, pr), pw * 0.5).iter().map(|p| *p as i32).collect();
-            v.env = Some([at(6, 63.0), at(7, 0.0), at(8, 0.0), at(9, 63.0), at(10, 0.0)].map(|x| x as i32));
-            v.init = pfx.to_vec();
-        }
-        // `#SAMPLERn{id,ignore key-off,pan,channels,start,end,loop}`: bank n / 128, key n % 128.
-        _ => {
-            let Some(smp) = cut_of(sh, a(0), [a(4), a(5), a(6), None]) else { return };
-            let bank = sh.kit[(k >> 7) & 3].get_or_insert_with(|| vec![None; 128]);
-            bank[k & 127] = Some(KitKey { smp, hold: at(1, 0.0) != 0.0, pan: at(2, 0.0) as i32 });
-        }
+    // `#SAMPLERn{id,ignore key-off,pan,channels,start,end,loop}`: bank n / 128, key n % 128.
+    if kind == b'P' {
+        let Some(smp) = cut_of(sh, a(0), [a(4), a(5), a(6), None]) else { return };
+        let bank = sh.kit[(k >> 7) & 3].get_or_insert_with(|| vec![None; 128]);
+        bank[k & 127] = Some(KitKey { smp, hold: at(1, 0.0) != 0.0, pan: at(2, 0.0) as i32 });
+        return;
     }
+    // `#PCMWAVEn{id,note,from,to,channels,start,end,loop}`
+    let smp = if kind == b'W' { let Some(smp) = cut_of(sh, a(0), [a(5), a(6), a(7), a(1)]) else { return }; smp } else { 0 };
+    let v = sh.pcmv[k & 255].get_or_insert_with(|| Box::new(PcmVoice { keys: None, vol: vec![1.0; 128], pan: vec![0; 128], env: None, init: vec![] }));
+    if kind == b'W' {
+        let (from, to) = (at(2, 0.0).max(0.0) as usize, at(3, 127.0) as i32);
+        let to = if to == -1 { from } else { to.min(127) as usize };
+        let keys = v.keys.get_or_insert_with(|| vec![NO_SAMPLE; 128]);
+        for key in keys.iter_mut().take(to + 1).skip(from) { *key = smp }
+        return;
+    }
+    // `#PCMVOICEn{volume center,range,amount, pan center,range,width, ar,dr,sr,rr,sl}commands`
+    let (vc, vr, vw) = (at(0, 64.0) as i32 as f32, at(1, 0.0), at(2, 0.0) / 128.0);
+    let step = |w: f32, r: f32| if r == 0.0 { w } else { w / r };
+    v.vol = key_scale(vc, vr, 1.0 - vw.max(0.0), step(vw, vr), 1.0 + vw.min(0.0));
+    let (pc, pr, pw) = (at(3, 64.0) as i32 as f32, at(4, 0.0), at(5, 0.0));
+    v.pan = key_scale(pc, pr, -pw * 0.5, step(pw, pr), pw * 0.5).iter().map(|p| *p as i32).collect();
+    v.env = Some([at(6, 63.0), at(7, 0.0), at(8, 0.0), at(9, 63.0), at(10, 0.0)].map(|x| x as i32));
+    v.init = pfx.to_vec();
 }
 
 /// All numbers in a voice definition.
@@ -435,6 +431,8 @@ struct Track {
     /// While rendering: the channel was idle (see `Chan::idle`) with nothing fading at the last frame, and has been
     /// left alone since, so until the track has something to do it stays that way.
     quiet: bool,
+    /// How many voice init sequences deep `exec` is (see `@`).
+    nest: u8,
     ch: Chan,
     dc: Declick,
 }
@@ -513,7 +511,7 @@ impl Track {
             at: 0.0, koff: INF, kon: INF, wake: 0.0, q: (sh.quant * 3 / 4) as f64 / sh.quant as f64, qc: 0.0, kd: 0.0,
             oct: 5, len: 480, ns: 0, vel: 256, vsh: sh.vmode.2, x: 128, kt: 0, k: 0, kf: 0.0, note: 0, slur: false, md: 0, tone: 0,
             set: [[None; 5]; 2], xoff: [false; 2], tvol: false, sweep: [0; 2], swe0: 0.0, modt: [None, None], env: [None; 5], menv: None,
-            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 1.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0, src: -1, sends: false, quiet: false,
+            swp: 0.0, sws: 0.0, swe: 0.0, pact: false, xo: 0, res: 1.0, itv: RATE / sh.fps, mask: 0, tset: 0.0, late: 0.0, lag: 0, seen: 0, next: 0, src: -1, sends: false, quiet: false, nest: 0,
             ch: Chan::new(), dc: Declick::new(64),
         };
         t.ch.vm = (sh.vmode.0, sh.vmode.1);
@@ -690,12 +688,14 @@ impl Track {
     fn catch(&mut self, sh: &Shared, pos: u64, replay: bool) {
         let mut k = pos - self.seen;
         (self.lag, self.seen) = (self.lag + k, pos);
-        while replay {
-            let f = (-M::floor(-self.res)).max(1.0);
-            if f > k as f32 { break }
-            (self.res, k) = (self.res - f, k - f as u64);
-            self.frame(sh);
-            (self.res, self.ch.stale) = (self.res + self.itv, true);
+        if replay {
+            loop {
+                let f = (-M::floor(-self.res)).max(1.0);
+                if f > k as f32 { break }
+                (self.res, k) = (self.res - f, k - f as u64);
+                self.frame(sh);
+                (self.res, self.ch.stale) = (self.res + self.itv, true);
+            }
         }
         self.res -= k as f32;
     }
@@ -857,9 +857,9 @@ impl Track {
                     b"@clock" => ch.fratio = p(0, 100).max(1) as f32 / 100.0,
                     b"@al" => { let cnt = p(0, 0).max(0) as usize; ch.set_alg(cnt, p(1, *[0, 1, 5, 7].get(cnt).unwrap_or(&0)).max(0) as usize) }
                     b"@fb" => (ch.fb, ch.fbc, ch.inp.0) = (p(0, 0), if (p(1, 0) as usize) < ch.ops.len() { p(1, 0) as usize } else { 0 }, 0),
-                    b"@i" => ch.inp = (p(0, 5), p(1, 0) as usize & 3),
-                    b"@o" => ch.outp = (p(0, 2), p(1, 0) as usize & 3),
-                    b"@r" => ch.ring = (p(0, 4), p(1, 0) as usize & 3),
+                    b"@i" => { ch.inp = (p(0, 5), p(1, 0) as usize & 3); sh.piped.set(true) }
+                    b"@o" => { ch.outp = (p(0, 2), p(1, 0) as usize & 3); sh.piped.set(true) }
+                    b"@r" => { ch.ring = (p(0, 4), p(1, 0) as usize & 3); sh.piped.set(true) }
                     b"i" => ch.act = (p(0, 4).max(0) as usize).min(ch.ops.len() - 1),
                     b"@tl" => ch.ops[ch.act].tl = p(0, 0).clamp(0, 127),
                     b"@ml" => ch.ops[ch.act].fmul = (p(0, 0) << 7) + p(1, 0),
@@ -915,7 +915,12 @@ impl Track {
                             self.ch.params(&a[1..15]);
                         }
                         let mut j = 0;
-                        while let Some(seq) = init.filter(|q| j < q.len()) { self.exec(seq, &mut j, sh, bpm, false) }
+                        // (Only a few deep: an init sequence may select its own voice, or one that comes back to it.)
+                        if self.nest < 4 {
+                            self.nest += 1;
+                            while let Some(seq) = init.filter(|q| j < q.len()) { self.exec(seq, &mut j, sh, bpm, false) }
+                            self.nest -= 1;
+                        }
                     }
                     _ => {}
                 }
@@ -949,7 +954,8 @@ pub struct Song {
     /// The pipes (`@o`, `@i`, `@r`): each one's values over the last `PIPE_BLOCK` frames. SiON renders the tracks a
     /// block at a time, one after another, so a track reads what the tracks before it wrote in the same block, but
     /// from those after it the block before; and a pipe that no track overwrites keeps what it held, so `@o2`
-    /// alone adds onto that. A ring of one block's frames does the same frame by frame.
+    /// alone adds onto that. A ring of one block's frames does the same frame by frame. (One frame until a pipe
+    /// command runs: all 0 till then.)
     pipes: Vec<[f32; 4]>,
 }
 
@@ -1103,7 +1109,7 @@ fn fm(form: &[u8], seqs: &[Vec<u8>]) -> Option<(usize, Vec<Vec<u8>>)> {
 }
 
 /// Replace inline envelope tables (`na{0,8,16}`) with references to new tables numbered down from 511.
-fn inline(s: &[u8], tables: &mut [Option<Table>], next: &mut usize) -> Vec<u8> {
+fn inline(s: &[u8], tables: &mut [Option<Box<Table>>], next: &mut usize) -> Vec<u8> {
     let (mut out, mut i) = (vec![], 0);
     while i < s.len() {
         let name = ENV.iter().find(|c| s[i..].starts_with(c));
@@ -1115,7 +1121,7 @@ fn inline(s: &[u8], tables: &mut [Option<Table>], next: &mut usize) -> Vec<u8> {
             let e = find(s, j, b"}");
             let mut k = e;
             while s.get(k).is_some_and(|c| c.is_ascii_digit() || matches!(c, b'*' | b'+' | b'-' | b'.')) { k += 1 }
-            tables[*next] = Some(table(&s[j + 1..(e - 1).max(j + 1)], &s[e..k])).filter(|t| !t.0.is_empty());
+            tables[*next] = Some(Box::new(table(&s[j + 1..(e - 1).max(j + 1)], &s[e..k]))).filter(|t| !t.0.is_empty());
             cmd(&mut out, b"", &[*next as i32]);
             *next -= 1;
             j = k;
@@ -1165,8 +1171,8 @@ impl Song {
         };
 
         let mut sh = Shared {
-            samples: vec![None; 256], cuts: vec![], pcmv: vec![None; 256], kit: vec![None; 4], dpcm: vec![false; 256], waves: vec![vec![]; 256], noise: noise(), tables: vec![None; 512], voices: vec![None; 256],
-            fps: 60.0, quant: 8, tmode: (0, 1.0), vmode: (0, 0, 4), rev: (1, 1), fb2: false, sign: [0; 7],
+            samples: vec![None; 256], cuts: vec![], pcmv: vec![None; 256], kit: vec![None; 4], dpcm: vec![false; 256], waves: vec![vec![]; 256], noise: Default::default(), tables: vec![None; 512], voices: vec![None; 256],
+            fps: 60.0, quant: 8, tmode: (0, 1.0), vmode: (0, 0, 4), rev: (1, 1), fb2: false, piped: Cell::new(false), sign: [0; 7],
             sine: lookup(|i| M::sin(i * TAU / 1024.0)), pan: lookup(|i| M::sin(i * PI / 256.0)), att: lookup(|i| M::exp2(-(i / 4.0 - 256.0) / 64.0)),
         };
 
@@ -1204,7 +1210,7 @@ impl Song {
             let (dat, pfx) = if body.get(j) == Some(&b'{') { let e = find(body, j, b"}"); (&body[j + 1..(e - 1).max(j + 1)], &body[e..]) } else { (&body[j..], &body[j..]) };
             match name {
                 b"END" => break,
-                b"@" | b"OPM@" | b"OPN@" | b"OPL@" | b"OPX@" | b"MA@" | b"AL@" => sh.voices[k & 255] = voice(name, &nums(dat), pfx),
+                b"@" | b"OPM@" | b"OPN@" | b"OPL@" | b"OPX@" | b"MA@" | b"AL@" => sh.voices[k & 255] = voice(name, &nums(dat), pfx).map(Box::new),
                 b"FPS" => sh.fps = if k > 0 { k as f32 } else { nums(dat).first().copied().unwrap_or(60.0).max(1.0) },
                 b"SIGN" => sh.sign = sign(dat),
                 b"MACRO" => dynamic = has(dat, b"dynamic"),
@@ -1226,7 +1232,7 @@ impl Song {
                 }
                 b"FBMODE" => sh.fb2 = has(dat, b"chip"),
                 b"REV" => sh.rev = (if has(dat, b"vol") { 1 } else { -1 }, if has(dat, b"oct") { 1 } else { -1 }),
-                b"TABLE" => if k < 255 { sh.tables[k] = Some(table(dat, pfx)).filter(|t| !t.0.is_empty()) },
+                b"TABLE" => if k < 255 { sh.tables[k] = Some(Box::new(table(dat, pfx))).filter(|t| !t.0.is_empty()) },
                 b"WAV" => {
                     let t = table(dat, pfx).0;
                     let n = t.len().clamp(2, 1024).next_power_of_two();
@@ -1296,7 +1302,7 @@ impl Song {
         }
         let mut next = 511;
         let tracks = seqs.into_iter().map(|s| Track::new(statics(&inline(&s, &mut sh.tables, &mut next), &sh), &sh)).collect();
-        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, declick: true, fade: 0, old: vec![], fresh: true, pos: 0, base: (0.0, 120.0, 0), pipes: vec![[0.0; 4]; PIPE_BLOCK] }
+        Song { tracks, sh, slots, bpm: 120.0, now: 0.0, tail: 0, declick: true, fade: 0, old: vec![], fresh: true, pos: 0, base: (0.0, 120.0, 0), pipes: vec![[0.0; 4]] }
     }
 
     /// Per track, the byte offset in the source MML of the note it is playing now (-1: none, resting or ended),
@@ -1340,18 +1346,14 @@ impl Song {
         (s, loops)
     }
 
-    /// Move playback `frames` ahead without producing output, for seeking. The sequencer runs (notes, tempo,
-    /// envelope tables), leaping straight from one event to the next, and each channel's slow-moving state
-    /// (envelopes, PCM sample positions, LFO, filter sweep, oscillator phases) leaps along with it. Plucked
-    /// strings (`%11`) are synthesized in full for the last two seconds, and the last moment (a quarter
-    /// second with effect units, else a twentieth) is rendered in full, so feedback, filters and effects
-    /// (reverb, delay..) settle. The result is close to, though not exactly, what continuous playback would
-    /// give there: echoes of what played before that last moment are missing, and the phases of oscillators
-    /// with vibrato drift. Returns false once the song has finished, as `render` does.
-    /// With declicking on (see `set_declick`), the jump is crossfaded over, as the output would otherwise cut
-    /// off mid-wave and start again mid-wave, with pops: the first `SKIP_FADE` frames (about 6 ms) skipped are
-    /// rendered, and fade out as the audio after the skip fades in. With nothing rendered before (a new song, or
-    /// after `forget_rendered`), the audio after the skip just fades in from silence.
+    /// Move playback `frames` ahead without producing output, for seeking. The sequencer leaps from one event to
+    /// the next, and each channel's slow-moving state (envelopes, PCM positions, LFO, filter sweep, phases) leaps
+    /// with it. Plucked strings (`%11`) are synthesized for the last two seconds, and the last moment (a quarter
+    /// second with effects, else a twentieth) is rendered, so feedback, filters and effects settle. Close to, not
+    /// exactly, continuous playback: echoes from before that moment are missing, and vibrato phases drift.
+    /// With declicking on (see `set_declick`) the jump is crossfaded: the first `SKIP_FADE` frames (about 6 ms) are
+    /// rendered and fade out as the audio after the skip fades in (from silence, if nothing was rendered before or
+    /// after `forget_rendered`). Returns false once the song has finished, as `render` does.
     /// To seek backwards, make a new `Song` and skip forward from the start.
     pub fn skip(&mut self, frames: u64) -> bool {
         if !self.declick || frames == 0 { return self.leap(frames) }
@@ -1457,14 +1459,19 @@ impl Song {
         if self.fade == 0 { self.old = vec![] }
     }
 
+    /// A whole block of pipes, once the first pipe command has run; returns where the current frame's go.
+    #[inline(never)]
+    fn pipe_block(&mut self) -> usize { self.pipes = vec![[0.0; 4]; PIPE_BLOCK]; self.pos as usize & (PIPE_BLOCK - 1) }
+
     /// Fill `out` with interleaved stereo samples; returns false once the song has finished.
     /// Songs with a `$` loop point never finish.
     #[cfg_attr(feature = "small", optimize(speed))]
     pub fn render(&mut self, out: &mut [f32]) -> bool {
         let n = out.len() / 2;
-        for s in &mut self.slots { s.buf.clear(); s.buf.resize(n, [0.0; 2]) }
+        // (Only the master and slots with effects are mixed into.)
+        for (k, s) in self.slots.iter_mut().enumerate() { if k == 0 || !s.fx.is_empty() { s.buf.clear(); s.buf.resize(n, [0.0; 2]) } }
         for i in 0..n {
-            let at = (self.pos % PIPE_BLOCK as u64) as usize;
+            let at = self.pos as usize & (self.pipes.len() - 1);
             let mut pipes = self.pipes[at];
             for t in &mut self.tracks {
                 // (Many tracks are quiet at any moment: until they have something to do, nothing to render.)
@@ -1494,6 +1501,8 @@ impl Song {
                     }
                 }
             }
+            // (The frame of pipes held until then is still all 0.)
+            let at = if self.pipes.len() == 1 && self.sh.piped.get() { self.pipe_block() } else { at };
             self.pipes[at] = pipes;
             self.advance(1);
         }

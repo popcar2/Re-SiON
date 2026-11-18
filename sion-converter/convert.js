@@ -6,7 +6,8 @@
 //
 //   r: { ok, mml, format, tracks, notes, bytes, plainBytes, secs, loopSecs, warnings } or { ok: false, error }.
 //   Conversion runs synchronously and can take seconds: call it from a Worker. A crash on a malformed file
-//   (a wasm trap) is thrown as an Error; the converter starts over with a fresh instance for the next file.
+//   (a wasm trap) is thrown as an Error. Each conversion runs in a fresh instance, so the memory a big file
+//   took is let go of afterwards.
 
 const dec = new TextDecoder();
 
@@ -34,15 +35,15 @@ export class Converter {
     try {
       x.convert_run(ptr, data.length, grid, gain, flags, track);
     } catch (e) {
-      // A trap leaves the instance in an unknown state: start over with a new one.
-      this.#fresh();
       throw new Error("the converter crashed on this file (" + e.message + ")");
+    } finally {
+      // (A wasm memory only grows, and a trap leaves the instance in an unknown state: the next file gets a new
+      // instance, which takes a fraction of a millisecond, and this one's memory goes with it.)
+      this.#fresh();
     }
-    x.convert_dealloc(ptr, data.length);
     const out = (i) => dec.decode(new Uint8Array(x.memory.buffer, x.convert_output(i), x.convert_output_len(i)));
     const r = JSON.parse(out(1));
     if (r.ok) r.mml = out(0);
-    x.convert_clear();
     return r;
   }
 }

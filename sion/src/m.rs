@@ -29,6 +29,7 @@ impl M for f32 {
         let x = if r == 1.0 { self - M::floor(self) } else { self - r * M::floor(self / r) };
         if x >= r { 0.0 } else { x }
     }
+    #[allow(clippy::approx_constant)] // (a fitted polynomial: its first coefficient is near ln 2, not it)
     fn exp2(self) -> f32 {
         if self.is_nan() { return self }
         if self < -126.0 { return 0.0 }

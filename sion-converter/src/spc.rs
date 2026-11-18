@@ -22,6 +22,8 @@ pub fn detect(d: &[u8]) -> bool { d.starts_with(b"SNES-SPC700 Sound File Data") 
 
 /// How long to play an SPC that neither loops nor says how long it is.
 const MAX_SECS: f64 = 600.0;
+/// The longest a tag's play time can make the run (a binary tag's field holds up to 194 days).
+const MAX_RUN: f64 = 3600.0;
 /// SPC700 cycles per second; the DSP makes one sample every 32 of them.
 const CLOCK: f64 = 1_024_000.0;
 const RATE: f64 = 32000.0;
@@ -137,8 +139,8 @@ struct Dsp {
     counter: u32,
     /// Samples made so far.
     t: u64,
-    /// Register writes: (sample, register, value).
-    writes: Vec<(u64, u8, u8)>,
+    /// Register writes: (sample, register, value). (A u32 holds the samples of a song's maximum, `MAX_RUN`.)
+    writes: Vec<(u32, u8, u8)>,
     keyons: Vec<KeyOn>,
     /// Key-offs (KOFF, or a soft reset): (sample, voice).
     offs: Vec<(u64, usize)>,
@@ -164,7 +166,7 @@ impl Dsp {
 
     fn write(&mut self, a: u8, v: u8) {
         let a = a as usize;
-        self.writes.push((self.t, a as u8, v));
+        self.writes.push((self.t as u32, a as u8, v));
         match a {
             KON => { self.new_kon = v; self.regs[a] = v }
             ENDX => self.regs[ENDX] = 0,
@@ -461,7 +463,7 @@ fn play(d: &[u8], warnings: &mut Vec<String>) -> Result<Played, String> {
 
     // Run until the driver's state repeats (the song loops), or the time runs out. (Or until the driver's writes
     // or key-ons have been repeating for a while: the same loop found at two checks in a row.)
-    let max = (tags.secs.map_or(MAX_SECS, |s| s.max(MAX_SECS)) * CLOCK) as u64;
+    let max = (tags.secs.map_or(MAX_SECS, |s| s.clamp(MAX_SECS, MAX_RUN)) * CLOCK) as u64;
     let (mut seen, mut ticks, mut sigs) = (HashMap::new(), vec![], vec![]);
     let mut exact = None;
     let check = (CHECK_SECS * CLOCK) as u64;
@@ -1031,7 +1033,7 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
     if dsp.keyons.is_empty() { return Err("the SPC plays no notes".into()) }
 
     // The register values as they change: replay the writes.
-    let at_reg = |from: &[u8; 128], t0: u64, t1: u64| dsp.writes[dsp.writes.partition_point(|w| w.0 < t0)..dsp.writes.partition_point(|w| w.0 < t1)].iter().scan(*from, |r, &(t, a, v)| { r[a as usize] = v; Some((t, a, *r)) });
+    let at_reg = |from: &[u8; 128], t0: u64, t1: u64| dsp.writes[dsp.writes.partition_point(|w| (w.0 as u64) < t0)..dsp.writes.partition_point(|w| (w.0 as u64) < t1)].iter().scan(*from, |r, &(t, a, v)| { r[a as usize] = v; Some((t as u64, a, *r)) });
 
     // Notes: each key-on, until the voice's next one (or it falls silent).
     let mut raws: Vec<Raw> = vec![];
@@ -1117,7 +1119,8 @@ pub fn to_score(data: &[u8]) -> Result<(Score, Vec<String>), String> {
         k
     };
     let (mut cur, mut since) = (regs0, 0u64);
-    for &(t, a, v) in dsp.writes.iter().take_while(|w| w.0 < end) {
+    for &(t, a, v) in dsp.writes.iter().take_while(|w| (w.0 as u64) < end) {
+        let t = t as u64;
         let before = echo_regs(&cur);
         cur[a as usize] = v;
         if echo_regs(&cur) != before { *memo(&mut held, before, || 0) += t - since; since = t }

@@ -2,7 +2,7 @@
 
 use crate::m::M;
 use alloc::{boxed::Box, vec, vec::Vec};
-use core::f32::consts::TAU;
+use core::{cell::{Cell, OnceCell}, f32::consts::TAU};
 
 pub const RATE: f32 = 44100.0;
 pub const MIN: i32 = i32::MIN;
@@ -82,15 +82,17 @@ pub struct Shared {
     /// Each sample past 255: the `#PCMB` it is cut from, and its start, end, loop and key (see `cut` in lib.rs).
     pub cuts: Vec<(usize, [Option<f32>; 4])>,
     /// `%7@n` voices (`#PCMWAVE`, `#PCMVOICE`); `%10`'s four banks of 128 keys (`#SAMPLER`; None: a bank with none).
-    pub pcmv: Vec<Option<PcmVoice>>,
+    pub pcmv: Vec<Option<Box<PcmVoice>>>,
     pub kit: Vec<Option<Vec<Option<KitKey>>>>,
     /// Which samples are NES DPCM (`#PCMB` flags 4): their frames are the level of the console's delta modulation
     /// channel, which a channel playing them keeps the way the console does (see `Chan::dpcm`).
     pub dpcm: Vec<bool>,
     pub waves: Vec<Vec<f32>>,
-    pub noise: [Vec<f32>; 6],
-    pub tables: Vec<Option<Table>>,
-    pub voices: Vec<Option<Voice>>,
+    /// The noise tables (see `noise`), each made the first time it is played: most songs use few or none.
+    pub noise: [OnceCell<Vec<f32>>; 6],
+    /// (Boxed, as these are mostly empty: an empty slot takes a pointer's room.)
+    pub tables: Vec<Option<Box<Table>>>,
+    pub voices: Vec<Option<Box<Voice>>>,
     pub fps: f32,
     pub quant: i32,
     pub tmode: (u8, f64),
@@ -99,6 +101,8 @@ pub struct Shared {
     /// `#FBMODE{chip}` (an extension): FM feedback from the sum of the operator's last two outputs at half the
     /// depth each, as the Yamaha chips do; SiON feeds back the last output alone.
     pub fb2: bool,
+    /// A pipe command (`@i`, `@o`, `@r`) has run: `Song::pipes` holds a whole block.
+    pub piped: Cell<bool>,
     pub sign: [i32; 7],
     /// 1024-step sine (as SiON's wave tables) and constant-power pan gains for pan 0..128.
     pub sine: Box<[f32; 1024]>,
@@ -109,7 +113,13 @@ pub struct Shared {
 
 impl Shared {
     pub fn sample(&self, i: usize) -> Option<&Sample> { self.samples.get(i)?.as_ref() }
-    pub fn voice(&self, i: usize) -> Option<&Voice> { self.voices.get(i)?.as_ref() }
+    pub fn voice(&self, i: usize) -> Option<&Voice> { self.voices.get(i)?.as_deref() }
+
+    /// Noise table `k`, made the first time it's asked for.
+    fn noise(&self, k: usize) -> &[f32] {
+        if self.noise[k].get().is_none() { let _ = self.noise[k].set(noise(self, k)); }
+        self.noise[k].get().map_or(&[], |t| t)
+    }
 }
 
 /// The S-DSP's Gaussian interpolation curve (weights of 2048; at position `u` + `i` / 256, frame `u` gets
@@ -139,26 +149,26 @@ const GAUSS16: [i16; 512] = [
     1282, 1283, 1284, 1286, 1287, 1288, 1290, 1291, 1292, 1293, 1294, 1295, 1296, 1297, 1297, 1298, 1299, 1300, 1300, 1301, 1302, 1302, 1303, 1303, 1303, 1304, 1304, 1304, 1304, 1304, 1305, 1305,
 ];
 
-/// White, pulse, short, high-pass, pink and Game Boy noise tables.
-pub fn noise() -> [Vec<f32>; 6] {
-    let (mut w, mut p, mut j) = (vec![], vec![], 1i32);
-    for _ in 0..32768 {
-        j = (((j << 13) ^ (j << 14)) & 0x4000) | (j >> 1);
-        w.push((j & 0x7fff) as f32 / 16384.0 - 1.0);
-        p.push(if j & 1 == 1 { 1.0 } else { -1.0 });
+/// Noise table `k`: white, pulse, short, high-pass, pink or Game Boy noise.
+fn noise(sh: &Shared, k: usize) -> Vec<f32> {
+    let n = match k { 2 => 1024, 5 => 128, _ => 32768 };
+    let w = if k == 3 || k == 4 { sh.noise(0) } else { &[] };
+    let (mut out, mut j, mut o, mut v, mut b) = (Vec::with_capacity(n), if k == 5 { 0xffff } else { 1i32 }, 0, 0f32, [0f32; 3]);
+    let pm = |b: bool| if b { 1.0 } else { -1.0 };
+    for i in 0..n {
+        out.push(match k {
+            0 | 1 => { j = (((j << 13) ^ (j << 14)) & 0x4000) | (j >> 1); if k == 0 { (j & 0x7fff) as f32 / 16384.0 - 1.0 } else { pm(j & 1 == 1) } }
+            2 => { j = (((j << 8) ^ (j << 14)) & 0x4000) | (j >> 1); pm(j & 1 == 1) }
+            3 => { v = if i == 0 { (w[0] - w[32767]) * 0.0625 } else { (v + w[i] - w[i - 1]) * 0.0625 }; v * 16.0 }
+            4 => {
+                let x = w[i];
+                b = [0.99765 * b[0] + x * 0.099046, 0.963 * b[1] + x * 0.2965164, 0.57 * b[2] + x * 1.0526913];
+                (b[0] + b[1] + b[2] + x * 0.1848) * 0.125
+            }
+            _ => { j = j.wrapping_add(j).wrapping_add(((j >> 6) ^ (j >> 5)) & 1); o ^= j & 1; pm(o == 1) }
+        });
     }
-    j = 1;
-    let short = (0..1024).map(|_| { j = (((j << 8) ^ (j << 14)) & 0x4000) | (j >> 1); if j & 1 == 1 { 1.0 } else { -1.0 } }).collect();
-    let (mut j, mut o) = (0xffffi32, 0);
-    let gb = (0..128).map(|_| { j = j.wrapping_add(j).wrapping_add(((j >> 6) ^ (j >> 5)) & 1); o ^= j & 1; if o == 1 { 1.0 } else { -1.0 } }).collect();
-    let mut v = (w[0] - w[32767]) * 0.0625;
-    let hi = (0..32768).map(|i| { if i > 0 { v = (v + w[i] - w[i - 1]) * 0.0625 } v * 16.0 }).collect();
-    let mut b = [0f32; 3];
-    let pink = w.iter().map(|&x| {
-        b = [0.99765 * b[0] + x * 0.099046, 0.963 * b[1] + x * 0.2965164, 0.57 * b[2] + x * 1.0526913];
-        (b[0] + b[1] + b[2] + x * 0.1848) * 0.125
-    }).collect();
-    [w, p, short, hi, pink, gb]
+    out
 }
 
 /// (Phases here are never negative, and converting through i32 is the cheaper conversion.)
@@ -210,15 +220,12 @@ pub fn wave(sh: &Shared, pg: i32, p: f32) -> f32 {
         3 => { let i = (p * 32.0) as i32; (match i { 0..=7 => i, 8..=23 => 15 - i, _ => i - 32 }) as f32 / 8.0 }
         4 => tri(p),
         5 => b(p < 0.5),
-        6 | 16 => at(&sh.noise[0], p),
-        17 | 26 => at(&sh.noise[1], p),
-        18..=21 => at(&sh.noise[pg as usize - 16], p),
+        6 | 16..=21 | 25 | 26 => noise_at(sh, pg, p),
         7 => KNM[(p * 32.0) as i32 as usize & 31] as f32 / 128.0,
         8 => -p,
         9 => p,
         11 => -0.96875 + M::floor(p * 32.0) * 0.0625,
         24 => (p < 0.0625) as i32 as f32,
-        25 => at(&sh.noise[2], p / 11.0),
         32..=63 => {
             let (g, v) = ((pg - 32) / 8, (pg - 32) % 8);
             let base = |q: f32| match g {
@@ -253,6 +260,14 @@ pub fn wave(sh: &Shared, pg: i32, p: f32) -> f32 {
         256..=511 => at(&sh.waves[(pg - 256) as usize & 255], p),
         _ => 0.0,
     }
+}
+
+/// A noise waveform (`wave` 6, 16..21, 25, 26) at phase `p`.
+#[inline(never)]
+fn noise_at(sh: &Shared, pg: i32, p: f32) -> f32 {
+    let (k, p) = match pg { 6 | 16 => (0, p), 17 | 26 => (1, p), 25 => (2, p / 11.0), _ => (pg as usize - 16, p) };
+    let t = sh.noise(k);
+    t[((p * t.len() as f32) as i32 as usize).min(t.len() - 1)]
 }
 
 /// Convert a velocity/expression value (0..512) to attenuation, per volume mode.
@@ -708,16 +723,13 @@ impl Chan {
     fn dmc_busy(&self) -> bool { self.dm && (self.dplay || self.dprev.is_some() || self.dhp.1.abs() > 1e-7 || (self.dlv + self.doff) * self.dg != self.dhp.0) }
 
     /// One frame of a DPCM sample, played as the NES's delta modulation channel plays it: its output is a level,
-    /// which stays where the sample left it (at its end, where `@ph` stops it, or at key-off: the channel doesn't
-    /// stop for it) until the next sample moves it on from there; a sample waiting for its start (a negative
-    /// `@ph`) lets the one before it play on until then, so samples that the converter decoded each from the level
-    /// the one before leaves join without a step however the notes fall on output frames. (Where a song loops
-    /// back, the level the end of the song left isn't the one the samples after the loop point were decoded from:
-    /// the first sample after it joins that level instead, and the difference fades out over a few tens of ms.)
-    /// The DC comes out the way the console's output stage takes it out: a first-order high-pass, at 60 Hz, where
-    /// the channel's low end matches an NSF player's (libgme's) within half a dB. (The console's own filters, 90 and
-    /// 440 Hz, act on the whole mix, which SiON's other channels don't get either.) The note's envelope only sets
-    /// the gain.
+    /// held where the sample left it (its end, an `@ph` stop, or key-off, which doesn't stop the channel) until the
+    /// next sample moves it on. A sample waiting for its start (negative `@ph`) lets the one before play on, so
+    /// samples the converter decoded each from the level the last one left join without a step. (After a loop back,
+    /// the first sample joins the level the song's end left, and the difference fades out over a few tens of ms.)
+    /// The DC is removed as by the console's output stage: a 60 Hz first-order high-pass, matching libgme's low end
+    /// within half a dB. (The console's 90 and 440 Hz filters act on the whole mix, which SiON's other channels
+    /// don't get either.) The note's envelope only sets the gain.
     fn dpcm(&mut self, sh: &Shared, am: f32) -> f32 {
         const HP: f32 = 1.0 / (1.0 + TAU * 60.0 / RATE);
         const FADE: f32 = 1.0 - 1.0 / (0.02 * RATE);

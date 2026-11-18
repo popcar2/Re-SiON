@@ -329,7 +329,7 @@ impl Bus for Nes {
                         self.sent.insert((addr, len), bytes.clone());
                         self.blocks.push((0xc2, addr, bytes));
                         let at = (cycle as f64 / self.clock * 44100.0).round() as u64;
-                        self.writes.push(Write { at, chip: 0, port: 0, reg: 0, val: 0, block: Some(self.blocks.len() - 1), src: None });
+                        self.writes.push(Write::block(at, 0, self.blocks.len() - 1));
                     }
                 }
                 if a == 0x4012 { self.dmc.0 = v }
