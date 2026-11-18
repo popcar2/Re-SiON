@@ -28,6 +28,17 @@ use synth::*;
 
 const INF: f64 = f64::INFINITY;
 
+// Limits that only damaged or hostile MML reaches (real songs are far inside them), so that it can't hang the player
+// or run it out of memory:
+/// Bytes macros may expand to, in all (each macro is expanded where it's defined, so a few lines of macros that
+/// each repeat the one before could otherwise ask for more memory than there is).
+const MAX_EXPANDED: usize = 16 << 20;
+/// Sequences (tracks) played: any after these are left out.
+const MAX_TRACKS: usize = 512;
+/// Commands a track may run without its time moving on (e.g. a `$` loop or `[..]` repeat of zero-length
+/// notes, `l0`): it stops there instead of looping for ever.
+const MAX_STALLED: u32 = 1 << 20;
+
 /// Index just past the next `pat` at or after `i`.
 fn find(s: &[u8], i: usize, pat: &[u8]) -> usize {
     let i = i.min(s.len());
@@ -662,7 +673,11 @@ impl Track {
     fn events(&mut self, sh: &Shared, now: f64, bpm: &mut f64) {
         let due = now + 1e-6;
         let late = |at: f64, bpm: f64| ((now - at) * RATE as f64 / (bpm * 8.0)).clamp(0.0, 1.0) as f32;
+        let (mut stalled, mut was) = (0, self.at);
         while !self.end && due >= self.at {
+            if self.at > was { (stalled, was) = (0, self.at) }
+            stalled += 1;
+            if stalled > MAX_STALLED { (self.end, self.once, self.src) = (true, true, -1); break }
             self.ch.stale = true;
             self.late = late(self.at, *bpm);
             let s = self.s.clone();
@@ -1040,9 +1055,10 @@ fn spans(s: &[u8], at: &[usize]) -> Vec<u8> {
 }
 
 /// Replace macro references (`A`, `A(3)` = transposed) with their bodies.
-fn expand(mac: &[Vec<u8>], s: &[u8], deep: u8) -> Vec<u8> {
+/// (No more than `cap` bytes of it: see `MAX_EXPANDED`.)
+fn expand(mac: &[Vec<u8>], s: &[u8], deep: u8, cap: usize) -> Vec<u8> {
     let (mut out, mut i) = (vec![], 0);
-    while i < s.len() {
+    while i < s.len() && out.len() < cap {
         let c = s[i];
         i += 1;
         if !c.is_ascii_uppercase() { out.push(c); continue }
@@ -1054,9 +1070,11 @@ fn expand(mac: &[Vec<u8>], s: &[u8], deep: u8) -> Vec<u8> {
         // Only a transposed macro is wrapped in note shifts: the closing one would otherwise swallow a length
         // written right after the macro (`Z16..` would read as `!@ns016` and lose its `16..`).
         if t != 0 { cmd(&mut out, b"!@ns", &[t]) }
-        if deep > 0 && deep < 9 { out.extend(expand(mac, m, deep + 1)) } else { out.extend(m) }
+        let room = cap.saturating_sub(out.len());
+        if deep > 0 && deep < 9 { out.extend(expand(mac, m, deep + 1, room)) } else { out.extend(&m[..m.len().min(room)]) }
         if t != 0 { cmd(&mut out, b"!@ns", &[-t]) }
     }
+    out.truncate(cap);
     out
 }
 
@@ -1180,20 +1198,28 @@ impl Song {
         let (mut mac, mut dynamic, mut seqs, mut effects, mut conn) = (vec![vec![]; 26], false, vec![], vec![], vec![]);
         // Each DPCM `#PCMB`'s bytes, for `{=m}` references.
         let mut raw: Vec<(usize, Vec<u8>)> = vec![];
-        let (mut st, mut brace) = (0, false);
+        let (mut st, mut brace, mut room) = (0, false, MAX_EXPANDED);
         for e in 0..text.len() {
             match text[e] { b'{' => brace = true, b'}' => brace = false, _ => {} }
             if brace || text[e] != b';' { continue }
             let s = text[st..e].trim_ascii_start();
             st = e + 1;
-            if s.first() != Some(&b'#') { seqs.push(expand(&mac, &mark(s), dynamic as u8)); continue }
+            if s.first() != Some(&b'#') {
+                if seqs.len() < MAX_TRACKS {
+                    let x = expand(&mac, &mark(s), dynamic as u8, room);
+                    room -= x.len();
+                    seqs.push(x);
+                }
+                continue
+            }
             let n = 1 + s[1..].iter().take_while(|c| c.is_ascii_uppercase() || matches!(c, b'@' | b'-')).count();
             let (name, body) = (&s[1..n], &s[n..]);
             let add = body.starts_with(b"+=");
             if add || body.starts_with(b"=") {
                 // `#A=`, `#ABC=`, `#A-C=`: (re)define or append to macros. Static macros expand at definition.
                 let x = mark(&body[1 + add as usize..]);
-                let x = if dynamic { x } else { expand(&mac, &x, 0) };
+                let x = if dynamic { x } else { expand(&mac, &x, 0, room) };
+                room = room.saturating_sub(x.len());
                 let mut j = 0;
                 while j < name.len() {
                     let letter = |j: &mut usize| name.get(*j).filter(|c| c.is_ascii_uppercase()).map(|c| { *j += 1; (c - b'A') as usize });

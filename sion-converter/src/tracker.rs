@@ -359,6 +359,8 @@ fn load_s3m(d: &[u8]) -> Result<Module, String> {
         let (len, ls, le, vol, fl, c2) = (u32le(d, o + 16) as usize, u32le(d, o + 20) as usize, u32le(d, o + 24) as usize, byte(d, o + 28).min(64), byte(d, o + 31), u32le(d, o + 32));
         let (bits16, stereo) = (fl & 4 != 0, fl & 2 != 0);
         let bytes = if bits16 { 2 } else { 1 };
+        // (No longer than the data the file holds: a damaged length would otherwise read gigabytes of silence.)
+        let len = len.min(d.len().saturating_sub(mem) / bytes);
         let mut data = Vec::with_capacity(len);
         for k in 0..len {
             let at = mem + k * bytes;
@@ -492,6 +494,7 @@ fn load_xm(d: &[u8]) -> Result<Module, String> {
             let mut p = shdr;
             for (len, ls, ll, vol, ft, ty, pan, rel) in heads {
                 let bits16 = ty & 16 != 0;
+                let len = len.min(d.len().saturating_sub(p));
                 let (mut acc, mut data) = (0i32, Vec::with_capacity(if bits16 { len / 2 } else { len }));
                 if bits16 {
                     for k in 0..len / 2 { acc = (acc + u16le(d, p + k * 2) as i16 as i32) as i16 as i32; data.push(acc as f32 / 32768.0) }
@@ -592,6 +595,9 @@ fn load_it(d: &[u8]) -> Result<Module, String> {
         let o = u32le(d, sp + i * 4) as usize;
         let (gvol, fl, vol, len, ls, le, c5, ptr, cvt, dfp) = (byte(d, o + 0x11), byte(d, o + 0x12), byte(d, o + 0x13), u32le(d, o + 0x30) as usize, u32le(d, o + 0x34) as usize, u32le(d, o + 0x38) as usize, u32le(d, o + 0x3c), u32le(d, o + 0x48) as usize, byte(d, o + 0x2e), byte(d, o + 0x2f));
         let bits16 = fl & 2 != 0;
+        // (No longer than the data the file holds; packed data takes at least a bit per sample.)
+        let room = d.len().saturating_sub(ptr);
+        let len = len.min(if fl & 8 != 0 { room * 8 } else if bits16 { room / 2 } else { room });
         let data = if fl & 1 == 0 || len == 0 { vec![] } else if fl & 8 != 0 { it_unpack(d, ptr, len, bits16, cvt & 4 != 0) } else {
             (0..len).map(|k| {
                 let v = if bits16 { u16le(d, ptr + k * 2) as i32 } else { byte(d, ptr + k) as i32 };

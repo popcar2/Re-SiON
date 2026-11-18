@@ -16,7 +16,18 @@ pub fn gunzip(d: &[u8]) -> Result<Vec<u8>, String> {
     if flags & 4 != 0 { i += 2 + (d[i] as usize | (d.get(i + 1).copied().unwrap_or(0) as usize) << 8) }
     for bit in [8, 16] { if flags & bit != 0 { while d.get(i).is_some_and(|&c| c != 0) { i += 1 } i += 1 } }
     if flags & 2 != 0 { i += 2 }
-    miniz_oxide::inflate::decompress_to_vec(d.get(i..).ok_or("truncated gzip file")?).map_err(|e| format!("bad gzip data: {e:?}"))
+    let packed = d.get(i..).ok_or("truncated gzip file")?;
+    miniz_oxide::inflate::decompress_to_vec_with_limit(packed, MAX_UNPACKED).map_err(|e| unpack_error("gzip", e.status))
+}
+
+/// How large compressed data may unpack to (real files unpack to a few MB at most): a tiny file that unpacks to
+/// gigabytes would otherwise run the converter (or the web page's tab) out of memory.
+pub(crate) const MAX_UNPACKED: usize = 128 << 20;
+
+pub(crate) fn unpack_error(what: &str, status: miniz_oxide::inflate::TINFLStatus) -> String {
+    if status == miniz_oxide::inflate::TINFLStatus::HasMoreOutput {
+        format!("the {what} data unpacks to more than {} MB", MAX_UNPACKED >> 20)
+    } else { format!("bad {what} data") }
 }
 
 /// Chips that may appear in a VGM header but are not converted: (header offset, name).

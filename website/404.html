@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Not found</title>
+  <script>
+    // GitHub Pages paths are case-sensitive; send /Re-SiON/Songs.html etc. to the real page
+    let pages = ["index.html", "songs.html", "playground.html", "convert.html", "docs.html"]
+    let match = location.pathname.match(/^\/re-sion(?:\/([^\/]*))?\/?$/i)
+    if (match) {
+      let name = (match[1] || "index.html").toLowerCase()
+      if (!name.endsWith(".html")) name += ".html"
+      if (pages.includes(name)) {
+        let target = "/Re-SiON/" + (name === "index.html" ? "" : name)
+        if (target !== location.pathname) location.replace(target + location.search + location.hash)
+      }
+    }
+  </script>
+</head>
+<body>
+  <p>Nothing here. Back to <a href="/Re-SiON/">Re-SiON</a>?</p>
+</body>
+</html>

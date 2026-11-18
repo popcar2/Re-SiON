@@ -62,8 +62,15 @@ pub fn detect(data: &[u8]) -> Option<Format> {
     None
 }
 
-/// Convert any supported file.
+/// Convert any supported file. A file that plays no notes is refused: it is most likely not music at all (a
+/// file that only looks like a supported format at its start, or one that holds a MIDI file inside it, like a zip).
 pub fn convert(data: &[u8], opt: &Options) -> Result<Converted, String> {
+    let c = convert_any(data, opt)?;
+    if c.notes == 0 { return Err("the file plays no notes (is it a damaged or a different kind of file?)".into()) }
+    Ok(c)
+}
+
+fn convert_any(data: &[u8], opt: &Options) -> Result<Converted, String> {
     match detect(data) {
         Some(Format::Midi) => midi_to_mml(data, opt),
         Some(Format::Module) => Ok(module_to_mml(&tracker::load(data)?, opt)),

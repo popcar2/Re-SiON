@@ -79,6 +79,12 @@
     <div><b>Drop a file here</b> or <u>browse</u></div>
     <small>MIDI · MOD, S3M, XM, IT · VGM, VGZ, GYM, S98 · NSF, NSFE · GBS · SPC</small>
     <input type="file" id="file" hidden>
+    <script>
+      // With no accept type, Chrome on Android offers the camera and sound recorder next to the files, and asks for
+      // camera, microphone and photo permissions first. One plain (non-media) type opens just the file browser, with
+      // every file still pickable. Only there: desktop pickers would filter by it, hiding e.g. .mid (audio/midi) files.
+      if (/Android/i.test(navigator.userAgent)) document.getElementById("file").accept = "application/octet-stream";
+    </script>
   </label>
 
   <details>
@@ -164,8 +170,22 @@ const FORMATS = { Midi: "MIDI", Module: "Tracker module", Vgm: "VGM", Nsf: "NSF"
 const time = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 const size = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(2)} MB`;
 
+// Larger files aren't read at all (music files are a few MB at most): they'd only tie up the page's memory.
+const MAX_FILE = 64 << 20;
+
 async function open(file) {
   if (!file) return;
+  if (file.size > MAX_FILE) {
+    job++; // (drops any conversion still running)
+    current = output = null;
+    $("result").hidden = false;
+    $("result").classList.add("error");
+    $("name").textContent = file.name;
+    $("busy").hidden = $("stats").hidden = $("actions").hidden = true;
+    $("warnings").replaceChildren();
+    $("state").textContent = `Could not convert: the file is ${size(file.size)}, larger than any music file this converts (${size(MAX_FILE)} at most)`;
+    return;
+  }
   // (A track number belongs to its file.)
   if (current && current.name !== file.name) { $("track").value = ""; $("track").placeholder = "The file's first"; $("track").removeAttribute("max") }
   current = { name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) };

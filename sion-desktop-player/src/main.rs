@@ -2,7 +2,7 @@
 //! Double-clicking it opens a terminal window (on Linux it relaunches itself in one).
 #![forbid(unsafe_code)]
 
-use std::io::{stdin, stdout, Write};
+use std::io::{stdin, stdout, Read, Write};
 use std::sync::{Arc, Mutex};
 use tinyaudio::prelude::*;
 
@@ -84,7 +84,10 @@ fn main() {
         match (line.trim(), line.trim().parse::<usize>()) {
             ("q", _) => break,
             ("s", _) => set(None),
-            (_, Ok(n)) if (1..=songs.len()).contains(&n) => match std::fs::read(&songs[n - 1]) {
+            (_, Ok(n)) if (1..=songs.len()).contains(&n) => match std::fs::File::open(&songs[n - 1]).and_then(|f| { let mut v = vec![]; f.take((16 << 20) + 1).read_to_end(&mut v).map(|_| v) }) {
+                // (Refused: anything much larger than a song, or with control characters no text file has.)
+                Ok(mml) if mml.len() > 16 << 20 => say(&["too large to play (over 16 MB)\n"]),
+                Ok(mml) if mml.iter().any(|&c| matches!(c, 0..=8 | 0x0e..=0x19 | 0x1c..=0x1f)) => say(&["not an MML file\n"]),
                 Ok(mml) => {
                     set(Some((sion::Song::from_bytes(&mml), volume(&songs[n - 1]))));
                     say(&["playing: ", &name(n - 1), "\n"])

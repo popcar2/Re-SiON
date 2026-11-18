@@ -49,7 +49,8 @@
      played can be highlighted in it. Both wrap the same way (same width, with room for a scrollbar kept in both) and scroll together,
      so their text lines up. */
   .editor {
-    position: relative; height: calc(100vh - 230px); min-height: 240px;
+    /* Fills the window down to just above the player bar: --footer is how much of the window the bar covers, kept up to date below. */
+    position: relative; height: calc(100dvh - var(--editor-top, 190px) - var(--footer, 110px) - 12px); min-height: 240px;
     border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--bg);
   }
   .editor:focus-within { border-color: var(--muted); }
@@ -244,6 +245,20 @@ function notes(offsets) {
 
 // ---- Player ----
 const player = createPlayer({ idleText: "Playground", heatmap: true, idle: run, notes });
+
+// The editor ends just above the player bar (and the Visualizer tab sticking up from it, when shown), whose height
+// changes with the window's width.
+const footer = document.querySelector("footer"), viz = $("viz"), editor = document.querySelector(".editor");
+function fit() {
+  const root = document.documentElement.style, top = footer.getBoundingClientRect().top;
+  const covered = innerHeight - (viz.hidden ? top : Math.min(top, viz.getBoundingClientRect().top));
+  root.setProperty("--footer", covered + "px");
+  root.setProperty("--editor-top", editor.getBoundingClientRect().top + scrollY + "px");
+}
+new ResizeObserver(fit).observe(footer);
+new ResizeObserver(fit).observe(viz);
+addEventListener("resize", fit);
+fit();
 
 function run() {
   played = text.value;

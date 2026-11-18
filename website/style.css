@@ -43,13 +43,15 @@ h1 a {
 @media (prefers-reduced-motion: reduce) { h1 a { animation: none; } }
 @media (forced-colors: active) { h1 a { background: none; -webkit-text-fill-color: currentColor; } }
 /* The light/dark switch (added by js/theme.js), in the top left corner. It shows the mode it switches to. */
-button.theme {
+button.theme, a.github {
   position: absolute; top: 12px; left: 12px; width: 34px; height: 34px; display: grid; place-items: center; padding: 0;
   color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 50%; cursor: pointer;
 }
-button.theme:hover { color: var(--fg); background: var(--hover); }
-button.theme:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-button.theme svg { width: 16px; height: 16px; fill: currentColor; }
+/* The GitHub link (also added by js/theme.js), the same size, in the top right corner. */
+a.github { left: auto; right: 12px; }
+:is(button.theme, a.github):hover { color: var(--fg); background: var(--hover); }
+:is(button.theme, a.github):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:is(button.theme, a.github) svg { width: 16px; height: 16px; fill: currentColor; }
 :root[data-theme=dark] button.theme .moon, :root:not([data-theme=dark]) button.theme .sun { display: none; }
 header nav { display: flex; flex-wrap: wrap; justify-content: center; gap: 2px; }
 header nav a {

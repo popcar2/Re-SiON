@@ -14,6 +14,10 @@
 import { heatmap } from "./heatmap.js";
 
 const RATE = 44100;
+// MML is refused (with the reason shown in the bar) when it's larger than this (real songs are well under 1 MB)...
+const MAX_MML = 16 << 20;
+// ...or holds control characters no text file has: it's some other kind of file, which would play as noise.
+const BINARY = /[\0-\x08\x0e-\x19\x1c-\x1f]/;
 const PLAY = "M4 2.5v11L13.5 8z", PAUSE = "M3.5 2.5h3v11h-3zM9.5 2.5h3v11h-3z";
 
 const BAR = `<footer>
@@ -54,12 +58,17 @@ export function createPlayer(hooks = {}) {
 
   let ctx, node, heat, ready, song = null, id = 0; // song: what's loaded ({title, artist}); id: bumped per song
   let text = null; // the MML of the song loaded, once it has arrived (for the download button)
+  let refused = null; // {title, why}: the song last given to play() that can't be played, shown until the next
+  let early = false; // the song played out before its length arrived: ended() waits for it (0 or 1 frame = plays no notes)
   // Songs are rendered ahead and measured in a worker (render.js) and handed to the audio worklet, which only copies samples.
   const renderer = new Worker(new URL("render.js", import.meta.url), { type: "module" });
   let pos = 0, dur = 0, loop = -1, dragging = false; // in frames; dur = 0 until measured, loop = -1 unless it loops
   renderer.onmessage = ({ data }) => {
     if (data.id !== id) return;
+    // (A song with nothing in it still measures a frame: the sequencer always takes a step.)
+    if (data.frames <= 1) return refuse("Plays no notes");
     if ("frames" in data) dur = data.frames;
+    if (early && dur) { early = false; end() }
     if ("loop" in data) loop = data.loop;
     showTime();
   };
@@ -84,7 +93,8 @@ export function createPlayer(hooks = {}) {
       renderer.postMessage({ port: port2 }, [port2]);
       node.port.onmessage = ({ data }) => {
         if ("pos" in data) { pos = data.pos; showTime(); if (hooks.notes && data.notes) notes(data.notes) }
-        if (data.ended) hooks.ended ? hooks.ended() : stop();
+        // (Nothing loaded: it was stopped already, perhaps refused, whose reason stays shown.)
+        if (data.ended && song) { if (!dur) early = true; else end() }
       };
     })();
   }
@@ -98,16 +108,32 @@ export function createPlayer(hooks = {}) {
     loop = -1;
     hooks.notes?.([]);
     show();
+    refused = null;
+    early = false;
     [mml] = await Promise.all([mml, audio()]);
     if (me !== id) return; // another song was picked while this one loaded
+    const why = mml.length > MAX_MML ? `Too large to play (over ${MAX_MML >> 20} MB)` : BINARY.test(mml) ? "Not an MML file" : null;
+    if (why) return refuse(why);
     text = mml;
     renderer.postMessage({ mml, id: me, volume: meta.volume ?? 1, notes: !!hooks.notes });
     await ctx.resume();
     show();
   }
 
+  const end = () => hooks.ended ? hooks.ended() : stop();
+
+  /** Stop, showing why the song given to play() can't be played. */
+  function refuse(why) {
+    const title = song?.title;
+    stop();
+    refused = { title, why };
+    show();
+  }
+
   function stop() {
     renderer.postMessage({ mml: null });
+    refused = null;
+    early = false;
     id++;
     song = text = null;
     pos = dur = 0;
@@ -135,8 +161,8 @@ export function createPlayer(hooks = {}) {
   function show() {
     document.body.classList.toggle("playing", playing());
     if (playing()) heat?.wake();
-    $("title").textContent = song ? song.title : "Nothing playing";
-    $("artist").textContent = song ? song.artist || " " : idleText;
+    $("title").textContent = song ? song.title : refused?.title || "Nothing playing";
+    $("artist").textContent = song ? song.artist || " " : refused ? refused.why : idleText;
     $("icon").setAttribute("d", playing() ? PAUSE : PLAY);
     $("prev").disabled = !song || !hooks.canPrev?.();
     $("next").disabled = !song || !hooks.canNext?.();

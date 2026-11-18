@@ -122,7 +122,8 @@ pub fn gym_to_vgm(d: &[u8]) -> Result<(Vec<u8>, Vec<String>), String> {
         if d.len() < 0x1ac { return Err("truncated GYM header".into()) }
         let packed = u32le(d, 0x1a8);
         let body = if packed != 0 {
-            miniz_oxide::inflate::decompress_to_vec_zlib(&d[0x1ac..]).map_err(|e| format!("bad packed GYM data: {e:?}"))?
+            miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&d[0x1ac..], crate::vgm::MAX_UNPACKED)
+                .map_err(|e| crate::vgm::unpack_error("packed GYM", e.status))?
         } else { d[0x1ac..].to_vec() };
         // (libgme starts the loop on the frame the loop start counts to, from 1.)
         (body, u32le(d, 0x1a4).checked_sub(1).map(|f| f as usize))
