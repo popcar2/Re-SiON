@@ -97,6 +97,12 @@ footer div.row { display: flex; align-items: center; gap: 12px; }
 footer div.seek { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
 footer .now { flex: 1; min-width: 0; }
 footer .now .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 550; }
+/* Long titles slide back and forth (js/player.js sets .scroll, --over and --dur). */
+@media (prefers-reduced-motion: no-preference) {
+  footer .now .t.scroll { text-overflow: clip; }
+  footer .now .t.scroll span { display: inline-block; animation: marquee var(--dur) linear infinite alternate; }
+}
+@keyframes marquee { 0%, 20% { transform: none; } 80%, 100% { transform: translateX(var(--over)); } }
 footer .now .a {
   color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   /* A 1px outline in the page background, so the label stays readable over the visualizer. */
@@ -150,6 +156,12 @@ footer div.vol input[type=range]::-webkit-slider-thumb { width: 10px; height: 10
 footer div.vol input[type=range]::-moz-range-thumb { width: 10px; height: 10px; transform: none; }
 /* Phones have volume buttons of their own: no volume control there, leaving room for the title. */
 @media (max-width: 440px) { footer div.vol { display: none; } }
+/* Phones: list titles wrap to two lines. overflow-wrap lets titles with no spaces (most Japanese ones) break. */
+@media (max-width: 600px) {
+  ol.songs li .t span:first-child {
+    white-space: normal; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2;
+  }
+}
 
 /* The spectrum heatmap (js/heatmap.js): inside the player bar, rising from the bottom of the window under its controls. */
 footer canvas.heatmap { position: absolute; left: 0; bottom: 0; width: 100%; height: min(64px, 12vh); pointer-events: none; }

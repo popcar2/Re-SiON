@@ -176,10 +176,30 @@ export function createPlayer(hooks = {}) {
 
   const playing = () => !!song && ctx?.state === "running";
 
+  // A title wider than the bar scrolls (.scroll in style.css) at about 30 px/s, pausing at each end.
+  const titleEl = $("title");
+  function setTitle(text) {
+    if (titleEl.firstChild?.textContent === text) return; // don't restart the scroll
+    const span = document.createElement("span");
+    span.textContent = text;
+    titleEl.replaceChildren(span);
+    fitTitle();
+  }
+  function fitTitle() {
+    titleEl.classList.remove("scroll");
+    const over = titleEl.scrollWidth - titleEl.clientWidth;
+    if (over <= 1) return;
+    titleEl.style.setProperty("--over", `${-over}px`);
+    titleEl.style.setProperty("--dur", `${(over / 30 / 0.6 + 2).toFixed(1)}s`);
+    titleEl.classList.add("scroll");
+  }
+  new ResizeObserver(fitTitle).observe(titleEl);
+  document.fonts?.ready.then(fitTitle);
+
   function show() {
     document.body.classList.toggle("playing", playing());
     if (playing()) heat?.wake();
-    $("title").textContent = song ? song.title : refused?.title || "Nothing playing";
+    setTitle(song ? song.title : refused?.title || "Nothing playing");
     $("artist").textContent = song ? song.artist || " " : refused ? refused.why : idleText;
     $("icon").setAttribute("d", playing() ? PAUSE : PLAY);
     $("prev").disabled = !song || !hooks.canPrev?.();
